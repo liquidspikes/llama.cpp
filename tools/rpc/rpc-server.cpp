@@ -122,16 +122,16 @@ static bool fs_create_directory_with_parents(const std::string & path) {
 #endif // _WIN32
 }
 
+static std::string ensure_trailing_slash(std::string p) {
+    if (!p.empty() && p.back() != DIRECTORY_SEPARATOR) {
+        p += DIRECTORY_SEPARATOR;
+    }
+    return p;
+}
+
 // NOTE: this is copied from common.cpp to avoid linking with libcommon
 static std::string fs_get_cache_directory() {
     std::string cache_directory = "";
-    auto ensure_trailing_slash = [](std::string p) {
-        // Make sure to add trailing slash
-        if (p.back() != DIRECTORY_SEPARATOR) {
-            p += DIRECTORY_SEPARATOR;
-        }
-        return p;
-    };
     if (getenv("LLAMA_CACHE")) {
         cache_directory = std::getenv("LLAMA_CACHE");
     } else {
@@ -174,6 +174,7 @@ struct rpc_server_params {
     std::string              host        = "127.0.0.1";
     int                      port        = 50052;
     bool                     use_cache   = false;
+    std::string              cache_dir   = "";
     int                      n_threads   = std::max(1U, std::thread::hardware_concurrency()/2);
     std::vector<std::string> devices;
 };
@@ -189,6 +190,7 @@ static void print_usage(int /*argc*/, char ** argv, rpc_server_params params) {
     fprintf(stderr, "  -s, --stream <data,ctrl>         USB4 stream character devices (e.g. /dev/tbstream0,/dev/tbstream1)\n");
     fprintf(stderr, "  -r, --rpc, --endpoint <ep>       full endpoint string (e.g. dev:///dev/tbstream0,/dev/tbstream1 or host:port)\n");
     fprintf(stderr, "  -c, --cache                      enable local file cache\n");
+    fprintf(stderr, "  -C, --cache-dir <dir>            specify custom cache directory\n");
     fprintf(stderr, "\n");
 }
 
@@ -250,6 +252,12 @@ static bool rpc_server_params_parse(int argc, char ** argv, rpc_server_params & 
             }
         } else if (arg == "-c" || arg == "--cache") {
             params.use_cache = true;
+        } else if (arg == "-C" || arg == "--cache-dir") {
+            if (++i >= argc) {
+                return false;
+            }
+            params.use_cache = true;
+            params.cache_dir = argv[i];
         } else if (arg == "-h" || arg == "--help") {
             print_usage(argc, argv, params);
             exit(0);
@@ -338,7 +346,11 @@ int main(int argc, char * argv[]) {
     const char * cache_dir = nullptr;
     std::string cache_dir_str;
     if (params.use_cache) {
-        cache_dir_str = fs_get_cache_directory() + "rpc" + DIRECTORY_SEPARATOR;
+        if (!params.cache_dir.empty()) {
+            cache_dir_str = ensure_trailing_slash(params.cache_dir);
+        } else {
+            cache_dir_str = fs_get_cache_directory() + "rpc" + DIRECTORY_SEPARATOR;
+        }
         if (!fs_create_directory_with_parents(cache_dir_str)) {
             fprintf(stderr, "Failed to create cache directory: %s\n", cache_dir_str.c_str());
             return 1;
