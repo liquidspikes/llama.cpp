@@ -83,8 +83,8 @@ enum rpc_cmd {
 
 static_assert(RPC_CMD_HELLO == 14, "RPC_CMD_HELLO must be always 14");
 
-// Try RPC_CMD_SET_TENSOR_HASH first when data size is larger than this threshold
-const size_t HASH_THRESHOLD = 10 * 1024 * 1024;
+// Try RPC_CMD_SET_TENSOR_HASH first for all tensors
+const size_t HASH_THRESHOLD = 0;
 
 struct rpc_msg_hello_req {
     uint8_t conn_caps[RPC_CONN_CAPS_SIZE];
@@ -256,17 +256,8 @@ static uint64_t fnv_hash(const uint8_t * data, size_t len, uint64_t hash = 0xcbf
 }
 
 static inline uint32_t rpc_cmd_to_channel(enum rpc_cmd cmd) {
-    switch (cmd) {
-        case RPC_CMD_SET_TENSOR:
-        case RPC_CMD_SET_TENSOR_HASH:
-        case RPC_CMD_GET_TENSOR:
-        case RPC_CMD_COPY_TENSOR:
-        case RPC_CMD_INIT_TENSOR:
-        case RPC_CMD_MEMSET_TENSOR:
-            return RPC_CHANNEL_DATA; // Channel 0: Data Plane (/dev/tbstream0)
-        default:
-            return RPC_CHANNEL_CONTROL; // Channel 1: Control Plane (/dev/tbstream1)
-    }
+    (void)cmd;
+    return RPC_CHANNEL_CONTROL;
 }
 
 static bool send_msg(socket_ptr sock, const void * msg, size_t msg_size, uint32_t channel = RPC_CHANNEL_CONTROL) {
@@ -368,12 +359,12 @@ static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, 
 // matching capabilities, the socket is upgraded transparently.
 static bool negotiate_hello(const std::shared_ptr<socket_t> & sock) {
     rpc_msg_hello_req request = {};
+    sock->get_caps(request.conn_caps);
     rpc_msg_hello_rsp response = {};
 
-    sock->get_caps(request.conn_caps);
-
-    bool status = send_rpc_cmd(sock, RPC_CMD_HELLO, &request, sizeof(request), &response, sizeof(response));
-    RPC_STATUS_ASSERT(status);
+    if (!send_rpc_cmd(sock, RPC_CMD_HELLO, &request, sizeof(request), &response, sizeof(response))) {
+        return false;
+    }
 
     if (response.major != RPC_PROTO_MAJOR_VERSION || response.minor > RPC_PROTO_MINOR_VERSION) {
         GGML_LOG_ERROR("RPC server version mismatch: %d.%d.%d\n",
@@ -578,6 +569,8 @@ void rpc_dispatcher::work() {
             break;
         }
         if (msg_ptr->cmd != RPC_CMD_NONE) {
+            GGML_LOG_INFO("[RPC_DISPATCH] sending cmd=%d (in_size=%zu, out_size=%zu)\n",
+                          (int)msg_ptr->cmd, msg_ptr->input_size, msg_ptr->output_size);
             if (msg_ptr->output) {
                 bool status = send_rpc_cmd(sock, msg_ptr->cmd, msg_ptr->input.get(), msg_ptr->input_size, msg_ptr->output, msg_ptr->output_size);
                 RPC_STATUS_ASSERT(status);
@@ -585,6 +578,7 @@ void rpc_dispatcher::work() {
                 bool status = send_rpc_cmd(sock, msg_ptr->cmd, msg_ptr->input.get(), msg_ptr->input_size);
                 RPC_STATUS_ASSERT(status);
             }
+            GGML_LOG_INFO("[RPC_DISPATCH] finished cmd=%d\n", (int)msg_ptr->cmd);
         }
         msg_ptr->completion.set_value();
     }
@@ -602,13 +596,11 @@ rpc_dispatcher::~rpc_dispatcher() {
 static std::shared_ptr<rpc_dispatcher> get_dispatcher(const std::string & endpoint) {
     static std::mutex mutex;
     std::lock_guard<std::mutex> lock(mutex);
-    static std::unordered_map<std::string, std::weak_ptr<rpc_dispatcher>> dispatchers;
+    static std::unordered_map<std::string, std::shared_ptr<rpc_dispatcher>> dispatchers;
 
     auto it = dispatchers.find(endpoint);
-    if (it != dispatchers.end()) {
-        if (auto dispatcher = it->second.lock()) {
-            return dispatcher;
-        }
+    if (it != dispatchers.end() && it->second != nullptr) {
+        return it->second;
     }
 
     auto dispatcher = std::make_shared<rpc_dispatcher>();
@@ -1417,6 +1409,7 @@ bool rpc_server::set_tensor(const std::vector<uint8_t> & input) {
     uint64_t offset;
     memcpy(&offset, input.data() + sizeof(rpc_tensor), sizeof(offset));
     const size_t size = input.size() - sizeof(rpc_tensor) - sizeof(offset);
+    fprintf(stderr, "[SET_TENSOR_SERVER] tensor=%s, size=%zu, input_size=%zu\n", in_tensor->name, size, input.size());
 
     struct ggml_init_params params {
         /*.mem_size   =*/ ggml_tensor_overhead(),
@@ -1498,8 +1491,8 @@ bool rpc_server::set_tensor_hash(const rpc_msg_set_tensor_hash_req & request, rp
     ggml_context * ctx = ctx_ptr.get();
     ggml_tensor * tensor = deserialize_tensor(ctx, &request.tensor);
     if (tensor == nullptr || tensor->buffer == nullptr) {
-        GGML_LOG_ERROR("[%s] error deserializing tensor\n", __func__);
-        return false;
+        response.result = 0;
+        return true;
     }
     LOG_DBG("[%s] buffer: %p, data: %p, offset: %" PRIu64 ", size: %zu, hash: %" PRIx64 "\n",
             __func__, (void*)tensor->buffer, tensor->data, request.offset, size, request.hash);
@@ -1512,9 +1505,8 @@ bool rpc_server::set_tensor_hash(const rpc_msg_set_tensor_hash_req & request, rp
         if (request.tensor.data + request.offset < p0
          || request.tensor.data + request.offset >= p1
          || size > (p1 - request.tensor.data - request.offset)) {
-            GGML_LOG_ERROR("[%s] tensor data region (data=0x%" PRIx64 ", offset=%" PRIu64 ", size=%zu, hash=0x%" PRIx64 ") out of buffer bounds [0x%zx, 0x%zx)\n",
-                           __func__, request.tensor.data, request.offset, size, request.hash, p0, p1);
-            return false;
+            response.result = 0;
+            return true;
         }
     }
     ggml_backend_tensor_set(tensor, cached_file.data(), request.offset, size);
@@ -1851,6 +1843,7 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
             GGML_LOG_ERROR("Unknown command: %d\n", cmd);
             break;
         }
+        GGML_LOG_INFO("[RPC_SERVER] received cmd=%d on channel=%u\n", (int)cmd, active_ch);
         uint32_t cmd_channel = rpc_cmd_to_channel((enum rpc_cmd)cmd);
         switch (cmd) {
             case RPC_CMD_HELLO: {
