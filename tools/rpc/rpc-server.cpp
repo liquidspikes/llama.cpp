@@ -170,6 +170,7 @@ static std::string fs_get_cache_directory() {
 }
 
 struct rpc_server_params {
+    std::string              endpoint    = "";
     std::string              host        = "127.0.0.1";
     int                      port        = 50052;
     bool                     use_cache   = false;
@@ -185,6 +186,8 @@ static void print_usage(int /*argc*/, char ** argv, rpc_server_params params) {
     fprintf(stderr, "  -d, --device <dev1,dev2,...>     comma-separated list of devices\n");
     fprintf(stderr, "  -H, --host HOST                  host to bind to (default: %s)\n", params.host.c_str());
     fprintf(stderr, "  -p, --port PORT                  port to bind to (default: %d)\n", params.port);
+    fprintf(stderr, "  -s, --stream <data,ctrl>         USB4 stream character devices (e.g. /dev/tbstream0,/dev/tbstream1)\n");
+    fprintf(stderr, "  -r, --rpc, --endpoint <ep>       full endpoint string (e.g. dev:///dev/tbstream0,/dev/tbstream1 or host:port)\n");
     fprintf(stderr, "  -c, --cache                      enable local file cache\n");
     fprintf(stderr, "\n");
 }
@@ -198,6 +201,20 @@ static bool rpc_server_params_parse(int argc, char ** argv, rpc_server_params & 
                 return false;
             }
             params.host = argv[i];
+        } else if (arg == "-s" || arg == "--stream") {
+            if (++i >= argc) {
+                return false;
+            }
+            std::string s = argv[i];
+            if (s.rfind("dev://", 0) != 0 && s.rfind("stream://", 0) != 0) {
+                s = "dev://" + s;
+            }
+            params.endpoint = s;
+        } else if (arg == "-r" || arg == "--rpc" || arg == "--endpoint") {
+            if (++i >= argc) {
+                return false;
+            }
+            params.endpoint = argv[i];
         } else if (arg == "-t" || arg == "--threads") {
             if (++i >= argc) {
                 return false;
@@ -298,7 +315,12 @@ int main(int argc, char * argv[]) {
         return 1;
     }
 
-    if (params.host != "127.0.0.1") {
+    std::string endpoint = params.endpoint;
+    if (endpoint.empty()) {
+        endpoint = params.host + ":" + std::to_string(params.port);
+    }
+
+    if (endpoint.rfind("dev://", 0) != 0 && endpoint.rfind("stream://", 0) != 0 && endpoint.find("/dev/") != 0 && params.host != "127.0.0.1") {
         fprintf(stderr, "\n");
         fprintf(stderr, "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n");
         fprintf(stderr, "WARNING: Host ('%s') is != '127.0.0.1'\n", params.host.c_str());
@@ -313,7 +335,6 @@ int main(int argc, char * argv[]) {
         fprintf(stderr, "No devices found\n");
         return 1;
     }
-    std::string endpoint = params.host + ":" + std::to_string(params.port);
     const char * cache_dir = nullptr;
     std::string cache_dir_str;
     if (params.use_cache) {
