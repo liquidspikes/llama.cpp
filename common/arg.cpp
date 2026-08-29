@@ -1161,7 +1161,12 @@ void common_print_available_devices() {
 }
 
 static void add_rpc_devices(const std::string & servers) {
-    auto rpc_servers = string_split<std::string>(servers, ',');
+    std::vector<std::string> rpc_servers;
+    if (servers.rfind("dev://", 0) == 0 || servers.rfind("stream://", 0) == 0 || servers.find("/dev/") == 0) {
+        rpc_servers.push_back(servers);
+    } else {
+        rpc_servers = string_split<std::string>(servers, ',');
+    }
     if (rpc_servers.empty()) {
         throw std::invalid_argument("no RPC servers specified");
     }
@@ -2676,12 +2681,24 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     if (params.is_gen_docs || llama_supports_rpc()) {
         add_opt(common_arg(
             {"--rpc"}, "SERVERS",
-            "comma-separated list of RPC servers (host:port)",
+            "comma-separated list of RPC servers (host:port or dev:///dev/tbstream0,/dev/tbstream1)",
             [](common_params & params, const std::string & value) {
                 add_rpc_devices(value);
                 GGML_UNUSED(params);
             }
         ).set_env("LLAMA_ARG_RPC"));
+        add_opt(common_arg(
+            {"--stream"}, "DEVICES",
+            "comma-separated list of character devices for USB4 stream transport (e.g. /dev/tbstream0,/dev/tbstream1)",
+            [](common_params & params, const std::string & value) {
+                std::string ep = value;
+                if (ep.rfind("dev://", 0) != 0 && ep.rfind("stream://", 0) != 0) {
+                    ep = "dev://" + ep;
+                }
+                add_rpc_devices(ep);
+                GGML_UNUSED(params);
+            }
+        ).set_env("LLAMA_ARG_STREAM"));
     }
     add_opt(common_arg(
         {"--mlock"},

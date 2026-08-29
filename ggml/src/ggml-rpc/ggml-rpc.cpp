@@ -255,30 +255,44 @@ static uint64_t fnv_hash(const uint8_t * data, size_t len, uint64_t hash = 0xcbf
     return hash;
 }
 
-static bool send_msg(socket_ptr sock, const void * msg, size_t msg_size) {
-    if (!sock->send_data(&msg_size, sizeof(msg_size))) {
+static inline uint32_t rpc_cmd_to_channel(enum rpc_cmd cmd) {
+    switch (cmd) {
+        case RPC_CMD_SET_TENSOR:
+        case RPC_CMD_SET_TENSOR_HASH:
+        case RPC_CMD_GET_TENSOR:
+        case RPC_CMD_COPY_TENSOR:
+        case RPC_CMD_INIT_TENSOR:
+        case RPC_CMD_MEMSET_TENSOR:
+            return RPC_CHANNEL_DATA; // Channel 0: Data Plane (/dev/tbstream0)
+        default:
+            return RPC_CHANNEL_CONTROL; // Channel 1: Control Plane (/dev/tbstream1)
+    }
+}
+
+static bool send_msg(socket_ptr sock, const void * msg, size_t msg_size, uint32_t channel = RPC_CHANNEL_CONTROL) {
+    if (!sock->send_data_channel(channel, &msg_size, sizeof(msg_size))) {
         return false;
     }
-    if (!sock->send_data(msg, msg_size)) {
+    if (!sock->send_data_channel(channel, msg, msg_size)) {
         return false;
     }
     return sock->flush();
 }
 
-static bool recv_msg(socket_ptr sock, void * msg, size_t msg_size) {
+static bool recv_msg(socket_ptr sock, void * msg, size_t msg_size, uint32_t channel = RPC_CHANNEL_CONTROL) {
     uint64_t size;
-    if (!sock->recv_data(&size, sizeof(size))) {
+    if (!sock->recv_data_channel(channel, &size, sizeof(size))) {
         return false;
     }
     if (size != msg_size) {
         return false;
     }
-    return sock->recv_data(msg, msg_size);
+    return sock->recv_data_channel(channel, msg, msg_size);
 }
 
-static bool recv_msg(socket_ptr sock, std::vector<uint8_t> & input) {
+static bool recv_msg(socket_ptr sock, std::vector<uint8_t> & input, uint32_t channel = RPC_CHANNEL_CONTROL) {
     uint64_t size;
-    if (!sock->recv_data(&size, sizeof(size))) {
+    if (!sock->recv_data_channel(channel, &size, sizeof(size))) {
         return false;
     }
     try {
@@ -287,20 +301,21 @@ static bool recv_msg(socket_ptr sock, std::vector<uint8_t> & input) {
         GGML_LOG_ERROR("Failed to allocate input buffer of size %" PRIu64 "\n", size);
         return false;
     }
-    return sock->recv_data(input.data(), size);
+    return sock->recv_data_channel(channel, input.data(), size);
 }
 
 static bool parse_endpoint(const std::string & endpoint, std::string & host, int & port) {
-    size_t pos = endpoint.find(':');
-    if (pos == std::string::npos) {
+    rpc_endpoint_info info;
+    if (!socket_t::parse_endpoint(endpoint, info)) {
         return false;
     }
-    host = endpoint.substr(0, pos);
-    try {
-        port = std::stoi(endpoint.substr(pos + 1));
-    } catch (...) {
-        return false;
+    if (info.kind == rpc_transport_kind::STREAM) {
+        host = endpoint;
+        port = 0;
+        return true;
     }
+    host = info.host;
+    port = info.port;
     return true;
 }
 
@@ -308,13 +323,14 @@ static bool parse_endpoint(const std::string & endpoint, std::string & host, int
 // No response
 static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, size_t input_size) {
     uint8_t cmd_byte = cmd;
-    if (!sock->send_data(&cmd_byte, sizeof(cmd_byte))) {
+    uint32_t channel = rpc_cmd_to_channel(cmd);
+    if (!sock->send_data_channel(channel, &cmd_byte, sizeof(cmd_byte))) {
         return false;
     }
-    if (!sock->send_data(&input_size, sizeof(input_size))) {
+    if (!sock->send_data_channel(channel, &input_size, sizeof(input_size))) {
         return false;
     }
-    if (!sock->send_data(input, input_size)) {
+    if (!sock->send_data_channel(channel, input, input_size)) {
         return false;
     }
     return sock->flush();
@@ -326,14 +342,15 @@ static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, 
     if (!send_rpc_cmd(sock, cmd, input, input_size)) {
         return false;
     }
+    uint32_t channel = rpc_cmd_to_channel(cmd);
     uint64_t out_size;
-    if (!sock->recv_data(&out_size, sizeof(out_size))) {
+    if (!sock->recv_data_channel(channel, &out_size, sizeof(out_size))) {
         return false;
     }
     if (out_size != output_size) {
         return false;
     }
-    if (!sock->recv_data(output, output_size)) {
+    if (!sock->recv_data_channel(channel, output, output_size)) {
         return false;
     }
     return true;
@@ -533,16 +550,11 @@ void rpc_dispatcher::synchronize() {
 }
 
 void rpc_dispatcher::start(const std::string & endpoint) {
-    std::string host;
-    int port;
-    if (!parse_endpoint(endpoint, host, port)) {
-        GGML_ABORT("Failed to parse endpoint: %s\n", endpoint.c_str());
-    }
     if (!rpc_transport_init()) {
         GGML_ABORT("RPC transport initialization failed\n");
     }
 
-    sock = socket_t::connect(host.c_str(), port);
+    sock = socket_t::connect_endpoint(endpoint.c_str());
     if (sock == nullptr) {
         GGML_ABORT("Failed to connect to %s\n", endpoint.c_str());
     }
@@ -1821,7 +1833,8 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
     // Activate transport upgrade using client's caps
     sock->update_caps(req.conn_caps);
     while (true) {
-        if (!sock->recv_data(&cmd, 1)) {
+        uint32_t active_ch = RPC_CHANNEL_CONTROL;
+        if (!sock->recv_cmd(&cmd, &active_ch)) {
             break;
         }
         if (cmd >= RPC_CMD_COUNT) {
@@ -1829,95 +1842,96 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
             GGML_LOG_ERROR("Unknown command: %d\n", cmd);
             break;
         }
+        uint32_t cmd_channel = rpc_cmd_to_channel((enum rpc_cmd)cmd);
         switch (cmd) {
             case RPC_CMD_HELLO: {
                 // HELLO command is handled above
                 return;
             }
             case RPC_CMD_DEVICE_COUNT: {
-                if (!recv_msg(sock, nullptr, 0)) {
+                if (!recv_msg(sock, nullptr, 0, cmd_channel)) {
                     return;
                 }
                 rpc_msg_device_count_rsp response;
                 response.device_count = backends.size();
-                if (!send_msg(sock, &response, sizeof(response))) {
+                if (!send_msg(sock, &response, sizeof(response), cmd_channel)) {
                     return;
                 }
                 break;
             }
             case RPC_CMD_ALLOC_BUFFER: {
                 rpc_msg_alloc_buffer_req request;
-                if (!recv_msg(sock, &request, sizeof(request))) {
+                if (!recv_msg(sock, &request, sizeof(request), cmd_channel)) {
                     return;
                 }
                 rpc_msg_alloc_buffer_rsp response;
                 if (!server.alloc_buffer(request, response)) {
                     return;
                 }
-                if (!send_msg(sock, &response, sizeof(response))) {
+                if (!send_msg(sock, &response, sizeof(response), cmd_channel)) {
                     return;
                 }
                 break;
             }
             case RPC_CMD_GET_ALLOC_SIZE: {
                 rpc_msg_get_alloc_size_req request;
-                if (!recv_msg(sock, &request, sizeof(request))) {
+                if (!recv_msg(sock, &request, sizeof(request), cmd_channel)) {
                     return;
                 }
                 rpc_msg_get_alloc_size_rsp response;
                 if (!server.get_alloc_size(request, response)) {
                     return;
                 }
-                if (!send_msg(sock, &response, sizeof(response))) {
+                if (!send_msg(sock, &response, sizeof(response), cmd_channel)) {
                     return;
                 }
                 break;
             }
             case RPC_CMD_GET_ALIGNMENT: {
                 rpc_msg_get_alignment_req request;
-                if (!recv_msg(sock, &request, sizeof(request))) {
+                if (!recv_msg(sock, &request, sizeof(request), cmd_channel)) {
                     return;
                 }
                 rpc_msg_get_alignment_rsp response;
                 if (!server.get_alignment(request, response)) {
                     return;
                 }
-                if (!send_msg(sock, &response, sizeof(response))) {
+                if (!send_msg(sock, &response, sizeof(response), cmd_channel)) {
                     return;
                 }
                 break;
             }
             case RPC_CMD_GET_MAX_SIZE: {
                 rpc_msg_get_max_size_req request;
-                if (!recv_msg(sock, &request, sizeof(request))) {
+                if (!recv_msg(sock, &request, sizeof(request), cmd_channel)) {
                     return;
                 }
                 rpc_msg_get_max_size_rsp response;
                 if (!server.get_max_size(request, response)) {
                     return;
                 }
-                if (!send_msg(sock, &response, sizeof(response))) {
+                if (!send_msg(sock, &response, sizeof(response), cmd_channel)) {
                     return;
                 }
                 break;
             }
             case RPC_CMD_BUFFER_GET_BASE: {
                 rpc_msg_buffer_get_base_req request;
-                if (!recv_msg(sock, &request, sizeof(request))) {
+                if (!recv_msg(sock, &request, sizeof(request), cmd_channel)) {
                     return;
                 }
                 rpc_msg_buffer_get_base_rsp response;
                 if (!server.buffer_get_base(request, response)) {
                     return;
                 }
-                if (!send_msg(sock, &response, sizeof(response))) {
+                if (!send_msg(sock, &response, sizeof(response), cmd_channel)) {
                     return;
                 }
                 break;
             }
             case RPC_CMD_FREE_BUFFER: {
                 rpc_msg_free_buffer_req request;
-                if (!recv_msg(sock, &request, sizeof(request))) {
+                if (!recv_msg(sock, &request, sizeof(request), cmd_channel)) {
                     return;
                 }
                 if (!server.free_buffer(request)) {
@@ -1927,7 +1941,7 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
             }
             case RPC_CMD_BUFFER_CLEAR: {
                 rpc_msg_buffer_clear_req request;
-                if (!recv_msg(sock, &request, sizeof(request))) {
+                if (!recv_msg(sock, &request, sizeof(request), cmd_channel)) {
                     return;
                 }
                 if (!server.buffer_clear(request)) {
@@ -1937,7 +1951,7 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
             }
             case RPC_CMD_MEMSET_TENSOR: {
                 rpc_msg_memset_tensor_req request;
-                if (!recv_msg(sock, &request, sizeof(request))) {
+                if (!recv_msg(sock, &request, sizeof(request), cmd_channel)) {
                     return;
                 }
                 if (!server.memset_tensor(request)) {
@@ -1947,7 +1961,7 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
             }
             case RPC_CMD_SET_TENSOR: {
                 std::vector<uint8_t> input;
-                if (!recv_msg(sock, input)) {
+                if (!recv_msg(sock, input, cmd_channel)) {
                     return;
                 }
                 if (!server.set_tensor(input)) {
@@ -1957,21 +1971,21 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
             }
             case RPC_CMD_SET_TENSOR_HASH: {
                 rpc_msg_set_tensor_hash_req request;
-                if (!recv_msg(sock, &request, sizeof(request))) {
+                if (!recv_msg(sock, &request, sizeof(request), cmd_channel)) {
                     return;
                 }
                 rpc_msg_set_tensor_hash_rsp response;
                 if (!server.set_tensor_hash(request, response)) {
                     return;
                 }
-                if (!send_msg(sock, &response, sizeof(response))) {
+                if (!send_msg(sock, &response, sizeof(response), cmd_channel)) {
                     return;
                 }
                 break;
             }
             case RPC_CMD_INIT_TENSOR: {
                 rpc_msg_init_tensor_req request;
-                if (!recv_msg(sock, &request,sizeof(request))) {
+                if (!recv_msg(sock, &request, sizeof(request), cmd_channel)) {
                     return;
                 }
                 if (!server.init_tensor(request)) {
@@ -1981,35 +1995,35 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
             }
             case RPC_CMD_GET_TENSOR: {
                 rpc_msg_get_tensor_req request;
-                if (!recv_msg(sock, &request, sizeof(request))) {
+                if (!recv_msg(sock, &request, sizeof(request), cmd_channel)) {
                     return;
                 }
                 std::vector<uint8_t> response;
                 if (!server.get_tensor(request, response)) {
                     return;
                 }
-                if (!send_msg(sock, response.data(), response.size())) {
+                if (!send_msg(sock, response.data(), response.size(), cmd_channel)) {
                     return;
                 }
                 break;
             }
             case RPC_CMD_COPY_TENSOR: {
                 rpc_msg_copy_tensor_req request;
-                if (!recv_msg(sock, &request, sizeof(request))) {
+                if (!recv_msg(sock, &request, sizeof(request), cmd_channel)) {
                     return;
                 }
                 rpc_msg_copy_tensor_rsp response;
                 if (!server.copy_tensor(request, response)) {
                     return;
                 }
-                if (!send_msg(sock, &response, sizeof(response))) {
+                if (!send_msg(sock, &response, sizeof(response), cmd_channel)) {
                     return;
                 }
                 break;
             }
             case RPC_CMD_GRAPH_COMPUTE: {
                 std::vector<uint8_t> input;
-                if (!recv_msg(sock, input)) {
+                if (!recv_msg(sock, input, cmd_channel)) {
                     return;
                 }
                 if (!server.graph_compute(input)) {
@@ -2019,7 +2033,7 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
             }
             case RPC_CMD_GRAPH_RECOMPUTE: {
                 rpc_msg_graph_recompute_req request;
-                if (!recv_msg(sock, &request, sizeof(request))) {
+                if (!recv_msg(sock, &request, sizeof(request), cmd_channel)) {
                     return;
                 }
                 if (!server.graph_recompute(request)) {
@@ -2029,14 +2043,14 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
             }
             case RPC_CMD_GET_DEVICE_MEMORY: {
                 rpc_msg_get_device_memory_req request;
-                if (!recv_msg(sock, &request, sizeof(request))) {
+                if (!recv_msg(sock, &request, sizeof(request), cmd_channel)) {
                     return;
                 }
                 rpc_msg_get_device_memory_rsp response;
                 if (!server.get_device_memory(request, response)) {
                     return;
                 }
-                if (!send_msg(sock, &response, sizeof(response))) {
+                if (!send_msg(sock, &response, sizeof(response), cmd_channel)) {
                     return;
                 }
                 break;
@@ -2084,24 +2098,31 @@ void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir
         }
     }
 
-    std::string host;
-    int port;
-    if (!parse_endpoint(endpoint, host, port)) {
+    rpc_endpoint_info ep_info;
+    if (!socket_t::parse_endpoint(endpoint, ep_info)) {
+        fprintf(stderr, "Failed to parse endpoint: %s\n", endpoint);
         return;
     }
 
+    if (ep_info.kind == rpc_transport_kind::STREAM) {
+        printf("  transport      : USB4STREAM (Zero-Network-Stack Dual-Stream Character Devices)\n");
+        printf("  data stream    : %s\n", ep_info.data_path.c_str());
+        printf("  control stream : %s\n", ep_info.ctrl_path.c_str());
+    } else {
 #ifdef GGML_RPC_RDMA
-    printf("  transport      : TCP (RDMA auto-negotiate enabled)\n");
+        printf("  transport      : TCP (RDMA auto-negotiate enabled)\n");
 #else
-    printf("  transport      : TCP\n");
+        printf("  transport      : TCP\n");
 #endif // GGML_RPC_RDMA
+    }
+
     if (!rpc_transport_init()) {
         fprintf(stderr, "Failed to initialize RPC transport\n");
         return;
     }
-    auto server_socket = socket_t::create_server(host.c_str(), port);
+    auto server_socket = socket_t::create_server_endpoint(endpoint);
     if (server_socket == nullptr) {
-        fprintf(stderr, "Failed to create server socket\n");
+        fprintf(stderr, "Failed to create server socket for endpoint %s\n", endpoint);
         return;
     }
     while (true) {
