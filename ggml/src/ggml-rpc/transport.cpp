@@ -1,4 +1,5 @@
 #include "transport.h"
+#include "transport-usb4stream.h"
 #include "ggml-impl.h"
 
 #ifdef _WIN32
@@ -122,13 +123,27 @@ static_assert(sizeof(rdma_caps) == RPC_CONN_CAPS_SIZE, "rdma_caps must match con
 #endif // GGML_RPC_RDMA && !GGML_RPC_RDMA_APPLE
 
 struct socket_t::impl {
-    impl(sockfd_t fd) : use_rdma(false), fd(fd) {}
+    impl(sockfd_t fd) : use_usb4(false), is_server(false), accepted(false), use_rdma(false), fd(fd) {}
+    impl(std::unique_ptr<usb4stream_transport> transport, bool is_server = false)
+        : usb4(std::move(transport)), use_usb4(true), is_server(is_server), accepted(false), use_rdma(false),
+#ifdef _WIN32
+          fd(INVALID_SOCKET)
+#else
+          fd(-1)
+#endif
+    {}
+
     ~impl();
     bool send_data(const void * data, size_t size);
     bool recv_data(void * data, size_t size);
     bool flush();
     void get_caps(uint8_t * local_caps);
     void update_caps(const uint8_t * remote_caps);
+
+    std::unique_ptr<usb4stream_transport> usb4;
+    bool     use_usb4;
+    bool     is_server;
+    bool     accepted;
 
 #ifdef GGML_RPC_RDMA
     std::optional<rdma_gid_t> rdma_build_target_gid();
@@ -152,10 +167,14 @@ struct socket_t::impl {
 };
 
 socket_t::impl::~impl() {
+    if (use_usb4) {
+        usb4.reset();
+        return;
+    }
 #ifdef GGML_RPC_RDMA
     rdma.reset();
 #endif // GGML_RPC_RDMA
-    LOG_DBG("[%s] closing socket %d\n", __func__, this->fd);
+    LOG_DBG("[%s] closing socket %lld\n", __func__, (long long)this->fd);
 #ifdef _WIN32
     if (fd != INVALID_SOCKET) closesocket(this->fd);
 #else
@@ -478,6 +497,9 @@ bool socket_t::impl::rdma_recv(void * data, size_t size) {
 #endif // GGML_RPC_RDMA
 
 bool socket_t::impl::send_data(const void * data, size_t size) {
+    if (use_usb4) {
+        return usb4 ? usb4->send_data(data, size) : false;
+    }
 #ifdef GGML_RPC_RDMA_APPLE
     if (use_rdma) {
         return rdma->send(data, size);
@@ -502,6 +524,9 @@ bool socket_t::impl::send_data(const void * data, size_t size) {
 }
 
 bool socket_t::impl::recv_data(void * data, size_t size) {
+    if (use_usb4) {
+        return usb4 ? usb4->recv_data(data, size) : false;
+    }
 #ifdef GGML_RPC_RDMA_APPLE
     if (use_rdma) {
         return rdma->recv(data, size);
@@ -586,6 +611,9 @@ void socket_t::impl::update_caps(const uint8_t * remote_caps) {
 }
 
 bool socket_t::impl::flush() {
+    if (use_usb4) {
+        return usb4 ? usb4->flush() : false;
+    }
 #ifdef GGML_RPC_RDMA_APPLE
     if (use_rdma) {
         return rdma->flush();
@@ -642,6 +670,15 @@ static bool set_reuse_addr(sockfd_t sockfd) {
 }
 
 socket_ptr socket_t::accept() {
+    if (pimpl->use_usb4) {
+        if (pimpl->is_server && !pimpl->accepted) {
+            pimpl->accepted = true;
+            if (pimpl->usb4 && pimpl->usb4->is_connected()) {
+                return socket_ptr(new socket_t(std::make_unique<impl>(std::move(pimpl->usb4), false)));
+            }
+        }
+        return nullptr;
+    }
     auto client_socket_fd = ::accept(pimpl->fd, NULL, NULL);
     if (!is_valid_fd(client_socket_fd)) {
         return nullptr;
@@ -653,7 +690,40 @@ socket_ptr socket_t::accept() {
     return socket_ptr(new socket_t(std::make_unique<impl>(client_socket_fd)));
 }
 
+bool socket_t::is_usb4() const {
+    return pimpl && pimpl->use_usb4;
+}
+
+bool socket_t::is_usb4_endpoint(const char * endpoint) {
+    return usb4stream_transport::is_usb4_path(endpoint);
+}
+
+std::string socket_t::normalize_usb4_dev_path(const char * endpoint) {
+    return usb4stream_transport::normalize_device_path(endpoint);
+}
+
+socket_ptr socket_t::create_usb4_server(const char * dev_path) {
+    auto transport = usb4stream_transport::create_server(dev_path);
+    if (!transport) {
+        GGML_LOG_ERROR("Failed to initialize USB4 server on %s\n", dev_path);
+        return nullptr;
+    }
+    return socket_ptr(new socket_t(std::make_unique<impl>(std::move(transport), true)));
+}
+
+socket_ptr socket_t::connect_usb4(const char * dev_path) {
+    auto transport = usb4stream_transport::connect(dev_path);
+    if (!transport) {
+        GGML_LOG_ERROR("Failed to connect USB4 transport on %s\n", dev_path);
+        return nullptr;
+    }
+    return socket_ptr(new socket_t(std::make_unique<impl>(std::move(transport), false)));
+}
+
 socket_ptr socket_t::create_server(const char * host, int port) {
+    if (is_usb4_endpoint(host) || port == 0) {
+        return create_usb4_server(host);
+    }
     auto sockfd = socket(AF_INET, SOCK_STREAM, 0);
     if (!is_valid_fd(sockfd)) {
         return nullptr;
@@ -681,6 +751,9 @@ socket_ptr socket_t::create_server(const char * host, int port) {
 }
 
 socket_ptr socket_t::connect(const char * host, int port) {
+    if (is_usb4_endpoint(host) || port == 0) {
+        return connect_usb4(host);
+    }
     auto sockfd = socket(AF_INET, SOCK_STREAM, 0);
     if (!is_valid_fd(sockfd)) {
         return nullptr;

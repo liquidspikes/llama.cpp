@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <string>
 
 struct socket_t;
 typedef std::shared_ptr<socket_t> socket_ptr;
@@ -15,7 +16,7 @@ struct socket_t {
 
     bool send_data(const void * data, size_t size);
     bool recv_data(void * data, size_t size);
-    // Must be called at every message boundary: the RDMA transport coalesces
+    // Must be called at every message boundary: the RDMA / USB4 transport coalesces
     // writes into fixed-size frames and posts the trailing partial frame only
     // here. No-op on TCP.
     bool flush();
@@ -25,8 +26,16 @@ struct socket_t {
     void get_caps(uint8_t * local_caps);
     void update_caps(const uint8_t * remote_caps);
 
+    bool is_usb4() const;
+
     static socket_ptr create_server(const char * host, int port);
     static socket_ptr connect(const char * host, int port);
+
+    // USB4STREAM direct character stream endpoints
+    static socket_ptr create_usb4_server(const char * dev_path);
+    static socket_ptr connect_usb4(const char * dev_path);
+    static bool is_usb4_endpoint(const char * endpoint);
+    static std::string normalize_usb4_dev_path(const char * endpoint);
 
 private:
     struct impl;

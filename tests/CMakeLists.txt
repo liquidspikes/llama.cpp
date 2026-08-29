@@ -369,3 +369,12 @@ if (TARGET gguf-model-data)
     target_link_libraries(test-export-graph-ops PRIVATE gguf-model-data)
     target_compile_definitions(test-export-graph-ops PRIVATE LLAMA_HF_FETCH)
 endif()
+
+if (GGML_RPC)
+    add_executable(test-rpc-usb4stream test-rpc-usb4stream.cpp)
+    target_link_libraries(test-rpc-usb4stream PRIVATE ggml ggml-rpc)
+    target_include_directories(test-rpc-usb4stream PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src/ggml-rpc ${CMAKE_SOURCE_DIR}/ggml/include)
+    llama_test(test-rpc-usb4stream LABEL "rpc")
+endif()
+
+

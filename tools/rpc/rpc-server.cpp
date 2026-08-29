@@ -172,6 +172,7 @@ static std::string fs_get_cache_directory() {
 struct rpc_server_params {
     std::string              host        = "127.0.0.1";
     int                      port        = 50052;
+    std::string              usb4_dev    = "";
     bool                     use_cache   = false;
     int                      n_threads   = std::max(1U, std::thread::hardware_concurrency()/2);
     std::vector<std::string> devices;
@@ -183,8 +184,9 @@ static void print_usage(int /*argc*/, char ** argv, rpc_server_params params) {
     fprintf(stderr, "  -h, --help                       show this help message and exit\n");
     fprintf(stderr, "  -t, --threads N                  number of threads for the CPU device (default: %d)\n", params.n_threads);
     fprintf(stderr, "  -d, --device <dev1,dev2,...>     comma-separated list of devices\n");
-    fprintf(stderr, "  -H, --host HOST                  host to bind to (default: %s)\n", params.host.c_str());
+    fprintf(stderr, "  -H, --host HOST                  host to bind to (default: %s) or USB4 device path\n", params.host.c_str());
     fprintf(stderr, "  -p, --port PORT                  port to bind to (default: %d)\n", params.port);
+    fprintf(stderr, "  -U, --usb4 <dev>                 bind directly to USB4STREAM character device (e.g. /dev/tbstream0)\n");
     fprintf(stderr, "  -c, --cache                      enable local file cache\n");
     fprintf(stderr, "\n");
 }
@@ -198,6 +200,11 @@ static bool rpc_server_params_parse(int argc, char ** argv, rpc_server_params & 
                 return false;
             }
             params.host = argv[i];
+        } else if (arg == "-U" || arg == "--usb4") {
+            if (++i >= argc) {
+                return false;
+            }
+            params.usb4_dev = argv[i];
         } else if (arg == "-t" || arg == "--threads") {
             if (++i >= argc) {
                 return false;
@@ -298,14 +305,22 @@ int main(int argc, char * argv[]) {
         return 1;
     }
 
-    if (params.host != "127.0.0.1") {
-        fprintf(stderr, "\n");
-        fprintf(stderr, "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n");
-        fprintf(stderr, "WARNING: Host ('%s') is != '127.0.0.1'\n", params.host.c_str());
-        fprintf(stderr, "         Never expose the RPC server to an open network!\n");
-        fprintf(stderr, "         This is an experimental feature and is not secure!\n");
-        fprintf(stderr, "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n");
-        fprintf(stderr, "\n");
+    std::string endpoint;
+    if (!params.usb4_dev.empty()) {
+        endpoint = "usb4:" + params.usb4_dev;
+    } else if (params.host.rfind("/dev/tbstream", 0) == 0 || params.host.rfind("usb4:", 0) == 0 || params.host.rfind("tbstream:", 0) == 0) {
+        endpoint = params.host;
+    } else {
+        if (params.host != "127.0.0.1") {
+            fprintf(stderr, "\n");
+            fprintf(stderr, "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n");
+            fprintf(stderr, "WARNING: Host ('%s') is != '127.0.0.1'\n", params.host.c_str());
+            fprintf(stderr, "         Never expose the RPC server to an open network!\n");
+            fprintf(stderr, "         This is an experimental feature and is not secure!\n");
+            fprintf(stderr, "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n");
+            fprintf(stderr, "\n");
+        }
+        endpoint = params.host + ":" + std::to_string(params.port);
     }
 
     auto devices = get_devices(params);
@@ -313,7 +328,7 @@ int main(int argc, char * argv[]) {
         fprintf(stderr, "No devices found\n");
         return 1;
     }
-    std::string endpoint = params.host + ":" + std::to_string(params.port);
+
     const char * cache_dir = nullptr;
     std::string cache_dir_str;
     if (params.use_cache) {

@@ -10,9 +10,9 @@ This can be used for distributed LLM inference with `llama.cpp` in the following
 
 ```mermaid
 flowchart TD
-    rpcb<-->|TCP|srva
-    rpcb<-->|TCP|srvb
-    rpcb<-.->|TCP|srvn
+    rpcb<-->|TCP / USB4STREAM|srva
+    rpcb<-->|TCP / USB4STREAM|srvb
+    rpcb<-.->|TCP / USB4STREAM|srvn
     subgraph hostn[Host N]
     srvn[ggml-rpc-server]<-.->dev4["CUDA0"]
     srvn[ggml-rpc-server]<-.->dev5["CPU"]
@@ -74,7 +74,7 @@ $ bin/ggml-rpc-server --device CUDA0 -p 50052
 ### Main host
 
 On the main host build `llama.cpp` with the backends for the local devices and add `-DGGML_RPC=ON` to the build options.
-Finally, when running `llama-cli` or `llama-server`, use the `--rpc` option to specify the host and port of each `ggml-rpc-server`:
+Finally, when running `llama-cli` or `llama-server`, use the `--rpc` option to specify the host and port or device path of each `ggml-rpc-server`:
 
 ```bash
 $ llama-cli -hf ggml-org/gemma-3-1b-it-GGUF -ngl 99 --rpc 192.168.88.10:50052,192.168.88.11:50052
@@ -94,6 +94,33 @@ $ bin/ggml-rpc-server -c
 ```
 
 By default, the cache is stored in the `$HOME/.cache/llama.cpp/rpc` directory and can be controlled via the `LLAMA_CACHE` environment variable.
+
+### USB4STREAM transport (Linux kernel 7.2+)
+
+The RPC backend includes native support for **USB4STREAM** (`thunderbolt_stream.ko`), enabling direct, ultra-high-speed (40Gbps - 80Gbps) point-to-point data transfers between two machines connected over a USB4 or Thunderbolt cable without the TCP/IP networking stack overhead.
+
+#### Prerequisites
+1. Linux kernel 7.2 or newer built with `CONFIG_USB4_STREAM=m` or `=y`.
+2. Load the streaming kernel driver:
+   ```bash
+   sudo modprobe thunderbolt_stream
+   ```
+3. Connect the two machines with a certified USB4 / Thunderbolt 3/4 cable. The kernel will expose character device nodes at `/dev/tbstream0`, `/dev/tbstream1`, etc. (or via ConfigFS).
+
+#### Running with USB4STREAM
+Start the worker node binding directly to the USB4 character device:
+```bash
+$ bin/ggml-rpc-server -U /dev/tbstream0
+# Or using the -H/--host option:
+$ bin/ggml-rpc-server -H usb4:/dev/tbstream0
+```
+
+On the main host, point `--rpc` to the local USB4 stream character device:
+```bash
+$ llama-cli -m model.gguf -ngl 99 --rpc /dev/tbstream0
+# Or with multiple nodes:
+$ llama-cli -m model.gguf -ngl 99 --rpc /dev/tbstream0,/dev/tbstream1
+```
 
 ### RDMA transport
 
@@ -117,4 +144,3 @@ Use the `GGML_RPC_DEBUG` environment variable to enable debug messages from `ggm
 ```bash
 $ GGML_RPC_DEBUG=1 bin/ggml-rpc-server
 ```
-

@@ -291,8 +291,18 @@ static bool recv_msg(socket_ptr sock, std::vector<uint8_t> & input) {
 }
 
 static bool parse_endpoint(const std::string & endpoint, std::string & host, int & port) {
-    size_t pos = endpoint.find(':');
+    if (socket_t::is_usb4_endpoint(endpoint.c_str())) {
+        host = socket_t::normalize_usb4_dev_path(endpoint.c_str());
+        port = 0;
+        return true;
+    }
+    size_t pos = endpoint.rfind(':');
     if (pos == std::string::npos) {
+        if (endpoint.rfind("/dev/tbstream", 0) == 0) {
+            host = endpoint;
+            port = 0;
+            return true;
+        }
         return false;
     }
     host = endpoint.substr(0, pos);
@@ -2090,11 +2100,15 @@ void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir
         return;
     }
 
+    if (socket_t::is_usb4_endpoint(endpoint) || port == 0) {
+        printf("  transport      : USB4STREAM (%s)\n", host.c_str());
+    } else {
 #ifdef GGML_RPC_RDMA
-    printf("  transport      : TCP (RDMA auto-negotiate enabled)\n");
+        printf("  transport      : TCP (RDMA auto-negotiate enabled)\n");
 #else
-    printf("  transport      : TCP\n");
+        printf("  transport      : TCP\n");
 #endif // GGML_RPC_RDMA
+    }
     if (!rpc_transport_init()) {
         fprintf(stderr, "Failed to initialize RPC transport\n");
         return;

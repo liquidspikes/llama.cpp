@@ -1,12 +1,22 @@
 message(STATUS "Using RPC backend")
 
+option(GGML_RPC_USB4STREAM "ggml: enable USB4STREAM clustering transport for RPC" ON)
+
 ggml_add_backend_library(ggml-rpc
                          ggml-rpc.cpp
                          transport.cpp
+                         transport-usb4stream.cpp
                         )
 
 if (WIN32)
     target_link_libraries(ggml-rpc PRIVATE ws2_32)
+endif()
+
+if (GGML_RPC_USB4STREAM)
+    target_compile_definitions(ggml-rpc PRIVATE GGML_RPC_USB4STREAM)
+    message(STATUS "  USB4STREAM clustering transport enabled")
+else()
+    message(STATUS "  USB4STREAM transport disabled")
 endif()
 
 # RDMA auto-detection: Linux RoCE/IB via libibverbs, Apple RDMA-over-Thunderbolt via librdma
