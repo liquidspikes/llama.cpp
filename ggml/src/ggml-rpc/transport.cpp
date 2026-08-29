@@ -486,7 +486,12 @@ static bool stream_write_exact(int fd, const void * buf, size_t size) {
     size_t total = 0;
     while (total < size) {
         ssize_t n = ::write(fd, p + total, size - total);
-        if (n <= 0) return false;
+        if (n <= 0) {
+            if (n < 0 && (errno == EINTR || errno == EAGAIN)) continue;
+            GGML_LOG_ERROR("stream_write_exact failed: fd=%d, n=%zd, total=%zu, size=%zu, errno=%d (%s)\n",
+                           fd, n, total, size, errno, strerror(errno));
+            return false;
+        }
         total += (size_t)n;
     }
     return true;
@@ -497,14 +502,19 @@ static bool stream_read_exact(int fd, void * buf, size_t size) {
     size_t total = 0;
     while (total < size) {
         ssize_t n = ::read(fd, p + total, size - total);
-        if (n <= 0) return false;
+        if (n <= 0) {
+            if (n < 0 && (errno == EINTR || errno == EAGAIN)) continue;
+            GGML_LOG_ERROR("stream_read_exact failed: fd=%d, n=%zd, total=%zu, size=%zu, errno=%d (%s)\n",
+                           fd, n, total, size, errno, strerror(errno));
+            return false;
+        }
         total += (size_t)n;
     }
     return true;
 }
 #endif
 
-class stream_rpc_transport : public rpc_transport {
+class stream_rpc_transport : public rpc_transport, public std::enable_shared_from_this<stream_rpc_transport> {
 public:
     int data_fd = -1;
     int ctrl_fd = -1;
@@ -514,7 +524,17 @@ public:
     std::mutex data_send_mu, data_recv_mu, ctrl_send_mu, ctrl_recv_mu;
     stream_rpc_transport(int dfd, int cfd, const std::string & dpath, const std::string & cpath, bool listener = false)
         : data_fd(dfd), ctrl_fd(cfd), data_path(dpath), ctrl_path(cpath), is_listener(listener) {}
-    ~stream_rpc_transport() override { close(); }
+    ~stream_rpc_transport() override {
+        if (!is_listener) {
+            close();
+        } else {
+#ifndef _WIN32
+            if (ctrl_fd >= 0 && ctrl_fd != data_fd) ::close(ctrl_fd);
+            if (data_fd >= 0) ::close(data_fd);
+            ctrl_fd = data_fd = -1;
+#endif
+        }
+    }
     int get_fd_for_channel(uint32_t channel_id) const { return (channel_id == RPC_CHANNEL_DATA) ? data_fd : ctrl_fd; }
     std::mutex & get_send_mutex(uint32_t channel_id) { return (channel_id == RPC_CHANNEL_DATA) ? data_send_mu : ctrl_send_mu; }
     std::mutex & get_recv_mutex(uint32_t channel_id) { return (channel_id == RPC_CHANNEL_DATA) ? data_recv_mu : ctrl_recv_mu; }
@@ -522,75 +542,21 @@ public:
     bool recv_exact(void * data, size_t size) override { return recv_exact_channel(RPC_CHANNEL_CONTROL, data, size); }
     bool send_exact_channel(uint32_t channel_id, const void * data, size_t size) override {
 #ifndef _WIN32
+        if (size == 0 || data == nullptr) return true;
         int fd = get_fd_for_channel(channel_id);
         std::lock_guard<std::mutex> lock(get_send_mutex(channel_id));
-        stream_frame_header hdr = {STREAM_FRAME_MAGIC, channel_id, (uint64_t)size};
-        if (!stream_write_exact(fd, &hdr, sizeof(hdr))) return false;
-        return (size == 0 || data == nullptr || stream_write_exact(fd, data, size));
+        return stream_write_exact(fd, data, size);
 #else
-        return false;
-#endif
-    }
-    bool recv_frame_header(int fd, uint32_t expected_channel, stream_frame_header & hdr) {
-#ifndef _WIN32
-        if (!stream_read_exact(fd, &hdr, sizeof(hdr))) {
-            return false;
-        }
-        if (hdr.magic == STREAM_FRAME_MAGIC) {
-            return true;
-        }
-
-        // Robust Resynchronization: scan for STREAM_FRAME_MAGIC
-        GGML_LOG_WARN("Stream framing desync on fd %d (read magic=0x%08x, expected 0x%08x). Attempting resync...\n",
-                      fd, hdr.magic, STREAM_FRAME_MAGIC);
-
-        uint8_t raw[sizeof(stream_frame_header)];
-        memcpy(raw, &hdr, sizeof(hdr));
-
-        for (size_t offset = 1; offset <= sizeof(stream_frame_header) - 4; ++offset) {
-            uint32_t cand;
-            memcpy(&cand, raw + offset, 4);
-            if (cand == STREAM_FRAME_MAGIC) {
-                size_t tail = sizeof(stream_frame_header) - offset;
-                memmove(raw, raw + offset, tail);
-                if (!stream_read_exact(fd, raw + tail, sizeof(stream_frame_header) - tail)) {
-                    return false;
-                }
-                memcpy(&hdr, raw, sizeof(hdr));
-                GGML_LOG_INFO("Stream framing resynchronized at buffer offset %zu!\n", offset);
-                return true;
-            }
-        }
-
-        uint32_t window = 0;
-        memcpy(&window, raw + sizeof(stream_frame_header) - 4, 4);
-        while (true) {
-            uint8_t byte = 0;
-            if (!stream_read_exact(fd, &byte, 1)) {
-                return false;
-            }
-            window = (window >> 8) | ((uint32_t)byte << 24);
-            if (window == STREAM_FRAME_MAGIC) {
-                hdr.magic = STREAM_FRAME_MAGIC;
-                if (!stream_read_exact(fd, ((uint8_t*)&hdr) + 4, sizeof(hdr) - 4)) {
-                    return false;
-                }
-                GGML_LOG_INFO("Stream framing resynchronized from incoming stream!\n");
-                return true;
-            }
-        }
-#else
-        (void)fd; (void)expected_channel; (void)hdr;
+        (void)channel_id; (void)data; (void)size;
         return false;
 #endif
     }
     bool recv_exact_channel(uint32_t channel_id, void * data, size_t size) override {
 #ifndef _WIN32
+        if (size == 0 || data == nullptr) return true;
         int fd = get_fd_for_channel(channel_id);
         std::lock_guard<std::mutex> lock(get_recv_mutex(channel_id));
-        stream_frame_header hdr = {};
-        if (!recv_frame_header(fd, channel_id, hdr) || hdr.payload_len != size) return false;
-        return (size == 0 || data == nullptr || stream_read_exact(fd, data, size));
+        return stream_read_exact(fd, data, size);
 #else
         (void)channel_id; (void)data; (void)size;
         return false;
@@ -598,26 +564,12 @@ public:
     }
     bool recv_cmd(uint8_t * cmd, uint32_t * out_channel) override {
 #ifndef _WIN32
-        if (ctrl_fd == data_fd || data_fd < 0) {
-            if (out_channel) *out_channel = RPC_CHANNEL_CONTROL;
-            return recv_exact_channel(RPC_CHANNEL_CONTROL, cmd, 1);
-        }
-        struct pollfd pfds[2] = {{ctrl_fd, POLLIN, 0}, {data_fd, POLLIN, 0}};
-        while (poll(pfds, 2, -1) > 0) {
-            if (pfds[0].revents & POLLIN) {
-                if (out_channel) *out_channel = RPC_CHANNEL_CONTROL;
-                return recv_exact_channel(RPC_CHANNEL_CONTROL, cmd, 1);
-            } else if (pfds[1].revents & POLLIN) {
-                if (out_channel) *out_channel = RPC_CHANNEL_DATA;
-                return recv_exact_channel(RPC_CHANNEL_DATA, cmd, 1);
-            } else if ((pfds[0].revents | pfds[1].revents) & (POLLHUP | POLLERR | POLLNVAL)) {
-                return false;
-            }
-        }
+        if (out_channel) *out_channel = RPC_CHANNEL_CONTROL;
+        return recv_exact_channel(RPC_CHANNEL_CONTROL, cmd, 1);
 #else
         (void)cmd; (void)out_channel;
-#endif
         return false;
+#endif
     }
     bool flush() override {
 #ifndef _WIN32
@@ -633,8 +585,41 @@ public:
         ctrl_fd = data_fd = -1;
 #endif
     }
+    bool is_first_accept = true;
     std::shared_ptr<rpc_transport> accept() override {
-        return is_listener ? std::make_shared<stream_rpc_transport>(data_fd, ctrl_fd, data_path, ctrl_path, false) : nullptr;
+        if (!is_listener) return nullptr;
+#ifndef _WIN32
+        if (is_first_accept) {
+            is_first_accept = false;
+            return shared_from_this();
+        }
+        if (data_fd >= 0) ::close(data_fd);
+        if (ctrl_fd >= 0 && ctrl_fd != data_fd) ::close(ctrl_fd);
+        data_fd = -1;
+        ctrl_fd = -1;
+
+        int dfd = ::open(data_path.c_str(), O_RDWR);
+        if (dfd < 0) {
+            GGML_LOG_ERROR("Failed to open data stream device '%s': %s\n", data_path.c_str(), strerror(errno));
+            return nullptr;
+        }
+        int cfd = -1;
+        if (data_path == ctrl_path) {
+            cfd = dfd;
+        } else {
+            cfd = ::open(ctrl_path.c_str(), O_RDWR);
+            if (cfd < 0) {
+                GGML_LOG_ERROR("Failed to open control stream device '%s': %s\n", ctrl_path.c_str(), strerror(errno));
+                ::close(dfd);
+                return nullptr;
+            }
+        }
+        data_fd = dfd;
+        ctrl_fd = cfd;
+        return shared_from_this();
+#else
+        return nullptr;
+#endif
     }
     bool is_stream() const override { return true; }
     static std::shared_ptr<stream_rpc_transport> open_stream(const std::string & data_path, const std::string & ctrl_path, bool is_server = false) {

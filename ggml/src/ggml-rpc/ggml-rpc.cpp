@@ -340,17 +340,22 @@ static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, 
 // RPC response: | response_size (8 bytes) | response_data (response_size bytes) |
 static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, size_t input_size, void * output, size_t output_size) {
     if (!send_rpc_cmd(sock, cmd, input, input_size)) {
+        GGML_LOG_ERROR("send_rpc_cmd: failed to send input for cmd=%d (size=%zu)\n", (int)cmd, input_size);
         return false;
     }
     uint32_t channel = rpc_cmd_to_channel(cmd);
-    uint64_t out_size;
+    uint64_t out_size = 0;
     if (!sock->recv_data_channel(channel, &out_size, sizeof(out_size))) {
+        GGML_LOG_ERROR("send_rpc_cmd: failed to recv out_size for cmd=%d on channel=%u\n", (int)cmd, channel);
         return false;
     }
     if (out_size != output_size) {
+        GGML_LOG_ERROR("send_rpc_cmd: out_size mismatch for cmd=%d (got %" PRIu64 ", expected %zu)\n",
+                       (int)cmd, out_size, output_size);
         return false;
     }
     if (!sock->recv_data_channel(channel, output, output_size)) {
+        GGML_LOG_ERROR("send_rpc_cmd: failed to recv output payload for cmd=%d (size=%zu)\n", (int)cmd, output_size);
         return false;
     }
     return true;
@@ -1776,11 +1781,15 @@ bool rpc_server::graph_recompute(const rpc_msg_graph_recompute_req & request) {
 bool rpc_server::get_device_memory(const rpc_msg_get_device_memory_req & request, rpc_msg_get_device_memory_rsp & response) {
     uint32_t dev_id = request.device;
     if (dev_id >= backends.size()) {
-        return false;
+        response.free_mem = 0;
+        response.total_mem = 0;
+        return true;
     }
-    size_t free, total;
+    size_t free = 0, total = 0;
     ggml_backend_dev_t dev = ggml_backend_get_device(backends[dev_id]);
-    ggml_backend_dev_memory(dev, &free, &total);
+    if (dev) {
+        ggml_backend_dev_memory(dev, &free, &total);
+    }
     response.free_mem = free;
     response.total_mem = total;
     LOG_DBG("[%s] device: %u, free_mem: %" PRIu64 ", total_mem: %" PRIu64 "\n", __func__, dev_id, response.free_mem, response.total_mem);

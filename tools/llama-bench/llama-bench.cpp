@@ -174,7 +174,12 @@ static std::vector<ggml_backend_dev_t> parse_devices_arg(const std::string & val
 }
 
 static void register_rpc_server_list(const std::string & servers) {
-    auto rpc_servers = string_split<std::string>(servers, ',');
+    std::vector<std::string> rpc_servers;
+    if (servers.rfind("dev://", 0) == 0 || servers.rfind("stream://", 0) == 0 || servers.find("/dev/") == 0) {
+        rpc_servers.push_back(servers);
+    } else {
+        rpc_servers = string_split<std::string>(servers, ',');
+    }
     if (rpc_servers.empty()) {
         throw std::invalid_argument("no RPC servers specified");
     }
