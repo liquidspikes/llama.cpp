@@ -487,7 +487,7 @@ static bool stream_write_exact(int fd, const void * buf, size_t size) {
     const uint8_t * p = static_cast<const uint8_t *>(buf);
     size_t total = 0;
     while (total < size) {
-        size_t chunk = std::min(size - total, (size_t)(32 * 1024));
+        size_t chunk = std::min(size - total, (size_t)8192);
         errno = 0;
         ssize_t n = ::write(fd, p + total, chunk);
         if (n < 0) {
@@ -512,7 +512,7 @@ static bool stream_read_exact(int fd, void * buf, size_t size) {
     uint8_t * p = static_cast<uint8_t *>(buf);
     size_t total = 0;
     while (total < size) {
-        size_t chunk = std::min(size - total, (size_t)(64 * 1024));
+        size_t chunk = std::min(size - total, (size_t)65536);
         errno = 0;
         ssize_t n = ::read(fd, p + total, chunk);
         if (n < 0) {
