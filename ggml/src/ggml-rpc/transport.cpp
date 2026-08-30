@@ -500,7 +500,7 @@ static bool stream_write_exact(int fd, const void * buf, size_t size) {
         if (pr == 0) {
             continue; // Poll timeout, recheck
         }
-        size_t chunk = std::min(size - total, (size_t)8192);
+        size_t chunk = std::min(size - total, (size_t)4095);
         errno = 0;
         ssize_t n = ::write(fd, p + total, chunk);
         if (n < 0) {
