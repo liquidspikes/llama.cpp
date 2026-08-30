@@ -592,8 +592,14 @@ public:
         }
     }
     int get_fd_for_channel(uint32_t channel_id) const { return (channel_id == RPC_CHANNEL_DATA) ? data_fd : ctrl_fd; }
-    std::mutex & get_send_mutex(uint32_t channel_id) { return (channel_id == RPC_CHANNEL_DATA) ? data_send_mu : ctrl_send_mu; }
-    std::mutex & get_recv_mutex(uint32_t channel_id) { return (channel_id == RPC_CHANNEL_DATA) ? data_recv_mu : ctrl_recv_mu; }
+    std::mutex & get_send_mutex(uint32_t channel_id) {
+        if (data_fd == ctrl_fd) return data_send_mu;
+        return (channel_id == RPC_CHANNEL_DATA) ? data_send_mu : ctrl_send_mu;
+    }
+    std::mutex & get_recv_mutex(uint32_t channel_id) {
+        if (data_fd == ctrl_fd) return data_recv_mu;
+        return (channel_id == RPC_CHANNEL_DATA) ? data_recv_mu : ctrl_recv_mu;
+    }
     bool send_exact(const void * data, size_t size) override { return send_exact_channel(RPC_CHANNEL_CONTROL, data, size); }
     bool recv_exact(void * data, size_t size) override { return recv_exact_channel(RPC_CHANNEL_CONTROL, data, size); }
     bool send_exact_channel(uint32_t channel_id, const void * data, size_t size) override {
