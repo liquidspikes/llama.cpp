@@ -484,16 +484,19 @@ std::shared_ptr<rpc_transport> tcp_rpc_transport::accept() {
 static bool stream_write_exact(int fd, const void * buf, size_t size) {
     const uint8_t * p = static_cast<const uint8_t *>(buf);
     size_t total = 0;
-    size_t bytes_since_poll = 0;
     while (total < size) {
-        size_t chunk = std::min(size - total, (size_t)4096);
+        size_t chunk = std::min(size - total, (size_t)(1024 * 1024));
         errno = 0;
         ssize_t n = ::write(fd, p + total, chunk);
         if (n <= 0) {
-            if (n < 0 && (errno == EINTR || errno == EAGAIN || errno == ENXIO || errno == EBUSY)) {
+            if (n < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK || errno == ENXIO || errno == EBUSY)) {
                 struct pollfd pfd = {fd, POLLOUT, 0};
-                poll(&pfd, 1, 2);
-                usleep(50);
+                poll(&pfd, 1, 5);
+                continue;
+            }
+            if (n == 0) {
+                struct pollfd pfd = {fd, POLLOUT, 0};
+                poll(&pfd, 1, 5);
                 continue;
             }
             GGML_LOG_ERROR("stream_write_exact failed: fd=%d, n=%zd, total=%zu, size=%zu, errno=%d (%s)\n",
@@ -501,12 +504,6 @@ static bool stream_write_exact(int fd, const void * buf, size_t size) {
             return false;
         }
         total += (size_t)n;
-        bytes_since_poll += (size_t)n;
-        if (bytes_since_poll >= 256 * 1024) {
-            struct pollfd pfd = {fd, POLLOUT, 0};
-            poll(&pfd, 1, 1);
-            bytes_since_poll = 0;
-        }
     }
     return true;
 }
@@ -515,22 +512,19 @@ static bool stream_read_exact(int fd, void * buf, size_t size) {
     uint8_t * p = static_cast<uint8_t *>(buf);
     size_t total = 0;
     while (total < size) {
-        size_t chunk = std::min(size - total, (size_t)4096);
+        size_t chunk = std::min(size - total, (size_t)(1024 * 1024));
         errno = 0;
         ssize_t n = ::read(fd, p + total, chunk);
         if (n <= 0) {
-            if (n < 0 && (errno == EINTR || errno == EAGAIN)) {
+            if (n < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK || errno == EBUSY)) {
                 struct pollfd pfd = {fd, POLLIN, 0};
-                poll(&pfd, 1, 10);
+                poll(&pfd, 1, 50);
                 continue;
             }
             if (n == 0) {
-                // Character device stream may return 0 when ring is waiting for remote compute
                 struct pollfd pfd = {fd, POLLIN, 0};
-                int pr = poll(&pfd, 1, 100);
-                if (pr >= 0) {
-                    continue;
-                }
+                poll(&pfd, 1, 50);
+                continue;
             }
             GGML_LOG_ERROR("stream_read_exact failed: fd=%d, n=%zd, total=%zu, size=%zu, errno=%d (%s)\n",
                            fd, n, total, size, errno, strerror(errno));
@@ -648,7 +642,7 @@ public:
     bool is_stream() const override { return true; }
     static std::shared_ptr<stream_rpc_transport> open_stream(const std::string & data_path, const std::string & ctrl_path, bool is_server = false) {
 #ifndef _WIN32
-        int dfd = ::open(data_path.c_str(), O_RDWR | O_SYNC);
+        int dfd = ::open(data_path.c_str(), O_RDWR);
         if (dfd < 0) {
             GGML_LOG_ERROR("Failed to open data stream device '%s': %s\n", data_path.c_str(), strerror(errno));
             return nullptr;
@@ -657,7 +651,7 @@ public:
         if (data_path == ctrl_path) {
             cfd = dfd;
         } else {
-            cfd = ::open(ctrl_path.c_str(), O_RDWR | O_SYNC);
+            cfd = ::open(ctrl_path.c_str(), O_RDWR);
             if (cfd < 0) {
                 GGML_LOG_ERROR("Failed to open control stream device '%s': %s\n", ctrl_path.c_str(), strerror(errno));
                 ::close(dfd);

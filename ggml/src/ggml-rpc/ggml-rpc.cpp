@@ -261,11 +261,22 @@ static inline uint32_t rpc_cmd_to_channel(enum rpc_cmd cmd) {
 }
 
 static bool send_msg(socket_ptr sock, const void * msg, size_t msg_size, uint32_t channel = RPC_CHANNEL_CONTROL) {
-    if (!sock->send_data_channel(channel, &msg_size, sizeof(msg_size))) {
-        return false;
-    }
-    if (!sock->send_data_channel(channel, msg, msg_size)) {
-        return false;
+    if (msg_size <= 65536) {
+        uint8_t stack_buf[sizeof(size_t) + 65536];
+        memcpy(stack_buf, &msg_size, sizeof(msg_size));
+        if (msg && msg_size > 0) {
+            memcpy(stack_buf + sizeof(msg_size), msg, msg_size);
+        }
+        if (!sock->send_data_channel(channel, stack_buf, sizeof(msg_size) + msg_size)) {
+            return false;
+        }
+    } else {
+        if (!sock->send_data_channel(channel, &msg_size, sizeof(msg_size))) {
+            return false;
+        }
+        if (!sock->send_data_channel(channel, msg, msg_size)) {
+            return false;
+        }
     }
     return sock->flush();
 }
@@ -315,14 +326,26 @@ static bool parse_endpoint(const std::string & endpoint, std::string & host, int
 static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, size_t input_size) {
     uint8_t cmd_byte = cmd;
     uint32_t channel = rpc_cmd_to_channel(cmd);
-    if (!sock->send_data_channel(channel, &cmd_byte, sizeof(cmd_byte))) {
-        return false;
-    }
-    if (!sock->send_data_channel(channel, &input_size, sizeof(input_size))) {
-        return false;
-    }
-    if (!sock->send_data_channel(channel, input, input_size)) {
-        return false;
+    if (input_size <= 65536) {
+        uint8_t stack_buf[1 + sizeof(size_t) + 65536];
+        stack_buf[0] = cmd_byte;
+        memcpy(stack_buf + 1, &input_size, sizeof(input_size));
+        if (input && input_size > 0) {
+            memcpy(stack_buf + 1 + sizeof(input_size), input, input_size);
+        }
+        if (!sock->send_data_channel(channel, stack_buf, 1 + sizeof(input_size) + input_size)) {
+            return false;
+        }
+    } else {
+        if (!sock->send_data_channel(channel, &cmd_byte, sizeof(cmd_byte))) {
+            return false;
+        }
+        if (!sock->send_data_channel(channel, &input_size, sizeof(input_size))) {
+            return false;
+        }
+        if (!sock->send_data_channel(channel, input, input_size)) {
+            return false;
+        }
     }
     return sock->flush();
 }
