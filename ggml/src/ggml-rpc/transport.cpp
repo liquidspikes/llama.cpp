@@ -485,13 +485,13 @@ static bool stream_write_exact(int fd, const void * buf, size_t size) {
     const uint8_t * p = static_cast<const uint8_t *>(buf);
     size_t total = 0;
     while (total < size) {
-        size_t chunk = std::min(size - total, (size_t)(1024 * 1024));
+        size_t chunk = std::min(size - total, (size_t)(16 * 1024));
         errno = 0;
         ssize_t n = ::write(fd, p + total, chunk);
         if (n < 0) {
             if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK || errno == ENXIO || errno == EBUSY) {
                 struct pollfd pfd = {fd, POLLOUT, 0};
-                poll(&pfd, 1, 10);
+                poll(&pfd, 1, 5);
                 continue;
             }
             GGML_LOG_ERROR("stream_write_exact failed: fd=%d, n=%zd, total=%zu, size=%zu, errno=%d (%s)\n",
@@ -500,7 +500,7 @@ static bool stream_write_exact(int fd, const void * buf, size_t size) {
         }
         if (n == 0) {
             struct pollfd pfd = {fd, POLLOUT, 0};
-            poll(&pfd, 1, 10);
+            poll(&pfd, 1, 5);
             continue;
         }
         total += (size_t)n;
@@ -512,13 +512,13 @@ static bool stream_read_exact(int fd, void * buf, size_t size) {
     uint8_t * p = static_cast<uint8_t *>(buf);
     size_t total = 0;
     while (total < size) {
-        size_t chunk = std::min(size - total, (size_t)(1024 * 1024));
+        size_t chunk = std::min(size - total, (size_t)(16 * 1024));
         errno = 0;
         ssize_t n = ::read(fd, p + total, chunk);
         if (n < 0) {
             if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK || errno == EBUSY) {
                 struct pollfd pfd = {fd, POLLIN, 0};
-                poll(&pfd, 1, 10);
+                poll(&pfd, 1, 5);
                 continue;
             }
             GGML_LOG_ERROR("stream_read_exact failed: fd=%d, n=%zd, total=%zu, size=%zu, errno=%d (%s)\n",
@@ -527,7 +527,7 @@ static bool stream_read_exact(int fd, void * buf, size_t size) {
         }
         if (n == 0) {
             struct pollfd pfd = {fd, POLLIN, 0};
-            poll(&pfd, 1, 10);
+            poll(&pfd, 1, 5);
             continue;
         }
         total += (size_t)n;
