@@ -484,10 +484,22 @@ std::shared_ptr<rpc_transport> tcp_rpc_transport::accept() {
 
 #ifndef _WIN32
 #include <fcntl.h>
+#include <poll.h>
+
 static bool stream_write_exact(int fd, const void * buf, size_t size) {
     const uint8_t * p = static_cast<const uint8_t *>(buf);
     size_t total = 0;
     while (total < size) {
+        struct pollfd pfd = { fd, POLLOUT | POLLERR | POLLHUP, 0 };
+        int pr = ::poll(&pfd, 1, 100);
+        if (pr < 0) {
+            if (errno == EINTR || errno == EAGAIN) continue;
+            GGML_LOG_ERROR("stream_write_exact poll error: fd=%d, errno=%d (%s)\n", fd, errno, strerror(errno));
+            return false;
+        }
+        if (pr == 0) {
+            continue; // Poll timeout, recheck
+        }
         size_t chunk = std::min(size - total, (size_t)8192);
         errno = 0;
         ssize_t n = ::write(fd, p + total, chunk);
@@ -515,6 +527,16 @@ static bool stream_read_exact(int fd, void * buf, size_t size) {
     size_t total = 0;
     int zero_count = 0;
     while (total < size) {
+        struct pollfd pfd = { fd, POLLIN | POLLERR | POLLHUP, 0 };
+        int pr = ::poll(&pfd, 1, 100);
+        if (pr < 0) {
+            if (errno == EINTR || errno == EAGAIN) continue;
+            GGML_LOG_ERROR("stream_read_exact poll error: fd=%d, errno=%d (%s)\n", fd, errno, strerror(errno));
+            return false;
+        }
+        if (pr == 0) {
+            continue; // Poll timeout, recheck
+        }
         size_t chunk = std::min(size - total, (size_t)65536);
         errno = 0;
         ssize_t n = ::read(fd, p + total, chunk);
