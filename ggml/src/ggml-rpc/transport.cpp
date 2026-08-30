@@ -28,6 +28,8 @@
 #include <optional>
 #include <algorithm>
 #include <vector>
+#include <thread>
+#include <chrono>
 
 #ifdef GGML_RPC_RDMA
 #  include <infiniband/verbs.h>
@@ -484,14 +486,18 @@ std::shared_ptr<rpc_transport> tcp_rpc_transport::accept() {
 static bool stream_write_exact(int fd, const void * buf, size_t size) {
     const uint8_t * p = static_cast<const uint8_t *>(buf);
     size_t total = 0;
+    int retries = 0;
     while (total < size) {
-        size_t chunk = std::min(size - total, (size_t)(16 * 1024));
+        size_t chunk = std::min(size - total, (size_t)(64 * 1024));
         errno = 0;
         ssize_t n = ::write(fd, p + total, chunk);
         if (n < 0) {
             if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK || errno == ENXIO || errno == EBUSY) {
-                struct pollfd pfd = {fd, POLLOUT, 0};
-                poll(&pfd, 1, 5);
+                if (++retries > 50) {
+                    std::this_thread::sleep_for(std::chrono::microseconds(50));
+                } else {
+                    std::this_thread::yield();
+                }
                 continue;
             }
             GGML_LOG_ERROR("stream_write_exact failed: fd=%d, n=%zd, total=%zu, size=%zu, errno=%d (%s)\n",
@@ -499,11 +505,15 @@ static bool stream_write_exact(int fd, const void * buf, size_t size) {
             return false;
         }
         if (n == 0) {
-            struct pollfd pfd = {fd, POLLOUT, 0};
-            poll(&pfd, 1, 5);
+            if (++retries > 50) {
+                std::this_thread::sleep_for(std::chrono::microseconds(50));
+            } else {
+                std::this_thread::yield();
+            }
             continue;
         }
         total += (size_t)n;
+        retries = 0;
     }
     return true;
 }
@@ -511,14 +521,18 @@ static bool stream_write_exact(int fd, const void * buf, size_t size) {
 static bool stream_read_exact(int fd, void * buf, size_t size) {
     uint8_t * p = static_cast<uint8_t *>(buf);
     size_t total = 0;
+    int retries = 0;
     while (total < size) {
-        size_t chunk = std::min(size - total, (size_t)(16 * 1024));
+        size_t chunk = std::min(size - total, (size_t)(64 * 1024));
         errno = 0;
         ssize_t n = ::read(fd, p + total, chunk);
         if (n < 0) {
             if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK || errno == EBUSY) {
-                struct pollfd pfd = {fd, POLLIN, 0};
-                poll(&pfd, 1, 5);
+                if (++retries > 50) {
+                    std::this_thread::sleep_for(std::chrono::microseconds(50));
+                } else {
+                    std::this_thread::yield();
+                }
                 continue;
             }
             GGML_LOG_ERROR("stream_read_exact failed: fd=%d, n=%zd, total=%zu, size=%zu, errno=%d (%s)\n",
@@ -526,11 +540,15 @@ static bool stream_read_exact(int fd, void * buf, size_t size) {
             return false;
         }
         if (n == 0) {
-            struct pollfd pfd = {fd, POLLIN, 0};
-            poll(&pfd, 1, 5);
+            if (++retries > 50) {
+                std::this_thread::sleep_for(std::chrono::microseconds(50));
+            } else {
+                std::this_thread::yield();
+            }
             continue;
         }
         total += (size_t)n;
+        retries = 0;
     }
     return true;
 }
