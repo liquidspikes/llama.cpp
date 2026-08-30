@@ -488,13 +488,13 @@ static bool stream_write_exact(int fd, const void * buf, size_t size) {
     size_t total = 0;
     int retries = 0;
     while (total < size) {
-        size_t chunk = std::min(size - total, (size_t)4096);
+        size_t chunk = std::min(size - total, (size_t)(32 * 1024));
         errno = 0;
         ssize_t n = ::write(fd, p + total, chunk);
         if (n < 0) {
             if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK || errno == ENXIO || errno == EBUSY) {
-                if (++retries > 100) {
-                    std::this_thread::sleep_for(std::chrono::microseconds(20));
+                if (++retries > 500) {
+                    std::this_thread::sleep_for(std::chrono::microseconds(50));
                 } else {
                     std::this_thread::yield();
                 }
@@ -505,8 +505,8 @@ static bool stream_write_exact(int fd, const void * buf, size_t size) {
             return false;
         }
         if (n == 0) {
-            if (++retries > 100) {
-                std::this_thread::sleep_for(std::chrono::microseconds(20));
+            if (++retries > 500) {
+                std::this_thread::sleep_for(std::chrono::microseconds(50));
             } else {
                 std::this_thread::yield();
             }
@@ -523,13 +523,13 @@ static bool stream_read_exact(int fd, void * buf, size_t size) {
     size_t total = 0;
     int retries = 0;
     while (total < size) {
-        size_t chunk = std::min(size - total, (size_t)4096);
+        size_t chunk = std::min(size - total, (size_t)(64 * 1024));
         errno = 0;
         ssize_t n = ::read(fd, p + total, chunk);
         if (n < 0) {
             if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK || errno == EBUSY) {
-                if (++retries > 100) {
-                    std::this_thread::sleep_for(std::chrono::microseconds(20));
+                if (++retries > 500) {
+                    std::this_thread::sleep_for(std::chrono::microseconds(50));
                 } else {
                     std::this_thread::yield();
                 }
@@ -540,8 +540,8 @@ static bool stream_read_exact(int fd, void * buf, size_t size) {
             return false;
         }
         if (n == 0) {
-            if (++retries > 100) {
-                std::this_thread::sleep_for(std::chrono::microseconds(20));
+            if (++retries > 500) {
+                std::this_thread::sleep_for(std::chrono::microseconds(50));
             } else {
                 std::this_thread::yield();
             }
