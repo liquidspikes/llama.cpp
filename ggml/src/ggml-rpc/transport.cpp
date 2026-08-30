@@ -491,15 +491,18 @@ static bool stream_write_exact(int fd, const void * buf, size_t size) {
         errno = 0;
         ssize_t n = ::write(fd, p + total, size - total);
         if (n < 0) {
-            if (errno == EINTR) continue;
+            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK || errno == ENOBUFS || errno == ENOMEM) {
+                std::this_thread::sleep_for(std::chrono::microseconds(50));
+                continue;
+            }
             GGML_LOG_ERROR("stream_write_exact failed: fd=%d, n=%zd, total=%zu, size=%zu, errno=%d (%s)\n",
                            fd, n, total, size, errno, strerror(errno));
             return false;
         }
         if (n == 0) {
-            GGML_LOG_ERROR("stream_write_exact: write returned 0 (fd=%d, total=%zu, size=%zu)\n",
-                           fd, total, size);
-            return false;
+            // Kernel tbstream driver returns 0 when TX ring is temporarily out of buffers (-ENOBUFS)
+            std::this_thread::sleep_for(std::chrono::microseconds(50));
+            continue;
         }
         total += (size_t)n;
     }
@@ -509,20 +512,29 @@ static bool stream_write_exact(int fd, const void * buf, size_t size) {
 static bool stream_read_exact(int fd, void * buf, size_t size) {
     uint8_t * p = static_cast<uint8_t *>(buf);
     size_t total = 0;
+    int zero_count = 0;
     while (total < size) {
         errno = 0;
         ssize_t n = ::read(fd, p + total, size - total);
         if (n < 0) {
-            if (errno == EINTR) continue;
+            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
+                std::this_thread::sleep_for(std::chrono::microseconds(50));
+                continue;
+            }
             GGML_LOG_ERROR("stream_read_exact failed: fd=%d, n=%zd, total=%zu, size=%zu, errno=%d (%s)\n",
                            fd, n, total, size, errno, strerror(errno));
             return false;
         }
         if (n == 0) {
-            // EOF: peer closed the stream (0x3 EOP received by kernel)
-            return false;
+            // EOF (peer closed): verify if persistent EOF
+            if (++zero_count > 200) {
+                return false;
+            }
+            std::this_thread::sleep_for(std::chrono::microseconds(100));
+            continue;
         }
         total += (size_t)n;
+        zero_count = 0;
     }
     return true;
 }
