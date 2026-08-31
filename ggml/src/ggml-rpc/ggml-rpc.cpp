@@ -77,6 +77,7 @@ enum rpc_cmd {
     RPC_CMD_DEVICE_COUNT,
     RPC_CMD_GRAPH_RECOMPUTE,
     RPC_CMD_MEMSET_TENSOR,
+    RPC_CMD_ALL_REDUCE,
     RPC_CMD_NONE,
     RPC_CMD_COUNT,
 };
@@ -2094,6 +2095,58 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                 }
                 break;
             }
+            case RPC_CMD_ALL_REDUCE: {
+                rpc_msg_get_tensor_req request;
+                if (!recv_msg(sock, &request, sizeof(request), cmd_channel)) {
+                    return;
+                }
+                
+                size_t bytes = request.size;
+                std::vector<uint8_t> node1_data(bytes);
+                if (!recv_msg(sock, node1_data.data(), bytes, cmd_channel)) {
+                    return;
+                }
+                
+                std::vector<uint8_t> node2_data;
+                if (!server.get_tensor(request, node2_data)) {
+                    return;
+                }
+                
+                if (request.tensor.type == GGML_TYPE_F32) {
+                    float * d1 = (float *)node1_data.data();
+                    float * d2 = (float *)node2_data.data();
+                    for (size_t i = 0; i < bytes / sizeof(float); i++) {
+                        d1[i] += d2[i];
+                    }
+                } else if (request.tensor.type == GGML_TYPE_F16) {
+                    ggml_fp16_t * d1 = (ggml_fp16_t *)node1_data.data();
+                    ggml_fp16_t * d2 = (ggml_fp16_t *)node2_data.data();
+                    for (size_t i = 0; i < bytes / sizeof(ggml_fp16_t); i++) {
+                        d1[i] = ggml_compute_fp32_to_fp16(ggml_compute_fp16_to_fp32(d1[i]) + ggml_compute_fp16_to_fp32(d2[i]));
+                    }
+                } else {
+                    GGML_LOG_ERROR("Unsupported tensor type for RPC_CMD_ALL_REDUCE: %d\n", request.tensor.type);
+                    return;
+                }
+                
+                std::vector<uint8_t> set_input(sizeof(rpc_tensor) + sizeof(uint64_t) + bytes);
+                memcpy(set_input.data(), &request.tensor, sizeof(rpc_tensor));
+                uint64_t offset = request.offset;
+                memcpy(set_input.data() + sizeof(rpc_tensor), &offset, sizeof(offset));
+                memcpy(set_input.data() + sizeof(rpc_tensor) + sizeof(offset), node1_data.data(), bytes);
+                
+                if (!server.set_tensor(set_input)) {
+                    return;
+                }
+                
+                if (!sock->send_data_channel(cmd_channel, node1_data.data(), bytes)) {
+                    return;
+                }
+                if (!sock->flush()) {
+                    return;
+                }
+                break;
+            }
             default: {
                 GGML_LOG_ERROR("Unknown command: %d\n", cmd);
                 return;
@@ -2316,7 +2369,77 @@ static ggml_backend_dev_t ggml_backend_rpc_reg_get_device(ggml_backend_reg_t reg
     }
 }
 
+
+struct rpc_comm_context {
+    std::vector<ggml_backend_t> backends;
+};
+
+GGML_BACKEND_API void * ggml_backend_rpc_comm_init(ggml_backend_t * backends, size_t n_backends) {
+    rpc_comm_context * ctx = new rpc_comm_context;
+    for (size_t i = 0; i < n_backends; i++) {
+        ctx->backends.push_back(backends[i]);
+    }
+    return ctx;
+}
+
+GGML_BACKEND_API void ggml_backend_rpc_comm_free(void * comm_ctx) {
+    rpc_comm_context * ctx = (rpc_comm_context *)comm_ctx;
+    delete ctx;
+}
+
+GGML_BACKEND_API bool ggml_backend_rpc_comm_allreduce_tensor(void * comm_ctx, struct ggml_tensor ** tensors) {
+    rpc_comm_context * ctx = (rpc_comm_context *)comm_ctx;
+    size_t n_backends = ctx->backends.size();
+
+    ggml_backend_t local_backend = nullptr;
+    ggml_backend_t rpc_backend = nullptr;
+    ggml_tensor * local_tensor = nullptr;
+    ggml_tensor * rpc_tensor = nullptr;
+    
+    for (size_t i = 0; i < n_backends; i++) {
+        if (ggml_backend_is_rpc(ctx->backends[i])) {
+            rpc_backend = ctx->backends[i];
+            rpc_tensor = tensors[i];
+        } else {
+            local_backend = ctx->backends[i];
+            local_tensor = tensors[i];
+        }
+    }
+
+    if (local_backend && rpc_backend && local_tensor && rpc_tensor) {
+        size_t bytes = ggml_nbytes(local_tensor);
+        std::vector<uint8_t> local_data(bytes);
+        
+        ggml_backend_tensor_get(local_tensor, local_data.data(), 0, bytes);
+        
+        size_t total_size = sizeof(rpc_msg_get_tensor_req) + bytes;
+        auto payload = std::shared_ptr<uint8_t>(new uint8_t[total_size], std::default_delete<uint8_t[]>());
+        rpc_msg_get_tensor_req * hdr = (rpc_msg_get_tensor_req *)payload.get();
+        hdr->tensor = serialize_tensor(rpc_tensor);
+        hdr->offset = 0;
+        hdr->size = bytes;
+        memcpy(payload.get() + sizeof(rpc_msg_get_tensor_req), local_data.data(), bytes);
+        
+        ggml_backend_rpc_context * rpc_ctx = (ggml_backend_rpc_context *)rpc_backend->context;
+        rpc_ctx->dispatcher->send(RPC_CMD_ALL_REDUCE, payload, total_size, local_data.data(), bytes);
+        
+        ggml_backend_tensor_set(local_tensor, local_data.data(), 0, bytes);
+        ggml_backend_tensor_set(rpc_tensor, local_data.data(), 0, bytes);
+    }
+    
+    return true;
+}
+
 static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const char * name) {
+    if (std::strcmp(name, "ggml_backend_comm_init") == 0) {
+        return (void *)ggml_backend_rpc_comm_init;
+    }
+    if (std::strcmp(name, "ggml_backend_comm_free") == 0) {
+        return (void *)ggml_backend_rpc_comm_free;
+    }
+    if (std::strcmp(name, "ggml_backend_comm_allreduce_tensor") == 0) {
+        return (void *)ggml_backend_rpc_comm_allreduce_tensor;
+    }
     if (std::strcmp(name, "ggml_backend_rpc_add_server") == 0) {
         return (void *)ggml_backend_rpc_add_server;
     }

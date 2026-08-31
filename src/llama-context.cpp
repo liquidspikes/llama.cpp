@@ -1221,7 +1221,7 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
 
     LLAMA_LOG_DEBUG("%s: seq_id = %d, sampler = %p\n", __func__, (int) seq_id, (void *) sampler);
 
-    if (sampler && model.split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
+    if (sampler && (model.split_mode() == LLAMA_SPLIT_MODE_TENSOR || model.split_mode() == LLAMA_SPLIT_MODE_RPC_TENSOR)) {
         static bool warned = false;
         if (!warned) {
             LLAMA_LOG_WARN("%s: backend sampling not supported with SPLIT_MODE_TENSOR; using CPU\n", __func__);
@@ -3656,7 +3656,7 @@ llama_context * llama_init_from_model(
         params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
     }
 
-    if (model->split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
+    if ((model->split_mode() == LLAMA_SPLIT_MODE_TENSOR || model->split_mode() == LLAMA_SPLIT_MODE_RPC_TENSOR)) {
         if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO) {
             LLAMA_LOG_INFO("%s: enabling flash_attn since it is required for SPLIT_MODE_TENSOR\n", __func__);
             params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;

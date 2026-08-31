@@ -1824,26 +1824,50 @@ struct ggml_backend_meta_context {
         name += ")";
 
         if (n_devs > 1) {
-            ggml_backend_comm_init_t comm_init = (ggml_backend_comm_init_t) ggml_backend_reg_get_proc_address(
-                ggml_backend_dev_backend_reg(ggml_backend_get_device(simple_backends[0])), "ggml_backend_comm_init");
-            if (comm_init != nullptr) {
-                comm_ctx = comm_init(simple_backends.data(), simple_backends.size());
+            ggml_backend_reg_t comm_reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(simple_backends[0]));
+            for (auto & b : simple_backends) {
+                ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(b));
+                if (reg && strcmp(ggml_backend_reg_name(reg), "RPC") == 0) {
+                    comm_reg = reg; // If any backend is RPC, use the RPC registry for comms
+                    break;
+                }
+            }
+            if (comm_reg != nullptr) {
+                ggml_backend_comm_init_t comm_init = (ggml_backend_comm_init_t) ggml_backend_reg_get_proc_address(comm_reg, "ggml_backend_comm_init");
+                if (comm_init != nullptr) {
+                    comm_ctx = comm_init(simple_backends.data(), simple_backends.size());
+                }
             }
         }
         if (comm_ctx != nullptr) {
+            ggml_backend_reg_t comm_reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(simple_backends[0]));
+            for (auto & b : simple_backends) {
+                ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(b));
+                if (reg && strcmp(ggml_backend_reg_name(reg), "RPC") == 0) {
+                    comm_reg = reg;
+                    break;
+                }
+            }
             comm_allreduce = (ggml_backend_comm_allreduce_tensor_t)
-                ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(
-                    ggml_backend_get_device(simple_backends[0])), "ggml_backend_comm_allreduce_tensor");
+                ggml_backend_reg_get_proc_address(comm_reg, "ggml_backend_comm_allreduce_tensor");
             GGML_ASSERT(comm_allreduce != nullptr);
         }
     }
 
     ~ggml_backend_meta_context() {
         if (comm_ctx != nullptr) {
-            ggml_backend_comm_free_t comm_free = (ggml_backend_comm_free_t) ggml_backend_reg_get_proc_address(
-                ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_configs[0].backend)), "ggml_backend_comm_free");
-            GGML_ASSERT(comm_free != nullptr);
-            comm_free(comm_ctx);
+            ggml_backend_reg_t comm_reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_configs[0].backend));
+            for (auto & bc : backend_configs) {
+                ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(bc.backend));
+                if (reg && strcmp(ggml_backend_reg_name(reg), "RPC") == 0) {
+                    comm_reg = reg;
+                    break;
+                }
+            }
+            ggml_backend_comm_free_t comm_free = (ggml_backend_comm_free_t) ggml_backend_reg_get_proc_address(comm_reg, "ggml_backend_comm_free");
+            if (comm_free != nullptr) {
+                comm_free(comm_ctx);
+            }
         }
         for (auto & bc : backend_configs) {
             ggml_backend_free(bc.backend);

@@ -29,6 +29,9 @@ GGML_BACKEND_API void ggml_backend_rpc_start_server(const char * endpoint, const
 
 GGML_BACKEND_API ggml_backend_reg_t ggml_backend_rpc_reg(void);
 GGML_BACKEND_API ggml_backend_reg_t ggml_backend_rpc_add_server(const char * endpoint);
+GGML_BACKEND_API void * ggml_backend_rpc_comm_init(ggml_backend_t * backends, size_t n_backends);
+GGML_BACKEND_API void ggml_backend_rpc_comm_free(void * comm_ctx);
+GGML_BACKEND_API bool ggml_backend_rpc_comm_allreduce_tensor(void * comm_ctx, struct ggml_tensor ** tensors);
 
 #ifdef  __cplusplus
 }
