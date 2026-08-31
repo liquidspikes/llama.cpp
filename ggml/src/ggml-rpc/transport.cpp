@@ -30,6 +30,7 @@
 #include <vector>
 #include <thread>
 #include <chrono>
+#include <future>
 
 #ifdef GGML_RPC_RDMA
 #  include <infiniband/verbs.h>
@@ -490,34 +491,23 @@ static bool stream_write_exact(int fd, const void * buf, size_t size) {
     const uint8_t * p = static_cast<const uint8_t *>(buf);
     size_t total = 0;
     while (total < size) {
-        struct pollfd pfd = { fd, POLLOUT | POLLERR | POLLHUP, 0 };
-        int pr = ::poll(&pfd, 1, 100);
-        if (pr < 0) {
-            if (errno == EINTR || errno == EAGAIN) continue;
-            GGML_LOG_ERROR("stream_write_exact poll error: fd=%d, errno=%d (%s)\n", fd, errno, strerror(errno));
-            return false;
-        }
-        if (pr == 0) {
-            continue; // Poll timeout, recheck
-        }
-        size_t chunk = std::min(size - total, (size_t)4095);
+        size_t to_write = std::min(size - total, (size_t)4096);
         errno = 0;
-        ssize_t n = ::write(fd, p + total, chunk);
-        if (n < 0) {
-            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK || errno == ENOBUFS || errno == ENOMEM) {
-                std::this_thread::sleep_for(std::chrono::microseconds(50));
-                continue;
-            }
-            GGML_LOG_ERROR("stream_write_exact failed: fd=%d, n=%zd, total=%zu, size=%zu, errno=%d (%s)\n",
-                           fd, n, total, size, errno, strerror(errno));
-            return false;
+        ssize_t n = ::write(fd, p + total, to_write);
+        if (n > 0) {
+            total += (size_t)n;
+            continue;
         }
-        if (n == 0) {
-            // Kernel tbstream driver returns 0 when TX ring is temporarily out of buffers (-ENOBUFS)
+        if (n < 0 && errno == EINTR) {
+            continue;
+        }
+        if (n == 0 || (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == ENOBUFS || errno == ENOMEM))) {
             std::this_thread::sleep_for(std::chrono::microseconds(50));
             continue;
         }
-        total += (size_t)n;
+        GGML_LOG_ERROR("stream_write_exact failed: fd=%d, n=%zd, total=%zu, size=%zu, errno=%d (%s)\n",
+                       fd, n, total, size, errno, strerror(errno));
+        return false;
     }
     return true;
 }
@@ -525,40 +515,23 @@ static bool stream_write_exact(int fd, const void * buf, size_t size) {
 static bool stream_read_exact(int fd, void * buf, size_t size) {
     uint8_t * p = static_cast<uint8_t *>(buf);
     size_t total = 0;
-    int zero_count = 0;
     while (total < size) {
-        struct pollfd pfd = { fd, POLLIN | POLLERR | POLLHUP, 0 };
-        int pr = ::poll(&pfd, 1, 100);
-        if (pr < 0) {
-            if (errno == EINTR || errno == EAGAIN) continue;
-            GGML_LOG_ERROR("stream_read_exact poll error: fd=%d, errno=%d (%s)\n", fd, errno, strerror(errno));
-            return false;
-        }
-        if (pr == 0) {
-            continue; // Poll timeout, recheck
-        }
-        size_t chunk = std::min(size - total, (size_t)65536);
         errno = 0;
-        ssize_t n = ::read(fd, p + total, chunk);
-        if (n < 0) {
-            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
-                std::this_thread::sleep_for(std::chrono::microseconds(50));
-                continue;
-            }
-            GGML_LOG_ERROR("stream_read_exact failed: fd=%d, n=%zd, total=%zu, size=%zu, errno=%d (%s)\n",
-                           fd, n, total, size, errno, strerror(errno));
-            return false;
-        }
-        if (n == 0) {
-            // EOF (peer closed): verify if persistent EOF
-            if (++zero_count > 200) {
-                return false;
-            }
-            std::this_thread::sleep_for(std::chrono::microseconds(100));
+        ssize_t n = ::read(fd, p + total, size - total);
+        if (n > 0) {
+            total += (size_t)n;
             continue;
         }
-        total += (size_t)n;
-        zero_count = 0;
+        if (n < 0 && errno == EINTR) {
+            continue;
+        }
+        if (n == 0 || errno == EAGAIN || errno == EWOULDBLOCK) {
+            std::this_thread::sleep_for(std::chrono::microseconds(50));
+            continue;
+        }
+        GGML_LOG_ERROR("stream_read_exact failed: fd=%d, n=%zd, total=%zu, size=%zu, errno=%d (%s)\n",
+                       fd, n, total, size, errno, strerror(errno));
+        return false;
     }
     return true;
 }
@@ -575,6 +548,60 @@ private:
     std::mutex data_recv_mu;
     std::mutex ctrl_send_mu;
     std::mutex ctrl_recv_mu;
+
+    struct rx_stream_buffer {
+        std::vector<uint8_t> buf;
+        size_t head = 0;
+        size_t tail = 0;
+        rx_stream_buffer() : buf(262144) {}
+        void clear() { head = tail = 0; }
+    };
+    rx_stream_buffer data_rx_buf;
+    rx_stream_buffer ctrl_rx_buf;
+
+    rx_stream_buffer & get_rx_buf(uint32_t channel_id) {
+        if (data_fd == ctrl_fd) return data_rx_buf;
+        return (channel_id == RPC_CHANNEL_DATA) ? data_rx_buf : ctrl_rx_buf;
+    }
+
+    static bool buffered_stream_read_exact(int fd, rx_stream_buffer & sbuf, void * dst, size_t size) {
+        uint8_t * out = static_cast<uint8_t *>(dst);
+        size_t needed = size;
+        while (needed > 0) {
+            size_t available = sbuf.tail - sbuf.head;
+            if (available > 0) {
+                size_t to_copy = std::min(needed, available);
+                memcpy(out, sbuf.buf.data() + sbuf.head, to_copy);
+                sbuf.head += to_copy;
+                out += to_copy;
+                needed -= to_copy;
+                if (sbuf.head == sbuf.tail) {
+                    sbuf.head = 0;
+                    sbuf.tail = 0;
+                }
+                if (needed == 0) return true;
+            }
+
+            // Buffer is empty: read from kernel character device into buffer
+            errno = 0;
+            ssize_t n = ::read(fd, sbuf.buf.data(), sbuf.buf.size());
+            if (n > 0) {
+                sbuf.head = 0;
+                sbuf.tail = static_cast<size_t>(n);
+                continue;
+            }
+            if (n < 0 && errno == EINTR) {
+                continue;
+            }
+            if (n == 0 || errno == EAGAIN || errno == EWOULDBLOCK) {
+                std::this_thread::sleep_for(std::chrono::microseconds(50));
+                continue;
+            }
+            GGML_LOG_ERROR("buffered_stream_read_exact failed: fd=%d, errno=%d (%s)\n", fd, errno, strerror(errno));
+            return false;
+        }
+        return true;
+    }
 
 public:
     stream_rpc_transport(int dfd, int cfd, const std::string & dpath, const std::string & cpath, bool listener)
@@ -618,7 +645,7 @@ public:
         if (size == 0 || data == nullptr) return true;
         int fd = get_fd_for_channel(channel_id);
         std::lock_guard<std::mutex> lock(get_recv_mutex(channel_id));
-        return stream_read_exact(fd, data, size);
+        return buffered_stream_read_exact(fd, get_rx_buf(channel_id), data, size);
 #else
         (void)channel_id; (void)data; (void)size;
         return false;
@@ -658,8 +685,6 @@ public:
             GGML_LOG_ERROR("Failed to re-open data stream device '%s': %s\n", data_path.c_str(), strerror(errno));
             return nullptr;
         }
-        int flags = fcntl(data_fd, F_GETFL, 0);
-        if (flags >= 0) fcntl(data_fd, F_SETFL, flags & ~O_NONBLOCK);
         if (data_path == ctrl_path) {
             ctrl_fd = data_fd;
         } else {
@@ -670,8 +695,6 @@ public:
                 data_fd = -1;
                 return nullptr;
             }
-            flags = fcntl(ctrl_fd, F_GETFL, 0);
-            if (flags >= 0) fcntl(ctrl_fd, F_SETFL, flags & ~O_NONBLOCK);
         }
         return shared_from_this();
 #else
@@ -686,8 +709,6 @@ public:
             GGML_LOG_ERROR("Failed to open data stream device '%s': %s\n", data_path.c_str(), strerror(errno));
             return nullptr;
         }
-        int flags = fcntl(dfd, F_GETFL, 0);
-        if (flags >= 0) fcntl(dfd, F_SETFL, flags & ~O_NONBLOCK);
         int cfd = -1;
         if (data_path == ctrl_path) {
             cfd = dfd;
@@ -698,8 +719,6 @@ public:
                 ::close(dfd);
                 return nullptr;
             }
-            flags = fcntl(cfd, F_GETFL, 0);
-            if (flags >= 0) fcntl(cfd, F_SETFL, flags & ~O_NONBLOCK);
         }
         LOG_DBG("Opened stream devices: data='%s' (fd=%d), ctrl='%s' (fd=%d)\n",
                 data_path.c_str(), dfd, ctrl_path.c_str(), cfd);
