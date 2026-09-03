@@ -580,8 +580,9 @@ void rpc_dispatcher::work() {
             break;
         }
         if (msg_ptr->cmd != RPC_CMD_NONE) {
-            GGML_LOG_INFO("[RPC_DISPATCH] sending cmd=%d (in_size=%zu, out_size=%zu)\n",
-                          (int)msg_ptr->cmd, msg_ptr->input_size, msg_ptr->output_size);
+            
+            //
+//
             if (msg_ptr->output) {
                 bool status = send_rpc_cmd(sock, msg_ptr->cmd, msg_ptr->input.get(), msg_ptr->input_size, msg_ptr->output, msg_ptr->output_size);
                 RPC_STATUS_ASSERT(status);
@@ -589,7 +590,7 @@ void rpc_dispatcher::work() {
                 bool status = send_rpc_cmd(sock, msg_ptr->cmd, msg_ptr->input.get(), msg_ptr->input_size);
                 RPC_STATUS_ASSERT(status);
             }
-            GGML_LOG_INFO("[RPC_DISPATCH] finished cmd=%d\n", (int)msg_ptr->cmd);
+            //
         }
         msg_ptr->completion.set_value();
     }
@@ -729,7 +730,7 @@ static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggm
     const uint8_t * in_ptr = static_cast<const uint8_t *>(data);
     size_t transferred = 0;
     while (transferred < size) {
-        size_t chunk = std::min(size - transferred, (size_t)4096);
+        size_t chunk = std::min(size - transferred, (size_t)33554432);
         size_t cur_offset = offset + transferred;
         size_t input_size = sizeof(rpc_tensor) + sizeof(uint64_t) + chunk;
         uint8_t * input = new uint8_t[input_size]();
@@ -747,7 +748,7 @@ static void ggml_backend_rpc_buffer_get_tensor(ggml_backend_buffer_t buffer, con
     uint8_t * out = static_cast<uint8_t *>(data);
     size_t transferred = 0;
     while (transferred < size) {
-        size_t chunk = std::min(size - transferred, (size_t)4096);
+        size_t chunk = std::min(size - transferred, (size_t)33554432);
         auto request = std::make_shared<rpc_msg_get_tensor_req>();
         request->tensor = serialize_tensor(tensor);
         request->offset = offset + transferred;
@@ -969,7 +970,7 @@ static void ggml_backend_rpc_set_tensor_async(ggml_backend_t backend, ggml_tenso
     const uint8_t * in_ptr = static_cast<const uint8_t *>(data);
     size_t transferred = 0;
     while (transferred < size) {
-        size_t chunk = std::min(size - transferred, (size_t)4096);
+        size_t chunk = std::min(size - transferred, (size_t)33554432);
         size_t cur_offset = offset + transferred;
         size_t input_size = sizeof(rpc_tensor) + sizeof(uint64_t) + chunk;
         uint8_t * input = new uint8_t[input_size]();
@@ -987,7 +988,7 @@ static void ggml_backend_rpc_get_tensor_async(ggml_backend_t backend, const ggml
     uint8_t * out = static_cast<uint8_t *>(data);
     size_t transferred = 0;
     while (transferred < size) {
-        size_t chunk = std::min(size - transferred, (size_t)4096);
+        size_t chunk = std::min(size - transferred, (size_t)33554432);
         auto request = std::make_shared<rpc_msg_get_tensor_req>();
         request->tensor = serialize_tensor(tensor);
         request->offset = offset + transferred;
@@ -1444,7 +1445,7 @@ bool rpc_server::set_tensor(const std::vector<uint8_t> & input) {
     uint64_t offset;
     memcpy(&offset, input.data() + sizeof(rpc_tensor), sizeof(offset));
     const size_t size = input.size() - sizeof(rpc_tensor) - sizeof(offset);
-    fprintf(stderr, "[SET_TENSOR_SERVER] tensor=%s, size=%zu, input_size=%zu\n", in_tensor->name, size, input.size());
+    //
 
     struct ggml_init_params params {
         /*.mem_size   =*/ ggml_tensor_overhead(),
@@ -1510,11 +1511,15 @@ bool rpc_server::get_cached_file(uint64_t hash, std::vector<uint8_t> & data) {
 
 bool rpc_server::set_tensor_hash(const rpc_msg_set_tensor_hash_req & request, rpc_msg_set_tensor_hash_rsp & response)
 {
+    auto t1 = std::chrono::high_resolution_clock::now();
     std::vector<uint8_t> cached_file;
     if (!get_cached_file(request.hash, cached_file)) {
         response.result = 0;
         return true;
     }
+    auto t2 = std::chrono::high_resolution_clock::now();
+    long us = std::chrono::duration_cast<std::chrono::microseconds>(t2 - t1).count();
+    printf("DEBUG: get_cached_file took %ld us\n", us); fflush(stdout);
     size_t size = cached_file.size();
     struct ggml_init_params params {
         /*.mem_size   =*/ ggml_tensor_overhead(),
@@ -1836,8 +1841,9 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
     if (!sock->recv_data(&cmd, 1)) {
         return;
     }
+    // printf("DEBUG: RPC Server received command %d\n", (int)cmd); fflush(stdout);
     if (cmd != RPC_CMD_HELLO) {
-        GGML_LOG_ERROR("Expected HELLO command, update client\n");
+        GGML_LOG_ERROR("Expected HELLO command, got %d\n", (int)cmd);//, update client\n");
         return;
     }
 
@@ -1878,8 +1884,9 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
             GGML_LOG_ERROR("Unknown command: %d\n", cmd);
             break;
         }
-        GGML_LOG_INFO("[RPC_SERVER] received cmd=%d on channel=%u\n", (int)cmd, active_ch);
+        //
         uint32_t cmd_channel = rpc_cmd_to_channel((enum rpc_cmd)cmd);
+        // printf("DEBUG: RPC Server received command %d\n", cmd); fflush(stdout);
         switch (cmd) {
             case RPC_CMD_HELLO: {
                 // HELLO command is handled above
@@ -2096,16 +2103,14 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                 break;
             }
             case RPC_CMD_ALL_REDUCE: {
+                std::vector<uint8_t> input;
+                if (!recv_msg(sock, input, cmd_channel)) return;
+                if (input.size() < sizeof(rpc_msg_get_tensor_req)) return;
                 rpc_msg_get_tensor_req request;
-                if (!recv_msg(sock, &request, sizeof(request), cmd_channel)) {
-                    return;
-                }
-                
+                memcpy(&request, input.data(), sizeof(request));
                 size_t bytes = request.size;
-                std::vector<uint8_t> node1_data(bytes);
-                if (!recv_msg(sock, node1_data.data(), bytes, cmd_channel)) {
-                    return;
-                }
+                if (input.size() != sizeof(request) + bytes) return;
+                std::vector<uint8_t> node1_data(input.begin() + sizeof(request), input.end());
                 
                 std::vector<uint8_t> node2_data;
                 if (!server.get_tensor(request, node2_data)) {
@@ -2139,7 +2144,7 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                     return;
                 }
                 
-                if (!sock->send_data_channel(cmd_channel, node1_data.data(), bytes)) {
+                if (!send_msg(sock, node1_data.data(), bytes, cmd_channel)) {
                     return;
                 }
                 if (!sock->flush()) {
