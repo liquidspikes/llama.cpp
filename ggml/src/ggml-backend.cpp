@@ -624,8 +624,19 @@ ggml_backend_buffer_t ggml_backend_dev_buffer_from_host_ptr(ggml_backend_dev_t d
 
 bool ggml_backend_dev_supports_op(ggml_backend_dev_t device, const struct ggml_tensor * op) {
     GGML_ASSERT(device);
+    const char * name = device->iface.get_name(device);
+    if (name && (strstr(name, "HRX") != nullptr || strstr(name, "RPC") != nullptr)) {
+        if (op && op->op == GGML_OP_ADD) {
+            if (!ggml_is_contiguous(op)) return false;
+            if (op->src[0] && (!ggml_is_contiguous(op->src[0]) || op->src[0]->view_src != nullptr)) return false;
+            if (op->src[1] && (!ggml_is_contiguous(op->src[1]) || op->src[1]->view_src != nullptr)) return false;
+        }
+    }
     return device->iface.supports_op(device, op);
 }
+
+
+
 
 bool ggml_backend_dev_supports_buft(ggml_backend_dev_t device, ggml_backend_buffer_type_t buft) {
     GGML_ASSERT(device);
@@ -898,7 +909,7 @@ static int ggml_backend_sched_backend_from_buffer(ggml_backend_sched_t sched, co
     return -1;
 }
 
-#if 0
+#if 1
 #define GGML_SCHED_MAX_SPLITS_DEBUG 4096
 static char causes[GGML_DEFAULT_GRAPH_SIZE*16 + GGML_SCHED_MAX_SPLITS_DEBUG*GGML_SCHED_MAX_SPLIT_INPUTS][128]; // debug only
 #define SET_CAUSE(node, ...) sprintf(causes[hash_id(node)], __VA_ARGS__)
@@ -907,6 +918,7 @@ static char causes[GGML_DEFAULT_GRAPH_SIZE*16 + GGML_SCHED_MAX_SPLITS_DEBUG*GGML
 #define SET_CAUSE(node, ...)
 #define GET_CAUSE(node) ""
 #endif
+
 
 // returns the backend that should be used for the node based on the current locations
 static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, struct ggml_tensor * tensor) {
@@ -1050,8 +1062,14 @@ static void ggml_backend_sched_set_if_supported(ggml_backend_sched_t sched, stru
     if (ggml_backend_supports_op(sched->backends[cur_backend_id], node)) {
         *node_backend_id = cur_backend_id;
         SET_CAUSE(node, "2.sup");
+    } else {
+        if (getenv("GGML_SCHED_DEBUG")) {
+            fprintf(stderr, "[NOT_SUP] node '%s' (op=%d) not supported on backend %d (%s)\n",
+                    node->name, (int)node->op, cur_backend_id, ggml_backend_name(sched->backends[cur_backend_id]));
+        }
     }
 }
+
 
 // assigns backends to ops and splits the graph into subgraphs that can be computed on the same backend
 void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
@@ -1278,12 +1296,27 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                 }
             }
         }
+        // if the node is still unassigned, prefer the backend of its inputs
+        if (*cur_backend_id == -1) {
+            for (int j = 0; j < GGML_MAX_SRC; j++) {
+                struct ggml_tensor * src = node->src[j];
+                if (src != NULL) {
+                    int src_b = tensor_backend_id(src);
+                    if (src_b != -1 && ggml_backend_supports_op(sched->backends[src_b], node)) {
+                        *cur_backend_id = src_b;
+                        SET_CAUSE(node, "4.src");
+                        break;
+                    }
+                }
+            }
+        }
         // if the node is still unassigned, assign it to the first backend that supports it
         for (int b = 0; b < sched->n_backends && *cur_backend_id == -1; b++) {
             ggml_backend_sched_set_if_supported(sched, node, b, cur_backend_id);
         }
         GGML_ASSERT(*cur_backend_id != -1);
     }
+
 
     // pass 5: split graph, find tensors that need to be copied
     {
@@ -1344,7 +1377,13 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
             }
 
             if (node_backend_id != cur_backend_id || need_new_split) {
+                if (getenv("GGML_SCHED_DEBUG")) {
+                    fprintf(stderr, "[SCHED_SPLIT %d] node '%s' (op=%d): node_b=%d (%s) cur_b=%d need_new=%d n_inputs=%d\n",
+                            i_split + 1, node->name, (int)node->op, node_backend_id, GET_CAUSE(node), cur_backend_id, (int)need_new_split, split->n_inputs);
+                }
                 split->i_end = i;
+
+
                 i_split++;
                 if (i_split >= sched->splits_capacity) {
                     int old_cap = sched->splits_capacity;

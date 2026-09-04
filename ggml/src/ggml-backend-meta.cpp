@@ -1610,7 +1610,8 @@ static void ggml_backend_meta_buffer_get_tensor(ggml_backend_buffer_t buffer, co
     switch (split_state.axis) {
         case GGML_BACKEND_SPLIT_AXIS_0:
         case GGML_BACKEND_SPLIT_AXIS_1:
-        case GGML_BACKEND_SPLIT_AXIS_2: {
+        case GGML_BACKEND_SPLIT_AXIS_2:
+        case GGML_BACKEND_SPLIT_AXIS_3: {
             // Exploit that tensors are contiguous to splice it with simple tensors as "chunks".
             const size_t chunk_size_full = tensor->nb[split_state.axis + 1];
             GGML_ASSERT(offset % chunk_size_full == 0);
@@ -1630,10 +1631,27 @@ static void ggml_backend_meta_buffer_get_tensor(ggml_backend_buffer_t buffer, co
             }
             GGML_ASSERT(offset_j == chunk_size_full);
         } break;
-        case GGML_BACKEND_SPLIT_AXIS_MIRRORED: {
+        case GGML_BACKEND_SPLIT_AXIS_MIRRORED:
+        case GGML_BACKEND_SPLIT_AXIS_NONE: {
             // TODO other simple backend may be better
             const ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, 0);
             ggml_backend_tensor_get(simple_tensor, data, offset, size);
+        } break;
+        case GGML_BACKEND_SPLIT_AXIS_PARTIAL: {
+            GGML_ASSERT(tensor->type == GGML_TYPE_F32);
+            GGML_ASSERT(offset % sizeof(float) == 0);
+            GGML_ASSERT(size   % sizeof(float) == 0);
+            const size_t n_values = size / sizeof(float);
+            std::vector<float> sum(n_values, 0.0f);
+            std::vector<float> tmp(n_values);
+            for (size_t j = 0; j < n_bufs; j++) {
+                const ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, j);
+                ggml_backend_tensor_get(simple_tensor, tmp.data(), offset, size);
+                for (size_t i = 0; i < n_values; i++) {
+                    sum[i] += tmp[i];
+                }
+            }
+            memcpy(data, sum.data(), size);
         } break;
         default: {
             GGML_ABORT("fatal error");

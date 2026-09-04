@@ -24,6 +24,13 @@ static const Value * graph_value(const Graph & graph, ValueId id) {
     return graph.values().find(id);
 }
 
+static bool is_1d_or_contiguous(const Value & v) {
+    if (v.contiguous) {
+        return true;
+    }
+    return (v.ne[1] <= 1 && v.ne[2] <= 1 && v.ne[3] <= 1);
+}
+
 static bool supports_add_f32_dispatch(const Graph & graph, const GraphNode * node) {
     if (node == nullptr || node->op != GGML_OP_ADD || node->inputs.size() != 2) {
         return false;
@@ -35,7 +42,8 @@ static bool supports_add_f32_dispatch(const Graph & graph, const GraphNode * nod
         return false;
     }
     return output->type == GGML_TYPE_F32 && a->type == GGML_TYPE_F32 && b->type == GGML_TYPE_F32 &&
-           same_shape(*output, *a) && same_shape(*output, *b) && output->contiguous && a->contiguous && b->contiguous &&
+           same_shape(*output, *a) && same_shape(*output, *b) &&
+           is_1d_or_contiguous(*output) && is_1d_or_contiguous(*a) && is_1d_or_contiguous(*b) &&
            output->element_count > 0 &&
            static_cast<uint64_t>(output->element_count) <= std::numeric_limits<uint32_t>::max();
 }

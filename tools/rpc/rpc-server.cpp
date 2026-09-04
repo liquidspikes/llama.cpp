@@ -360,6 +360,9 @@ int main(int argc, char * argv[]) {
 
     ggml_backend_reg_t reg = ggml_backend_reg_by_name("RPC");
     if (!reg) {
+        reg = ggml_backend_rpc_reg();
+    }
+    if (!reg) {
         fprintf(stderr, "Failed to find RPC backend\n");
         return 1;
     }
