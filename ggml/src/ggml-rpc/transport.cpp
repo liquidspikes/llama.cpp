@@ -490,10 +490,13 @@ std::shared_ptr<rpc_transport> tcp_rpc_transport::accept() {
 static bool stream_write_exact(int fd, const void * buf, size_t size) {
     const uint8_t * p = static_cast<const uint8_t *>(buf);
     size_t total = 0;
+    alignas(4096) static thread_local uint8_t io_tx_page_buf[65536];
+
     while (total < size) {
-        size_t to_write = std::min(size - total, (size_t)4096);
+        size_t to_write = std::min(size - total, sizeof(io_tx_page_buf));
+        memcpy(io_tx_page_buf, p + total, to_write);
         errno = 0;
-        ssize_t n = ::write(fd, p + total, to_write);
+        ssize_t n = ::write(fd, io_tx_page_buf, to_write);
         if (n > 0) {
             total += (size_t)n;
             continue;
@@ -525,8 +528,8 @@ static bool stream_read_exact(int fd, void * buf, size_t size) {
         if (n < 0 && errno == EINTR) {
             continue;
         }
-        if (n == 0 || errno == EAGAIN || errno == EWOULDBLOCK) {
-            std::this_thread::sleep_for(std::chrono::microseconds(50));
+        if (n == 0) {
+            std::this_thread::yield();
             continue;
         }
         GGML_LOG_ERROR("stream_read_exact failed: fd=%d, n=%zd, total=%zu, size=%zu, errno=%d (%s)\n",
@@ -548,148 +551,128 @@ private:
     std::mutex data_recv_mu;
     std::mutex ctrl_send_mu;
     std::mutex ctrl_recv_mu;
-    std::condition_variable ctrl_recv_cv;
 
     struct rx_stream_buffer {
-        std::vector<uint8_t> buf;
-        size_t head = 0;
-        size_t tail = 0;
+        std::vector<uint8_t> raw_buf;
+        size_t raw_head = 0;
+        size_t raw_tail = 0;
+
         std::vector<uint8_t> msg_buf;
         size_t msg_offset = 0;
-        rx_stream_buffer() : buf(262144) {}
-        void clear() { msg_offset = 0; msg_buf.clear(); }
+
+        rx_stream_buffer() : raw_buf(524288) {}
+        void clear() {
+            msg_buf.clear();
+            msg_offset = 0;
+            raw_head = raw_tail = 0;
+        }
     };
     rx_stream_buffer data_rx_buf;
     rx_stream_buffer ctrl_rx_buf;
-    
-    std::atomic<uint64_t> unacked_tx{0};
-    std::atomic<uint64_t> unacked_rx{0};
-    
-    std::thread rx_thread;
-    std::atomic<bool> rx_thread_running{false};
 
     rx_stream_buffer & get_rx_buf(uint32_t channel_id) {
         if (data_fd == ctrl_fd) return data_rx_buf;
         return (channel_id == RPC_CHANNEL_DATA) ? data_rx_buf : ctrl_rx_buf;
     }
 
-public:
-    stream_rpc_transport(int dfd, int cfd, const std::string & dpath, const std::string & cpath, bool listener)
-        : data_fd(dfd), ctrl_fd(cfd), is_listener(listener), data_path(dpath), ctrl_path(cpath) {
-#ifndef _WIN32
-        int flags = fcntl(ctrl_fd, F_GETFL, 0);
-        fcntl(ctrl_fd, F_SETFL, flags & ~O_NONBLOCK);
-        
-        rx_thread_running = true;
-        rx_thread = std::thread([this]() {
-            while (rx_thread_running) {
-                std::vector<uint8_t> tmp(65536);
-                ssize_t n = ::read(this->ctrl_fd, tmp.data(), tmp.size()); if (n > 0) 
-                if (n > 0) {
-                                        std::unique_lock<std::mutex> lock(this->ctrl_recv_mu);
-                    
-                    size_t space = this->ctrl_rx_buf.buf.size() - this->ctrl_rx_buf.tail;
-                    if (space < (size_t)n) {
-                        if (this->ctrl_rx_buf.head > 0) {
-                            size_t avail = this->ctrl_rx_buf.tail - this->ctrl_rx_buf.head;
-                            memmove(this->ctrl_rx_buf.buf.data(), this->ctrl_rx_buf.buf.data() + this->ctrl_rx_buf.head, avail);
-                            this->ctrl_rx_buf.head = 0;
-                            this->ctrl_rx_buf.tail = avail;
-                            space = this->ctrl_rx_buf.buf.size() - this->ctrl_rx_buf.tail;
-                        }
-                        if (space < (size_t)n) {
-                            size_t old_size = this->ctrl_rx_buf.buf.size();
-                            this->ctrl_rx_buf.buf.resize(old_size + 65536);
-                        }
-                    }
-                    memcpy(this->ctrl_rx_buf.buf.data() + this->ctrl_rx_buf.tail, tmp.data(), n);
-                    this->ctrl_rx_buf.tail += n;
-                    this->unacked_rx += n;
-                    
+    static bool buffered_stream_read_exact(int fd, rx_stream_buffer & sbuf, void * dst, size_t size) {
+        uint8_t * out = static_cast<uint8_t *>(dst);
+        size_t needed = size;
 
-                    
-                    while (this->ctrl_rx_buf.tail - this->ctrl_rx_buf.head >= 4) {
-                        uint32_t header;
-                        memcpy(&header, this->ctrl_rx_buf.buf.data() + this->ctrl_rx_buf.head, 4);
-                        
-                        if (header == 0xAC00AC00) {
-                            if (this->ctrl_rx_buf.tail - this->ctrl_rx_buf.head < 2048) break;
-                            uint32_t payload;
-                            memcpy(&payload, this->ctrl_rx_buf.buf.data() + this->ctrl_rx_buf.head + 4, 4);
-                            
-                            {
-                                std::unique_lock<std::mutex> send_lock(this->ctrl_send_mu);
-                                if (payload <= this->unacked_tx) this->unacked_tx -= payload; else this->unacked_tx = 0;
-                            }
-                            if (this->unacked_rx >= 524288) this->unacked_rx -= 524288; else this->unacked_rx = 0; 
-                            this->ctrl_rx_buf.head += 2048;
-                            this->ctrl_recv_cv.notify_all();
-                            continue;
-                        }
-                        size_t pad = 2048 - ((4 + header) % 2048);
-                        if (pad == 2048) pad = 0;
-                        size_t frame_size = 4 + header + pad;
-                        
-                        if (this->ctrl_rx_buf.buf.size() < frame_size + 65536) {
-                            this->ctrl_rx_buf.buf.resize(frame_size + 65536);
-                        }
-                        
-                        if (this->ctrl_rx_buf.tail - this->ctrl_rx_buf.head >= frame_size) {
-                            size_t old_size = this->ctrl_rx_buf.msg_buf.size();
-                            this->ctrl_rx_buf.msg_buf.resize(old_size + header);
-                            if (header > 0) {
-                                memcpy(this->ctrl_rx_buf.msg_buf.data() + old_size, this->ctrl_rx_buf.buf.data() + this->ctrl_rx_buf.head + 4, header);
-                            }
-                            this->ctrl_rx_buf.head += frame_size;
-                            this->ctrl_recv_cv.notify_all();
-                            continue;
-                        }
-                        break;
-                    }
-                    
-                    if (this->unacked_rx >= 524288) {
-                        uint32_t ack = 0xAC00AC00;
-                        uint32_t payload = this->unacked_rx.load(); 
-                        std::vector<uint8_t> ack_frame(2048, 0);
-                        memcpy(ack_frame.data(), &ack, 4);
-                        memcpy(ack_frame.data() + 4, &payload, 4);
-                        
-                        std::lock_guard<std::mutex> send_lock(this->ctrl_send_mu);
-                        size_t ack_total = 0;
-                        while (ack_total < 2048) {
-                            errno = 0;
-                            ssize_t wn = ::write(this->data_fd, ack_frame.data() + ack_total, 2048 - ack_total);
-                            if (wn > 0) {
-                                ack_total += (size_t)wn;
-                            } else if (wn < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-                                std::this_thread::yield();
-                            }
-                        }
-                        this->unacked_rx -= payload;
-                    }
-                } else if (n == 0) {
-                    break;
+        while (needed > 0) {
+            // 1. Deliver from msg_buf if available
+            size_t available = sbuf.msg_buf.size() - sbuf.msg_offset;
+            if (available > 0) {
+                size_t to_copy = std::min(needed, available);
+                memcpy(out, sbuf.msg_buf.data() + sbuf.msg_offset, to_copy);
+                sbuf.msg_offset += to_copy;
+                out += to_copy;
+                needed -= to_copy;
+                if (sbuf.msg_offset == sbuf.msg_buf.size()) {
+                    sbuf.msg_buf.clear();
+                    sbuf.msg_offset = 0;
+                } else if (sbuf.msg_offset > 1048576) {
+                    size_t rem = sbuf.msg_buf.size() - sbuf.msg_offset;
+                    memmove(sbuf.msg_buf.data(), sbuf.msg_buf.data() + sbuf.msg_offset, rem);
+                    sbuf.msg_buf.resize(rem);
+                    sbuf.msg_offset = 0;
+                }
+                if (needed == 0) return true;
+            }
+
+            // 2. Unpack any complete frames in raw_buf into msg_buf
+            while (sbuf.raw_tail - sbuf.raw_head >= 4096) {
+                uint32_t header = 0;
+                memcpy(&header, sbuf.raw_buf.data() + sbuf.raw_head, 4);
+                if (header > 4092) {
+                    GGML_LOG_ERROR("corrupted frame header: %u > 4092\n", header);
+                    return false;
+                }
+                size_t old_sz = sbuf.msg_buf.size();
+                sbuf.msg_buf.resize(old_sz + header);
+                if (header > 0) {
+                    memcpy(sbuf.msg_buf.data() + old_sz, sbuf.raw_buf.data() + sbuf.raw_head + 4, header);
+                }
+                sbuf.raw_head += 4096;
+                if (sbuf.raw_head == sbuf.raw_tail) {
+                    sbuf.raw_head = sbuf.raw_tail = 0;
                 }
             }
-        });
-#endif
+
+            // If we unpacked new data into msg_buf, deliver it
+            if (sbuf.msg_buf.size() > sbuf.msg_offset) {
+                continue;
+            }
+
+            // 3. Compact raw_buf before reading more
+            if (sbuf.raw_head > 0) {
+                size_t rem = sbuf.raw_tail - sbuf.raw_head;
+                if (rem > 0) {
+                    memmove(sbuf.raw_buf.data(), sbuf.raw_buf.data() + sbuf.raw_head, rem);
+                }
+                sbuf.raw_head = 0;
+                sbuf.raw_tail = rem;
+            }
+
+            // Read from kernel using page-aligned buffer
+            alignas(4096) static thread_local uint8_t io_page_buf[65536];
+            errno = 0;
+            ssize_t n = ::read(fd, io_page_buf, sizeof(io_page_buf));
+            if (n > 0) {
+                if (sbuf.raw_buf.size() < sbuf.raw_tail + (size_t)n) {
+                    sbuf.raw_buf.resize(sbuf.raw_tail + (size_t)n + 262144);
+                }
+                memcpy(sbuf.raw_buf.data() + sbuf.raw_tail, io_page_buf, (size_t)n);
+                sbuf.raw_tail += (size_t)n;
+                continue;
+            }
+            if (n < 0 && errno == EINTR) {
+                continue;
+            }
+            if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                std::this_thread::sleep_for(std::chrono::microseconds(50));
+                continue;
+            }
+            if (n == 0) {
+                std::this_thread::sleep_for(std::chrono::microseconds(50));
+                continue;
+            }
+            GGML_LOG_ERROR("buffered_stream_read_exact read failed: fd=%d, errno=%d (%s)\n", fd, errno, strerror(errno));
+            return false;
+        }
+        return true;
     }
 
+public:
+    stream_rpc_transport(int dfd, int cfd, const std::string & dpath, const std::string & cpath, bool listener)
+        : data_fd(dfd), ctrl_fd(cfd), is_listener(listener), data_path(dpath), ctrl_path(cpath) {}
+
     ~stream_rpc_transport() override {
-#ifndef _WIN32
-        rx_thread_running = false;
-        if (rx_thread.joinable()) {
-            rx_thread.detach(); 
-        }
         if (!is_listener) {
             close();
-        } else {
-            if (ctrl_fd >= 0 && ctrl_fd != data_fd) ::close(ctrl_fd);
-            if (data_fd >= 0) ::close(data_fd);
-            ctrl_fd = data_fd = -1;
         }
-#endif
     }
+
     int get_fd_for_channel(uint32_t channel_id) const { return (channel_id == RPC_CHANNEL_DATA) ? data_fd : ctrl_fd; }
     std::mutex & get_send_mutex(uint32_t channel_id) {
         if (data_fd == ctrl_fd) return data_send_mu;
@@ -699,92 +682,51 @@ public:
         if (data_fd == ctrl_fd) return data_recv_mu;
         return (channel_id == RPC_CHANNEL_DATA) ? data_recv_mu : ctrl_recv_mu;
     }
+
     bool send_exact(const void * data, size_t size) override { return send_exact_channel(RPC_CHANNEL_CONTROL, data, size); }
-    
-    bool recv_exact_channel(uint32_t channel_id, void * data, size_t size) override {
-#ifndef _WIN32
-        if (size == 0 || data == nullptr) return true;
-        
-        uint8_t * out = (uint8_t *)data;
-        size_t needed = size;
-        
-        std::unique_lock<std::mutex> lock(ctrl_recv_mu); 
-        while (needed > 0) {
-            size_t available = ctrl_rx_buf.msg_buf.size() - ctrl_rx_buf.msg_offset;
-            if (available > 0) {
-                size_t to_copy = std::min(needed, available);
-                memcpy(out, ctrl_rx_buf.msg_buf.data() + ctrl_rx_buf.msg_offset, to_copy);
-                ctrl_rx_buf.msg_offset += to_copy;
-                out += to_copy;
-                needed -= to_copy;
-                if (ctrl_rx_buf.msg_offset == ctrl_rx_buf.msg_buf.size()) {
-                    ctrl_rx_buf.clear();
-                } else if (ctrl_rx_buf.msg_offset > 1048576 && ctrl_rx_buf.msg_offset > ctrl_rx_buf.msg_buf.size() / 2) {
-                    size_t avail2 = ctrl_rx_buf.msg_buf.size() - ctrl_rx_buf.msg_offset;
-                    memmove(ctrl_rx_buf.msg_buf.data(), ctrl_rx_buf.msg_buf.data() + ctrl_rx_buf.msg_offset, avail2);
-                    ctrl_rx_buf.msg_buf.resize(avail2);
-                    ctrl_rx_buf.msg_offset = 0;
-                }
-                if (needed == 0) return true;
-            }
-            if (needed > 0) {
-                /* printf("DEBUG: recv_exact_channel waiting for %zu bytes...\n", needed); */ ctrl_recv_cv.wait(lock);
-            }
-        }
-        return true;
-#else
-        (void)channel_id; (void)data; (void)size;
-        return false;
-#endif
-    }
-    
     bool recv_exact(void * data, size_t size) override { return recv_exact_channel(RPC_CHANNEL_CONTROL, data, size); }
-    
+
     bool send_exact_channel(uint32_t channel_id, const void * data, size_t size) override {
 #ifndef _WIN32
         if (size == 0 || data == nullptr) return true;
-        std::unique_lock<std::mutex> lock(ctrl_send_mu); 
+        int fd = get_fd_for_channel(channel_id);
+        std::lock_guard<std::mutex> lock(get_send_mutex(channel_id));
 
-        uint32_t header = size;
-        size_t pad = 2048 - ((4 + header) % 2048);
-        if (pad == 2048) pad = 0;
-        size_t frame_size = 4 + header + pad;
-        std::vector<uint8_t> frame(frame_size, 0);
-        memcpy(frame.data(), &header, 4);
-        memcpy(frame.data() + 4, data, size);
-
+        const uint8_t * p = static_cast<const uint8_t *>(data);
         size_t total = 0;
-        while (total < frame_size) {
-            while (unacked_tx >= 1048576) {
-                lock.unlock();
-                std::this_thread::yield();
-                lock.lock();
-            }
-            size_t max_chunk = 1048576 - unacked_tx;
-            max_chunk = max_chunk & ~2047; 
-            if (max_chunk == 0) continue;
-            
-            size_t to_write = std::min(frame_size - total, max_chunk);
-            errno = 0;
-            ssize_t wn = ::write(data_fd, frame.data() + total, to_write);
-            if (wn > 0) {
-                total += (size_t)wn;
-                unacked_tx += (size_t)wn;
-            } else if (wn < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-                lock.unlock();
-                std::this_thread::yield();
-                lock.lock();
-            }
-        }
-        
 
+        while (total < size) {
+            size_t chunk_len = std::min(size - total, (size_t)4092);
+            uint32_t header = (uint32_t)chunk_len;
+            size_t frame_size = 4096;
+
+            std::vector<uint8_t> frame(frame_size, 0);
+            memcpy(frame.data(), &header, 4);
+            memcpy(frame.data() + 4, p + total, chunk_len);
+
+            if (!stream_write_exact(fd, frame.data(), frame_size)) {
+                return false;
+            }
+            total += chunk_len;
+            std::this_thread::sleep_for(std::chrono::microseconds(50));
+        }
         return true;
 #else
         (void)channel_id; (void)data; (void)size;
         return false;
 #endif
     }
-    
+    bool recv_exact_channel(uint32_t channel_id, void * data, size_t size) override {
+#ifndef _WIN32
+        if (size == 0 || data == nullptr) return true;
+        int fd = get_fd_for_channel(channel_id);
+        std::lock_guard<std::mutex> lock(get_recv_mutex(channel_id));
+        return buffered_stream_read_exact(fd, get_rx_buf(channel_id), data, size);
+#else
+        (void)channel_id; (void)data; (void)size;
+        return false;
+#endif
+    }
     bool recv_cmd(uint8_t * cmd, uint32_t * out_channel) override {
 #ifndef _WIN32
         if (out_channel) *out_channel = RPC_CHANNEL_CONTROL;
@@ -808,31 +750,43 @@ public:
     std::shared_ptr<rpc_transport> accept() override {
         if (!is_listener) return nullptr;
 #ifndef _WIN32
-        if (is_first_accept) {
-            is_first_accept = false;
-            return shared_from_this();
-        }
-        if (data_fd >= 0) ::close(data_fd);
-        if (ctrl_fd >= 0 && ctrl_fd != data_fd) ::close(ctrl_fd);
-        data_fd = ::open(data_path.c_str(), O_RDWR | O_NONBLOCK);
-        if (data_fd < 0) {
-            GGML_LOG_ERROR("Failed to re-open data stream device '%s': %s\n", data_path.c_str(), strerror(errno));
-            return nullptr;
-        }
-        if (data_path == ctrl_path) {
-            ctrl_fd = data_fd;
-        } else {
-            ctrl_fd = ::open(ctrl_path.c_str(), O_RDWR | O_NONBLOCK);
-            if (ctrl_fd < 0) {
-                GGML_LOG_ERROR("Failed to re-open control stream device '%s': %s\n", ctrl_path.c_str(), strerror(errno));
-                ::close(data_fd);
-                data_fd = -1;
+        if (!is_first_accept) {
+            if (data_fd >= 0) ::close(data_fd);
+            if (ctrl_fd >= 0 && ctrl_fd != data_fd) ::close(ctrl_fd);
+            data_rx_buf.clear();
+            ctrl_rx_buf.clear();
+            data_fd = ::open(data_path.c_str(), O_RDWR);
+            if (data_fd < 0) {
+                GGML_LOG_ERROR("Failed to re-open data stream device '%s': %s\n", data_path.c_str(), strerror(errno));
                 return nullptr;
             }
+            if (data_path == ctrl_path) {
+                ctrl_fd = data_fd;
+            } else {
+                ctrl_fd = ::open(ctrl_path.c_str(), O_RDWR);
+                if (ctrl_fd < 0) {
+                    GGML_LOG_ERROR("Failed to re-open control stream device '%s': %s\n", ctrl_path.c_str(), strerror(errno));
+                    ::close(data_fd);
+                    data_fd = -1;
+                    return nullptr;
+                }
+            }
         }
-        
-        data_rx_buf.clear();
-        ctrl_rx_buf.clear();
+        is_first_accept = false;
+        {
+            pollfd pfd = { data_fd, POLLIN, 0 };
+            while (poll(&pfd, 1, 0) > 0 && (pfd.revents & POLLIN)) {
+                uint8_t drain_buf[4096];
+                if (::read(data_fd, drain_buf, sizeof(drain_buf)) <= 0) break;
+            }
+        }
+        if (ctrl_fd >= 0 && ctrl_fd != data_fd) {
+            pollfd pfd = { ctrl_fd, POLLIN, 0 };
+            while (poll(&pfd, 1, 0) > 0 && (pfd.revents & POLLIN)) {
+                uint8_t drain_buf[4096];
+                if (::read(ctrl_fd, drain_buf, sizeof(drain_buf)) <= 0) break;
+            }
+        }
         return shared_from_this();
 #else
         return nullptr;
@@ -841,7 +795,7 @@ public:
     bool is_stream() const override { return true; }
     static std::shared_ptr<stream_rpc_transport> open_stream(const std::string & data_path, const std::string & ctrl_path, bool is_server = false) {
 #ifndef _WIN32
-        int dfd = ::open(data_path.c_str(), O_RDWR | O_NONBLOCK);
+        int dfd = ::open(data_path.c_str(), O_RDWR);
         if (dfd < 0) {
             GGML_LOG_ERROR("Failed to open data stream device '%s': %s\n", data_path.c_str(), strerror(errno));
             return nullptr;
@@ -850,11 +804,25 @@ public:
         if (data_path == ctrl_path) {
             cfd = dfd;
         } else {
-            cfd = ::open(ctrl_path.c_str(), O_RDWR | O_NONBLOCK);
+            cfd = ::open(ctrl_path.c_str(), O_RDWR);
             if (cfd < 0) {
                 GGML_LOG_ERROR("Failed to open control stream device '%s': %s\n", ctrl_path.c_str(), strerror(errno));
                 ::close(dfd);
                 return nullptr;
+            }
+        }
+        {
+            pollfd pfd = { dfd, POLLIN, 0 };
+            while (poll(&pfd, 1, 0) > 0 && (pfd.revents & POLLIN)) {
+                uint8_t drain_buf[4096];
+                if (::read(dfd, drain_buf, sizeof(drain_buf)) <= 0) break;
+            }
+        }
+        if (cfd >= 0 && cfd != dfd) {
+            pollfd pfd = { cfd, POLLIN, 0 };
+            while (poll(&pfd, 1, 0) > 0 && (pfd.revents & POLLIN)) {
+                uint8_t drain_buf[4096];
+                if (::read(cfd, drain_buf, sizeof(drain_buf)) <= 0) break;
             }
         }
         LOG_DBG("Opened stream devices: data='%s' (fd=%d), ctrl='%s' (fd=%d)\n",
