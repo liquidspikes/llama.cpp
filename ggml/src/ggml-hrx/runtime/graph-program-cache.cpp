@@ -54,7 +54,7 @@ static void apply_graph_replay_result(PreparedCommandProgramCacheExecutionResult
 }
 
 static bool graph_replay_should_fallback(HrxGraphReplayEvent event) {
-    return event == HrxGraphReplayEvent::Ineligible || event == HrxGraphReplayEvent::BuildFailed;
+    return event == HrxGraphReplayEvent::Ineligible || event == HrxGraphReplayEvent::BuildFailed || event == HrxGraphReplayEvent::LaunchFailed;
 }
 
 static Status bind_current_value(const ValueMap &                                   values,

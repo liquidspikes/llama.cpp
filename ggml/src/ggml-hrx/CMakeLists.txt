@@ -1,3 +1,25 @@
+set(GGML_HRX_PREBUILT_DIR "/opt/llama-hrx" CACHE PATH "Path to prebuilt HRX bundle")
+
+if (EXISTS "${GGML_HRX_PREBUILT_DIR}/lib/libggml-hrx.so")
+    message(STATUS "Using prebuilt GGML HRX backend from ${GGML_HRX_PREBUILT_DIR}")
+    add_library(hrx::hrx SHARED IMPORTED GLOBAL)
+    set_target_properties(hrx::hrx PROPERTIES
+        IMPORTED_LOCATION "${GGML_HRX_PREBUILT_DIR}/lib/libhrx.so"
+    )
+    add_library(loomc::loomc SHARED IMPORTED GLOBAL)
+    set_target_properties(loomc::loomc PROPERTIES
+        IMPORTED_LOCATION "${GGML_HRX_PREBUILT_DIR}/lib/libloomc.so"
+    )
+    add_library(ggml-hrx SHARED IMPORTED GLOBAL)
+    set_target_properties(ggml-hrx PROPERTIES
+        IMPORTED_LOCATION "${GGML_HRX_PREBUILT_DIR}/lib/libggml-hrx.so"
+        INTERFACE_INCLUDE_DIRECTORIES "${CMAKE_CURRENT_SOURCE_DIR}/../../include"
+        INTERFACE_LINK_LIBRARIES "hrx::hrx;loomc::loomc"
+    )
+    target_link_libraries(ggml PUBLIC ggml-hrx)
+    return()
+endif()
+
 set(HRX_SOURCE_DIR "" CACHE PATH "Optional HRX source tree to build instead of using installed hrx and loomc packages")
 
 if(HRX_SOURCE_DIR)

@@ -31,6 +31,9 @@
 #include <thread>
 #include <chrono>
 #include <future>
+#if defined(__x86_64__) || defined(_M_X64)
+#  include <immintrin.h>
+#endif
 
 #ifdef GGML_RPC_RDMA
 #  include <infiniband/verbs.h>
@@ -491,6 +494,7 @@ static bool stream_write_exact(int fd, const void * buf, size_t size) {
     const uint8_t * p = static_cast<const uint8_t *>(buf);
     size_t total = 0;
     alignas(4096) static thread_local uint8_t io_tx_page_buf[65536];
+    int retries = 0;
 
     while (total < size) {
         size_t to_write = std::min(size - total, sizeof(io_tx_page_buf));
@@ -499,13 +503,18 @@ static bool stream_write_exact(int fd, const void * buf, size_t size) {
         ssize_t n = ::write(fd, io_tx_page_buf, to_write);
         if (n > 0) {
             total += (size_t)n;
+            retries = 0;
             continue;
         }
         if (n < 0 && errno == EINTR) {
             continue;
         }
         if (n == 0 || (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == ENOBUFS || errno == ENOMEM))) {
-            std::this_thread::sleep_for(std::chrono::microseconds(50));
+            if (++retries < 100) {
+                std::this_thread::yield();
+            } else {
+                std::this_thread::sleep_for(std::chrono::microseconds(5));
+            }
             continue;
         }
         GGML_LOG_ERROR("stream_write_exact failed: fd=%d, n=%zd, total=%zu, size=%zu, errno=%d (%s)\n",
@@ -575,9 +584,33 @@ private:
         return (channel_id == RPC_CHANNEL_DATA) ? data_rx_buf : ctrl_rx_buf;
     }
 
+    static inline bool tb_debug_enabled() {
+        static int enabled = -1;
+        if (enabled == -1) {
+            const char * e = std::getenv("GGML_TB_DEBUG");
+            enabled = (e && strcmp(e, "0") != 0 && strcmp(e, "") != 0) ? 1 : 0;
+        }
+        return enabled == 1;
+    }
+
+    static inline void tb_delay_us(int us) {
+        auto start = std::chrono::steady_clock::now();
+        int64_t target_ns = (int64_t)us * 1000;
+        while (std::chrono::duration_cast<std::chrono::nanoseconds>(
+                   std::chrono::steady_clock::now() - start).count() < target_ns) {
+#if defined(__x86_64__) || defined(_M_X64)
+            _mm_pause();
+#endif
+        }
+    }
+
     static bool buffered_stream_read_exact(int fd, rx_stream_buffer & sbuf, void * dst, size_t size) {
         uint8_t * out = static_cast<uint8_t *>(dst);
         size_t needed = size;
+        if (tb_debug_enabled()) {
+            fprintf(stderr, "[RX START fd=%d needed=%zu msg_avail=%zu raw_avail=%zu]\n",
+                    fd, needed, sbuf.msg_buf.size() - sbuf.msg_offset, sbuf.raw_tail - sbuf.raw_head);
+        }
 
         while (needed > 0) {
             // 1. Deliver from msg_buf if available
@@ -591,38 +624,39 @@ private:
                 if (sbuf.msg_offset == sbuf.msg_buf.size()) {
                     sbuf.msg_buf.clear();
                     sbuf.msg_offset = 0;
-                } else if (sbuf.msg_offset > 1048576) {
-                    size_t rem = sbuf.msg_buf.size() - sbuf.msg_offset;
-                    memmove(sbuf.msg_buf.data(), sbuf.msg_buf.data() + sbuf.msg_offset, rem);
-                    sbuf.msg_buf.resize(rem);
-                    sbuf.msg_offset = 0;
                 }
                 if (needed == 0) return true;
             }
 
-            // 2. Unpack any complete frames in raw_buf into msg_buf
-            while (sbuf.raw_tail - sbuf.raw_head >= 4096) {
-                uint32_t header = 0;
-                memcpy(&header, sbuf.raw_buf.data() + sbuf.raw_head, 4);
-                if (header > 4092) {
-                    GGML_LOG_ERROR("corrupted frame header: %u > 4092\n", header);
+            // 2. Unpack complete frames directly from raw_buf to out or msg_buf
+            while (sbuf.raw_tail - sbuf.raw_head >= 2048) {
+                uint32_t chunk_len = 0;
+                memcpy(&chunk_len, sbuf.raw_buf.data() + sbuf.raw_head, 4);
+                if (chunk_len > 2044) {
+                    GGML_LOG_ERROR("corrupted frame header: %u > 2044\n", chunk_len);
                     return false;
                 }
-                size_t old_sz = sbuf.msg_buf.size();
-                sbuf.msg_buf.resize(old_sz + header);
-                if (header > 0) {
-                    memcpy(sbuf.msg_buf.data() + old_sz, sbuf.raw_buf.data() + sbuf.raw_head + 4, header);
+                const uint8_t * payload = sbuf.raw_buf.data() + sbuf.raw_head + 4;
+                if (needed > 0 && chunk_len > 0) {
+                    size_t to_out = std::min(needed, (size_t)chunk_len);
+                    memcpy(out, payload, to_out);
+                    out += to_out;
+                    needed -= to_out;
+                    payload += to_out;
+                    chunk_len -= (uint32_t)to_out;
                 }
-                sbuf.raw_head += 4096;
+                if (chunk_len > 0) {
+                    size_t old_sz = sbuf.msg_buf.size();
+                    sbuf.msg_buf.resize(old_sz + chunk_len);
+                    memcpy(sbuf.msg_buf.data() + old_sz, payload, chunk_len);
+                }
+                sbuf.raw_head += 2048;
                 if (sbuf.raw_head == sbuf.raw_tail) {
                     sbuf.raw_head = sbuf.raw_tail = 0;
                 }
             }
 
-            // If we unpacked new data into msg_buf, deliver it
-            if (sbuf.msg_buf.size() > sbuf.msg_offset) {
-                continue;
-            }
+            if (needed == 0) return true;
 
             // 3. Compact raw_buf before reading more
             if (sbuf.raw_head > 0) {
@@ -639,6 +673,10 @@ private:
             errno = 0;
             ssize_t n = ::read(fd, io_page_buf, sizeof(io_page_buf));
             if (n > 0) {
+                if (tb_debug_enabled()) {
+                    fprintf(stderr, "  [RX READ fd=%d n=%zd raw_tail_was=%zu needed=%zu]\n",
+                            fd, n, sbuf.raw_tail, needed);
+                }
                 if (sbuf.raw_buf.size() < sbuf.raw_tail + (size_t)n) {
                     sbuf.raw_buf.resize(sbuf.raw_tail + (size_t)n + 262144);
                 }
@@ -650,15 +688,19 @@ private:
                 continue;
             }
             if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-                std::this_thread::sleep_for(std::chrono::microseconds(50));
+                std::this_thread::yield();
                 continue;
             }
             if (n == 0) {
-                std::this_thread::sleep_for(std::chrono::microseconds(50));
-                continue;
+                GGML_LOG_ERROR("buffered_stream_read_exact: EOF from peer (fd=%d)\n", fd);
+                return false;
             }
             GGML_LOG_ERROR("buffered_stream_read_exact read failed: fd=%d, errno=%d (%s)\n", fd, errno, strerror(errno));
             return false;
+        }
+        if (tb_debug_enabled()) {
+            fprintf(stderr, "[RX DONE fd=%d size=%zu rem_msg=%zu rem_raw=%zu]\n",
+                    fd, size, sbuf.msg_buf.size() - sbuf.msg_offset, sbuf.raw_tail - sbuf.raw_head);
         }
         return true;
     }
@@ -695,20 +737,28 @@ public:
         const uint8_t * p = static_cast<const uint8_t *>(data);
         size_t total = 0;
 
+        if (tb_debug_enabled()) {
+            fprintf(stderr, "[TX START ch=%u fd=%d size=%zu]\n", channel_id, fd, size);
+        }
+
         while (total < size) {
-            size_t chunk_len = std::min(size - total, (size_t)4092);
+            size_t chunk_len = std::min(size - total, (size_t)2044);
             uint32_t header = (uint32_t)chunk_len;
-            size_t frame_size = 4096;
 
-            std::vector<uint8_t> frame(frame_size, 0);
-            memcpy(frame.data(), &header, 4);
-            memcpy(frame.data() + 4, p + total, chunk_len);
+            uint8_t frame[2048];
+            memset(frame, 0, 2048);
+            memcpy(frame, &header, 4);
+            memcpy(frame + 4, p + total, chunk_len);
 
-            if (!stream_write_exact(fd, frame.data(), frame_size)) {
+            if (!stream_write_exact(fd, frame, 2048)) {
                 return false;
             }
             total += chunk_len;
-            std::this_thread::sleep_for(std::chrono::microseconds(50));
+            std::this_thread::sleep_for(std::chrono::microseconds(65));
+        }
+        std::this_thread::sleep_for(std::chrono::microseconds(250));
+        if (tb_debug_enabled()) {
+            fprintf(stderr, "[TX DONE ch=%u fd=%d size=%zu]\n", channel_id, fd, size);
         }
         return true;
 #else
@@ -773,20 +823,6 @@ public:
             }
         }
         is_first_accept = false;
-        {
-            pollfd pfd = { data_fd, POLLIN, 0 };
-            while (poll(&pfd, 1, 0) > 0 && (pfd.revents & POLLIN)) {
-                uint8_t drain_buf[4096];
-                if (::read(data_fd, drain_buf, sizeof(drain_buf)) <= 0) break;
-            }
-        }
-        if (ctrl_fd >= 0 && ctrl_fd != data_fd) {
-            pollfd pfd = { ctrl_fd, POLLIN, 0 };
-            while (poll(&pfd, 1, 0) > 0 && (pfd.revents & POLLIN)) {
-                uint8_t drain_buf[4096];
-                if (::read(ctrl_fd, drain_buf, sizeof(drain_buf)) <= 0) break;
-            }
-        }
         return shared_from_this();
 #else
         return nullptr;
@@ -809,20 +845,6 @@ public:
                 GGML_LOG_ERROR("Failed to open control stream device '%s': %s\n", ctrl_path.c_str(), strerror(errno));
                 ::close(dfd);
                 return nullptr;
-            }
-        }
-        {
-            pollfd pfd = { dfd, POLLIN, 0 };
-            while (poll(&pfd, 1, 0) > 0 && (pfd.revents & POLLIN)) {
-                uint8_t drain_buf[4096];
-                if (::read(dfd, drain_buf, sizeof(drain_buf)) <= 0) break;
-            }
-        }
-        if (cfd >= 0 && cfd != dfd) {
-            pollfd pfd = { cfd, POLLIN, 0 };
-            while (poll(&pfd, 1, 0) > 0 && (pfd.revents & POLLIN)) {
-                uint8_t drain_buf[4096];
-                if (::read(cfd, drain_buf, sizeof(drain_buf)) <= 0) break;
             }
         }
         LOG_DBG("Opened stream devices: data='%s' (fd=%d), ctrl='%s' (fd=%d)\n",
