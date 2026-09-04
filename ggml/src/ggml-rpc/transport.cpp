@@ -728,6 +728,32 @@ public:
     bool send_exact(const void * data, size_t size) override { return send_exact_channel(RPC_CHANNEL_CONTROL, data, size); }
     bool recv_exact(void * data, size_t size) override { return recv_exact_channel(RPC_CHANNEL_CONTROL, data, size); }
 
+    static int open_stream_device(const std::string & path, int max_wait_sec = 10) {
+        auto start = std::chrono::steady_clock::now();
+        while (true) {
+            int fd = ::open(path.c_str(), O_RDWR | O_NONBLOCK);
+            if (fd >= 0) {
+                int flags = fcntl(fd, F_GETFL, 0);
+                if (flags != -1) {
+                    fcntl(fd, F_SETFL, flags & ~O_NONBLOCK);
+                }
+                return fd;
+            }
+            if (errno != ENXIO && errno != ENOENT && errno != EAGAIN && errno != EBUSY) {
+                GGML_LOG_ERROR("Failed to open stream device '%s': %s\n", path.c_str(), strerror(errno));
+                return -1;
+            }
+            auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::steady_clock::now() - start).count();
+            if (elapsed >= max_wait_sec) {
+                GGML_LOG_ERROR("Timeout waiting for stream device '%s' (waited %d s): %s\n",
+                               path.c_str(), max_wait_sec, strerror(errno));
+                return -1;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        }
+    }
+
     bool send_exact_channel(uint32_t channel_id, const void * data, size_t size) override {
 #ifndef _WIN32
         if (size == 0 || data == nullptr) return true;
@@ -741,22 +767,40 @@ public:
             fprintf(stderr, "[TX START ch=%u fd=%d size=%zu]\n", channel_id, fd, size);
         }
 
+        // Batch buffer: up to 32 frames of 2048 bytes = 65536 bytes
+        alignas(4096) uint8_t batch_buf[65536];
+
         while (total < size) {
-            size_t chunk_len = std::min(size - total, (size_t)2044);
-            uint32_t header = (uint32_t)chunk_len;
+            size_t batch_bytes = 0;
+            while (total < size && batch_bytes + 2048 <= sizeof(batch_buf)) {
+                size_t chunk_len = std::min(size - total, (size_t)2044);
+                uint32_t header = (uint32_t)chunk_len;
 
-            uint8_t frame[2048];
-            memset(frame, 0, 2048);
-            memcpy(frame, &header, 4);
-            memcpy(frame + 4, p + total, chunk_len);
+                uint8_t * frame = batch_buf + batch_bytes;
+                memset(frame, 0, 2048);
+                memcpy(frame, &header, 4);
+                memcpy(frame + 4, p + total, chunk_len);
 
-            if (!stream_write_exact(fd, frame, 2048)) {
+                total += chunk_len;
+                batch_bytes += 2048;
+            }
+
+            if (batch_bytes > 0) {
+                if (!stream_write_exact(fd, batch_buf, batch_bytes)) {
+                    return false;
+                }
+            }
+        }
+
+        // Append 2048-byte flush trailer frame (header = 0) to flush trailing DMA descriptors
+        {
+            alignas(4096) uint8_t flush_frame[2048];
+            memset(flush_frame, 0, sizeof(flush_frame));
+            if (!stream_write_exact(fd, flush_frame, sizeof(flush_frame))) {
                 return false;
             }
-            total += chunk_len;
-            std::this_thread::sleep_for(std::chrono::microseconds(65));
         }
-        std::this_thread::sleep_for(std::chrono::microseconds(250));
+
         if (tb_debug_enabled()) {
             fprintf(stderr, "[TX DONE ch=%u fd=%d size=%zu]\n", channel_id, fd, size);
         }
@@ -805,7 +849,7 @@ public:
             if (ctrl_fd >= 0 && ctrl_fd != data_fd) ::close(ctrl_fd);
             data_rx_buf.clear();
             ctrl_rx_buf.clear();
-            data_fd = ::open(data_path.c_str(), O_RDWR);
+            data_fd = open_stream_device(data_path);
             if (data_fd < 0) {
                 GGML_LOG_ERROR("Failed to re-open data stream device '%s': %s\n", data_path.c_str(), strerror(errno));
                 return nullptr;
@@ -813,7 +857,7 @@ public:
             if (data_path == ctrl_path) {
                 ctrl_fd = data_fd;
             } else {
-                ctrl_fd = ::open(ctrl_path.c_str(), O_RDWR);
+                ctrl_fd = open_stream_device(ctrl_path);
                 if (ctrl_fd < 0) {
                     GGML_LOG_ERROR("Failed to re-open control stream device '%s': %s\n", ctrl_path.c_str(), strerror(errno));
                     ::close(data_fd);
@@ -831,7 +875,7 @@ public:
     bool is_stream() const override { return true; }
     static std::shared_ptr<stream_rpc_transport> open_stream(const std::string & data_path, const std::string & ctrl_path, bool is_server = false) {
 #ifndef _WIN32
-        int dfd = ::open(data_path.c_str(), O_RDWR);
+        int dfd = open_stream_device(data_path);
         if (dfd < 0) {
             GGML_LOG_ERROR("Failed to open data stream device '%s': %s\n", data_path.c_str(), strerror(errno));
             return nullptr;
@@ -840,7 +884,7 @@ public:
         if (data_path == ctrl_path) {
             cfd = dfd;
         } else {
-            cfd = ::open(ctrl_path.c_str(), O_RDWR);
+            cfd = open_stream_device(ctrl_path);
             if (cfd < 0) {
                 GGML_LOG_ERROR("Failed to open control stream device '%s': %s\n", ctrl_path.c_str(), strerror(errno));
                 ::close(dfd);
