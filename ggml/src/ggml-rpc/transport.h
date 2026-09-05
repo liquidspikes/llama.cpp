@@ -26,7 +26,8 @@ static_assert(sizeof(stream_frame_header) == 16, "stream_frame_header must be 16
 enum rpc_channel_id : uint32_t {
     RPC_CHANNEL_DATA    = 0, // Bulk tensor memory / weights (/dev/tbstream0)
     RPC_CHANNEL_CONTROL = 1, // Control opcodes, sync barriers, graph requests (/dev/tbstream1)
-    RPC_CHANNEL_COUNT   = 2,
+    RPC_CHANNEL_STRIPED = 2, // Striped across BOTH streams (/dev/tbstream0 AND /dev/tbstream1)
+    RPC_CHANNEL_COUNT   = 3,
 };
 
 enum class rpc_transport_kind {
@@ -66,6 +67,16 @@ struct rpc_transport {
     }
 
     virtual bool flush() { return true; }
+
+    // Simultaneous send+recv. Stream/tbstripe implements this via tbs_xchg so
+    // allreduce does not half-duplex-deadlock the USB4 pipe. Default: unsupported.
+    virtual bool xchg(const void * out, void * in, size_t n) {
+        (void)out;
+        (void)in;
+        (void)n;
+        return false;
+    }
+
     virtual void close() = 0;
 
     virtual std::shared_ptr<rpc_transport> accept() { return nullptr; }
@@ -92,6 +103,7 @@ struct socket_t {
     bool recv_cmd(uint8_t * cmd, uint32_t * out_channel = nullptr);
 
     bool flush();
+    bool xchg(const void * out, void * in, size_t n);
 
     std::shared_ptr<socket_t> accept();
 
