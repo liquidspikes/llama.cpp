@@ -1914,7 +1914,11 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
             }
         }
     }
-    GGML_ASSERT(status == GGML_STATUS_SUCCESS && "Unsuccessful graph computations are not supported with RPC");
+    if (status != GGML_STATUS_SUCCESS) {
+        GGML_LOG_ERROR("[%s] graph_compute failed status=%d n_nodes=%u (keeping RPC session)\n",
+                       __func__, (int) status, n_nodes);
+        return false;
+    }
     stored_graphs[device].graph = graph;
     return true;
 }
@@ -1930,7 +1934,11 @@ bool rpc_server::graph_recompute(const rpc_msg_graph_recompute_req & request) {
     ggml_cgraph * graph = stored_graphs[device].graph;
     LOG_DBG("[%s] device: %u\n", __func__, device);
     ggml_status status = ggml_backend_graph_compute(backends[device], graph);
-    GGML_ASSERT(status == GGML_STATUS_SUCCESS && "Unsuccessful graph computations are not supported with RPC");
+    if (status != GGML_STATUS_SUCCESS) {
+        GGML_LOG_ERROR("[%s] graph_recompute failed status=%d (keeping RPC session)\n",
+                       __func__, (int) status);
+        return false;
+    }
     return true;
 }
 
@@ -2216,14 +2224,9 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                 if (!recv_msg(sock, input, cmd_channel)) {
                     return;
                 }
-                if (!server.graph_compute(input)) {
+                const uint8_t ack = server.graph_compute(input) ? 1 : 0;
+                if (!send_msg(sock, &ack, sizeof(ack), cmd_channel)) {
                     return;
-                }
-                {
-                    uint8_t ack = 1;
-                    if (!send_msg(sock, &ack, sizeof(ack), cmd_channel)) {
-                        return;
-                    }
                 }
                 break;
             }
@@ -2232,14 +2235,9 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                 if (!recv_msg(sock, &request, sizeof(request), cmd_channel)) {
                     return;
                 }
-                if (!server.graph_recompute(request)) {
+                const uint8_t ack = server.graph_recompute(request) ? 1 : 0;
+                if (!send_msg(sock, &ack, sizeof(ack), cmd_channel)) {
                     return;
-                }
-                {
-                    uint8_t ack = 1;
-                    if (!send_msg(sock, &ack, sizeof(ack), cmd_channel)) {
-                        return;
-                    }
                 }
                 break;
             }
