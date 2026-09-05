@@ -524,8 +524,18 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             if (ret.axis == GGML_BACKEND_SPLIT_AXIS_NONE) {
                 ret = src_ss[i];
             } else if (!split_states_equal(src_ss[i], ret)) {
-                ret = {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, {1}, 1};
-                break;
+                // Elementwise: a fully replicated operand does not change the
+                // other operand's split (Qwen3.5 GDN gate = softplus × ssm_a).
+                if (ret.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED &&
+                        src_ss[i].axis >= 0 && src_ss[i].axis < GGML_MAX_DIMS) {
+                    ret = src_ss[i];
+                } else if (src_ss[i].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED &&
+                        ret.axis >= 0 && ret.axis < GGML_MAX_DIMS) {
+                    // keep ret
+                } else {
+                    ret = {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, {1}, 1};
+                    break;
+                }
             }
         }
         if (ret.axis == GGML_BACKEND_SPLIT_AXIS_NONE) {
@@ -561,6 +571,15 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
     auto handle_bin_bcast = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
         if (src_ss[0].axis >= 0 && src_ss[0].axis < GGML_MAX_DIMS &&
                 tensor->src[1]->ne[src_ss[0].axis] == 1 && src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+            return src_ss[0];
+        }
+        // Swapped broadcast: src0 replicated, src1 split (gate-0 = a_softplus × ssm_a).
+        if (src_ss[1].axis >= 0 && src_ss[1].axis < GGML_MAX_DIMS &&
+                src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+            return src_ss[1];
+        }
+        if (src_ss[0].axis >= 0 && src_ss[0].axis < GGML_MAX_DIMS &&
+                src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
             return src_ss[0];
         }
         if (src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED && (src_ss[0].axis == src_ss[1].axis ||
