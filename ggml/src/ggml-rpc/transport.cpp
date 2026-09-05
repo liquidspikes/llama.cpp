@@ -31,6 +31,8 @@
 #include <thread>
 #include <chrono>
 #include <future>
+#include <condition_variable>
+#include <functional>
 #if defined(__x86_64__) || defined(_M_X64)
 #  include <immintrin.h>
 #endif
@@ -43,6 +45,10 @@
 #    include "transport-apple.h"
 #  endif
 #endif // GGML_RPC_RDMA
+
+#ifdef GGML_TBSTRIPE
+#  include "tbstripe.h"
+#endif
 
 #ifdef _WIN32
 typedef SOCKET sockfd_t;
@@ -561,6 +567,83 @@ private:
     std::mutex ctrl_send_mu;
     std::mutex ctrl_recv_mu;
 
+    std::thread stripe_worker;
+    std::mutex stripe_mu;
+    std::condition_variable stripe_cv_in;
+    std::condition_variable stripe_cv_out;
+    std::function<bool()> stripe_fn;
+    bool stripe_has_work = false;
+    bool stripe_done = false;
+    bool stripe_res = false;
+    bool stripe_stop = false;
+
+#ifdef GGML_TBSTRIPE
+    tbs_pipe * tbs_pipe_handle = nullptr;
+#endif
+
+    void start_stripe_worker() {
+#ifndef _WIN32
+        if (data_fd != ctrl_fd && data_fd >= 0 && ctrl_fd >= 0 && !stripe_worker.joinable()) {
+            stripe_stop = false;
+            stripe_has_work = false;
+            stripe_done = false;
+            stripe_worker = std::thread([this]() {
+                std::unique_lock<std::mutex> lock(stripe_mu);
+                while (!stripe_stop) {
+                    stripe_cv_in.wait(lock, [this]() { return stripe_has_work || stripe_stop; });
+                    if (stripe_stop) break;
+                    stripe_has_work = false;
+                    lock.unlock();
+
+                    bool r = stripe_fn ? stripe_fn() : false;
+
+                    lock.lock();
+                    stripe_res = r;
+                    stripe_done = true;
+                    stripe_cv_out.notify_one();
+                }
+            });
+        }
+#endif
+    }
+
+    void stop_stripe_worker() {
+#ifndef _WIN32
+        {
+            std::lock_guard<std::mutex> lock(stripe_mu);
+            stripe_stop = true;
+            stripe_has_work = false;
+            stripe_cv_in.notify_all();
+        }
+        if (stripe_worker.joinable()) {
+            stripe_worker.join();
+        }
+#endif
+    }
+
+    bool run_striped_op(std::function<bool()> fn0, std::function<bool()> fn1) {
+#ifndef _WIN32
+        if (!stripe_worker.joinable()) {
+            return fn0() && fn1();
+        }
+        {
+            std::lock_guard<std::mutex> lock(stripe_mu);
+            stripe_fn = std::move(fn0);
+            stripe_done = false;
+            stripe_has_work = true;
+            stripe_cv_in.notify_one();
+        }
+        bool r1 = fn1();
+        {
+            std::unique_lock<std::mutex> lock(stripe_mu);
+            stripe_cv_out.wait(lock, [this]() { return stripe_done; });
+            return stripe_res && r1;
+        }
+#else
+        return fn0() && fn1();
+#endif
+    }
+
     struct rx_stream_buffer {
         std::vector<uint8_t> raw_buf;
         size_t raw_head = 0;
@@ -706,10 +789,69 @@ private:
     }
 
 public:
+    bool init_tbstripe() {
+#ifdef GGML_TBSTRIPE
+        if (data_path.empty() || data_path == ctrl_path) {
+            return false;
+        }
+        tbs_config cfg = {};
+        cfg.dev_a = data_path.c_str();
+        cfg.dev_b = ctrl_path.c_str();
+        cfg.stripe = TBS_FRAME_SIZE;
+        cfg.busy_spin = 1;
+        cfg.cpu_affinity_a = 8;
+        cfg.cpu_affinity_b = 9;
+        tbs_pipe_handle = tbs_open(&cfg);
+        if (!tbs_pipe_handle) {
+            GGML_LOG_ERROR("stream_rpc_transport: tbs_open failed for %s,%s\n",
+                           data_path.c_str(), ctrl_path.c_str());
+            return false;
+        }
+        GGML_LOG_INFO("stream_rpc_transport: tbstripe pipe on %s + %s (striped=%d)\n",
+                      data_path.c_str(), ctrl_path.c_str(), tbs_is_striped(tbs_pipe_handle));
+        return true;
+#else
+        return false;
+#endif
+    }
+
+    void release_raw_fds() {
+#ifndef _WIN32
+        if (ctrl_fd >= 0 && ctrl_fd != data_fd) {
+            ::close(ctrl_fd);
+        }
+        if (data_fd >= 0) {
+            ::close(data_fd);
+        }
+        data_fd = -1;
+        ctrl_fd = -1;
+#endif
+    }
+
     stream_rpc_transport(int dfd, int cfd, const std::string & dpath, const std::string & cpath, bool listener)
-        : data_fd(dfd), ctrl_fd(cfd), is_listener(listener), data_path(dpath), ctrl_path(cpath) {}
+        : data_fd(dfd), ctrl_fd(cfd), is_listener(listener), data_path(dpath), ctrl_path(cpath) {
+        // Drop constructor FDs first so tbstripe is the only opener.
+        release_raw_fds();
+        if (init_tbstripe()) {
+            return;
+        }
+        data_fd = open_stream_device(data_path);
+        if (data_path == ctrl_path) {
+            ctrl_fd = data_fd;
+        } else if (data_fd >= 0) {
+            ctrl_fd = open_stream_device(ctrl_path);
+        }
+        start_stripe_worker();
+    }
 
     ~stream_rpc_transport() override {
+#ifdef GGML_TBSTRIPE
+        if (tbs_pipe_handle) {
+            tbs_close(tbs_pipe_handle);
+            tbs_pipe_handle = nullptr;
+        }
+#endif
+        stop_stripe_worker();
         if (!is_listener) {
             close();
         }
@@ -725,8 +867,24 @@ public:
         return (channel_id == RPC_CHANNEL_DATA) ? data_recv_mu : ctrl_recv_mu;
     }
 
-    bool send_exact(const void * data, size_t size) override { return send_exact_channel(RPC_CHANNEL_CONTROL, data, size); }
-    bool recv_exact(void * data, size_t size) override { return recv_exact_channel(RPC_CHANNEL_CONTROL, data, size); }
+    bool send_exact(const void * data, size_t size) override {
+#ifdef GGML_TBSTRIPE
+        if (tbs_pipe_handle) {
+            if (size == 0 || data == nullptr) return true;
+            return tbs_send(tbs_pipe_handle, data, size) == 0;
+        }
+#endif
+        return send_exact_channel(RPC_CHANNEL_CONTROL, data, size);
+    }
+    bool recv_exact(void * data, size_t size) override {
+#ifdef GGML_TBSTRIPE
+        if (tbs_pipe_handle) {
+            if (size == 0 || data == nullptr) return true;
+            return tbs_recv(tbs_pipe_handle, data, size) == 0;
+        }
+#endif
+        return recv_exact_channel(RPC_CHANNEL_CONTROL, data, size);
+    }
 
     static int open_stream_device(const std::string & path, int max_wait_sec = 10) {
         auto start = std::chrono::steady_clock::now();
@@ -757,6 +915,27 @@ public:
     bool send_exact_channel(uint32_t channel_id, const void * data, size_t size) override {
 #ifndef _WIN32
         if (size == 0 || data == nullptr) return true;
+#ifdef GGML_TBSTRIPE
+        if (tbs_pipe_handle) {
+            (void)channel_id;
+            return tbs_send(tbs_pipe_handle, data, size) == 0;
+        }
+#endif
+        if (channel_id == RPC_CHANNEL_STRIPED) {
+            if (data_fd == ctrl_fd || size < 2048) {
+                return send_exact_channel(RPC_CHANNEL_CONTROL, data, size);
+            }
+            size_t half0 = size / 2;
+            size_t half1 = size - half0;
+            return run_striped_op(
+                [this, data, half0]() {
+                    return send_exact_channel(RPC_CHANNEL_DATA, data, half0);
+                },
+                [this, data, half0, half1]() {
+                    return send_exact_channel(RPC_CHANNEL_CONTROL, (const uint8_t*)data + half0, half1);
+                }
+            );
+        }
         int fd = get_fd_for_channel(channel_id);
         std::lock_guard<std::mutex> lock(get_send_mutex(channel_id));
 
@@ -813,6 +992,27 @@ public:
     bool recv_exact_channel(uint32_t channel_id, void * data, size_t size) override {
 #ifndef _WIN32
         if (size == 0 || data == nullptr) return true;
+#ifdef GGML_TBSTRIPE
+        if (tbs_pipe_handle) {
+            (void)channel_id;
+            return tbs_recv(tbs_pipe_handle, data, size) == 0;
+        }
+#endif
+        if (channel_id == RPC_CHANNEL_STRIPED) {
+            if (data_fd == ctrl_fd || size < 2048) {
+                return recv_exact_channel(RPC_CHANNEL_CONTROL, data, size);
+            }
+            size_t half0 = size / 2;
+            size_t half1 = size - half0;
+            return run_striped_op(
+                [this, data, half0]() {
+                    return recv_exact_channel(RPC_CHANNEL_DATA, data, half0);
+                },
+                [this, data, half0, half1]() {
+                    return recv_exact_channel(RPC_CHANNEL_CONTROL, (uint8_t*)data + half0, half1);
+                }
+            );
+        }
         int fd = get_fd_for_channel(channel_id);
         std::lock_guard<std::mutex> lock(get_recv_mutex(channel_id));
         return buffered_stream_read_exact(fd, get_rx_buf(channel_id), data, size);
@@ -824,6 +1024,11 @@ public:
     bool recv_cmd(uint8_t * cmd, uint32_t * out_channel) override {
 #ifndef _WIN32
         if (out_channel) *out_channel = RPC_CHANNEL_CONTROL;
+#ifdef GGML_TBSTRIPE
+        if (tbs_pipe_handle) {
+            return recv_exact(cmd, 1);
+        }
+#endif
         return recv_exact_channel(RPC_CHANNEL_CONTROL, cmd, 1);
 #else
         (void)cmd; (void)out_channel;
@@ -835,6 +1040,7 @@ public:
     }
     void close() override {
 #ifndef _WIN32
+        stop_stripe_worker();
         if (ctrl_fd >= 0 && ctrl_fd != data_fd) ::close(ctrl_fd);
         if (data_fd >= 0) ::close(data_fd);
         ctrl_fd = data_fd = -1;
@@ -844,11 +1050,34 @@ public:
     std::shared_ptr<rpc_transport> accept() override {
         if (!is_listener) return nullptr;
 #ifndef _WIN32
+        // USB4STREAM is a persistent pipe, not a TCP listen socket. Re-opening
+        // sends CLOSE/EOF and desynchronizes the peer. Keep the same tbstripe
+        // handle for the life of the process.
+#ifdef GGML_TBSTRIPE
+        if (tbs_pipe_handle) {
+            if (!is_first_accept) {
+                // Previous client closed the USB4STREAM (CLOSE/EOF). Reopen
+                // once, with a short pause so we do not spin at 100% CPU.
+                tbs_close(tbs_pipe_handle);
+                tbs_pipe_handle = nullptr;
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                if (!init_tbstripe()) {
+                    return nullptr;
+                }
+            }
+            is_first_accept = false;
+            return shared_from_this();
+        }
+#endif
         if (!is_first_accept) {
-            if (data_fd >= 0) ::close(data_fd);
-            if (ctrl_fd >= 0 && ctrl_fd != data_fd) ::close(ctrl_fd);
+            stop_stripe_worker();
+            release_raw_fds();
             data_rx_buf.clear();
             ctrl_rx_buf.clear();
+            if (init_tbstripe()) {
+                is_first_accept = false;
+                return shared_from_this();
+            }
             data_fd = open_stream_device(data_path);
             if (data_fd < 0) {
                 GGML_LOG_ERROR("Failed to re-open data stream device '%s': %s\n", data_path.c_str(), strerror(errno));
@@ -865,6 +1094,7 @@ public:
                     return nullptr;
                 }
             }
+            start_stripe_worker();
         }
         is_first_accept = false;
         return shared_from_this();
@@ -873,27 +1103,30 @@ public:
 #endif
     }
     bool is_stream() const override { return true; }
+    bool xchg(const void * out, void * in, size_t n) override {
+#ifdef GGML_TBSTRIPE
+        if (tbs_pipe_handle) {
+            if (n == 0) {
+                return true;
+            }
+            if (out == nullptr || in == nullptr) {
+                return false;
+            }
+            return tbs_xchg(tbs_pipe_handle, out, in, n) == 0;
+        }
+#else
+        (void)out;
+        (void)in;
+        (void)n;
+#endif
+        return false;
+    }
     static std::shared_ptr<stream_rpc_transport> open_stream(const std::string & data_path, const std::string & ctrl_path, bool is_server = false) {
 #ifndef _WIN32
-        int dfd = open_stream_device(data_path);
-        if (dfd < 0) {
-            GGML_LOG_ERROR("Failed to open data stream device '%s': %s\n", data_path.c_str(), strerror(errno));
-            return nullptr;
-        }
-        int cfd = -1;
-        if (data_path == ctrl_path) {
-            cfd = dfd;
-        } else {
-            cfd = open_stream_device(ctrl_path);
-            if (cfd < 0) {
-                GGML_LOG_ERROR("Failed to open control stream device '%s': %s\n", ctrl_path.c_str(), strerror(errno));
-                ::close(dfd);
-                return nullptr;
-            }
-        }
-        LOG_DBG("Opened stream devices: data='%s' (fd=%d), ctrl='%s' (fd=%d)\n",
-                data_path.c_str(), dfd, ctrl_path.c_str(), cfd);
-        return std::make_shared<stream_rpc_transport>(dfd, cfd, data_path, ctrl_path, is_server);
+        // Do not open the char devices here. Closing a USB4STREAM fd sends a
+        // CLOSE/EOF frame to the peer. tbstripe (or the constructor fallback)
+        // must be the only opener for the session.
+        return std::make_shared<stream_rpc_transport>(-1, -1, data_path, ctrl_path, is_server);
 #else
         (void)data_path; (void)ctrl_path; (void)is_server;
         return nullptr;
@@ -909,6 +1142,7 @@ bool socket_t::send_data_channel(uint32_t channel_id, const void * data, size_t 
 bool socket_t::recv_data_channel(uint32_t channel_id, void * data, size_t size) { return transport && transport->recv_exact_channel(channel_id, data, size); }
 bool socket_t::recv_cmd(uint8_t * cmd, uint32_t * out_channel) { return transport && transport->recv_cmd(cmd, out_channel); }
 bool socket_t::flush() { return transport && transport->flush(); }
+bool socket_t::xchg(const void * out, void * in, size_t n) { return transport && transport->xchg(out, in, n); }
 std::shared_ptr<socket_t> socket_t::accept() {
     auto child = transport ? transport->accept() : nullptr;
     return child ? std::make_shared<socket_t>(child) : nullptr;
