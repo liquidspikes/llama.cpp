@@ -252,12 +252,12 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         src0_d += ncols * iter_nrows;
         dst_d  += k     * iter_nrows;
     }
-#else
+#else                             // GGML_CUDA_USE_CUB
 #if defined(GGML_USE_HIP)
     if (ncols > 1024) {
         top_k_radix_cuda(pool, src0_d, dst_d, ncols, nrows, k, stream);
     } else {
-#endif
+#endif // defined(GGML_USE_HIP)
         ggml_cuda_pool_alloc<int> temp_dst_alloc(pool, ncols * nrows);
         int *                     tmp_dst = temp_dst_alloc.get();
         argsort_f32_i32_cuda_bitonic(src0_d, tmp_dst, ncols, nrows, GGML_SORT_ORDER_DESC, stream);
@@ -265,6 +265,6 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
                                      cudaMemcpyDeviceToDevice, stream));
 #if defined(GGML_USE_HIP)
     }
-#endif
+#endif // defined(GGML_USE_HIP)
 #endif
 }
