@@ -22,8 +22,78 @@
 #include <algorithm>
 #include <atomic>
 #include <thread>
+#if defined(__x86_64__) || defined(_M_X64)
+#  include <immintrin.h>
+#endif
 
 static const char * RPC_DEBUG = std::getenv("GGML_RPC_DEBUG");
+
+/* IMP-24: AVX-512 F32 add + F16C F16 add. This CPU has avx512f/f16c, not avx512fp16,
+ * so F16 uses cvtph/ps + add_ps (never _mm512_add_ph). */
+static void allreduce_add_f32(float * dst, const float * src, size_t count) {
+    size_t i = 0;
+#if defined(__AVX512F__)
+    for (; i + 64 <= count; i += 64) {
+        __m512 d0 = _mm512_loadu_ps(dst + i);
+        __m512 s0 = _mm512_loadu_ps(src + i);
+        __m512 d1 = _mm512_loadu_ps(dst + i + 16);
+        __m512 s1 = _mm512_loadu_ps(src + i + 16);
+        __m512 d2 = _mm512_loadu_ps(dst + i + 32);
+        __m512 s2 = _mm512_loadu_ps(src + i + 32);
+        __m512 d3 = _mm512_loadu_ps(dst + i + 48);
+        __m512 s3 = _mm512_loadu_ps(src + i + 48);
+        _mm512_storeu_ps(dst + i,      _mm512_add_ps(d0, s0));
+        _mm512_storeu_ps(dst + i + 16, _mm512_add_ps(d1, s1));
+        _mm512_storeu_ps(dst + i + 32, _mm512_add_ps(d2, s2));
+        _mm512_storeu_ps(dst + i + 48, _mm512_add_ps(d3, s3));
+    }
+    for (; i + 16 <= count; i += 16) {
+        _mm512_storeu_ps(dst + i, _mm512_add_ps(_mm512_loadu_ps(dst + i),
+                                                _mm512_loadu_ps(src + i)));
+    }
+#elif defined(__AVX2__)
+    for (; i + 8 <= count; i += 8) {
+        _mm256_storeu_ps(dst + i, _mm256_add_ps(_mm256_loadu_ps(dst + i),
+                                                _mm256_loadu_ps(src + i)));
+    }
+#endif
+    for (; i < count; i++) {
+        dst[i] += src[i];
+    }
+}
+
+static void allreduce_add_f16(ggml_fp16_t * dst, const ggml_fp16_t * src, size_t count) {
+    size_t i = 0;
+#if defined(__AVX512F__)
+    for (; i + 64 <= count; i += 64) {
+        for (int k = 0; k < 64; k += 16) {
+            const __m256i h = _mm256_loadu_si256((const __m256i *)(dst + i + (size_t)k));
+            const __m256i s = _mm256_loadu_si256((const __m256i *)(src + i + (size_t)k));
+            const __m512 sum = _mm512_add_ps(_mm512_cvtph_ps(h), _mm512_cvtph_ps(s));
+            _mm256_storeu_si256((__m256i *)(dst + i + (size_t)k),
+                                _mm512_cvtps_ph(sum, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
+        }
+    }
+    for (; i + 16 <= count; i += 16) {
+        const __m256i h = _mm256_loadu_si256((const __m256i *)(dst + i));
+        const __m256i s = _mm256_loadu_si256((const __m256i *)(src + i));
+        const __m512 sum = _mm512_add_ps(_mm512_cvtph_ps(h), _mm512_cvtph_ps(s));
+        _mm256_storeu_si256((__m256i *)(dst + i),
+                            _mm512_cvtps_ph(sum, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
+    }
+#elif defined(__AVX2__) && defined(__F16C__)
+    for (; i + 8 <= count; i += 8) {
+        const __m128i h = _mm_loadu_si128((const __m128i *)(dst + i));
+        const __m128i s = _mm_loadu_si128((const __m128i *)(src + i));
+        const __m256 sum = _mm256_add_ps(_mm256_cvtph_ps(h), _mm256_cvtph_ps(s));
+        _mm_storeu_si128((__m128i *)(dst + i), _mm256_cvtps_ph(sum, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
+    }
+#endif
+    for (; i < count; i++) {
+        dst[i] = ggml_compute_fp32_to_fp16(ggml_compute_fp16_to_fp32(dst[i]) +
+                                           ggml_compute_fp16_to_fp32(src[i]));
+    }
+}
 
 #define LOG_DBG(...) \
     do { if (RPC_DEBUG) GGML_LOG_DEBUG(__VA_ARGS__); } while (0)
@@ -2279,17 +2349,13 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                     return;
                 }
                 if (request.tensor.type == GGML_TYPE_F32) {
-                    float * d1 = (float *)local_data.data();
-                    const float * d2 = (const float *)peer_data.data();
-                    for (size_t i = 0; i < bytes / sizeof(float); i++) {
-                        d1[i] += d2[i];
-                    }
+                    allreduce_add_f32((float *)local_data.data(),
+                                      (const float *)peer_data.data(),
+                                      bytes / sizeof(float));
                 } else if (request.tensor.type == GGML_TYPE_F16) {
-                    ggml_fp16_t * d1 = (ggml_fp16_t *)local_data.data();
-                    const ggml_fp16_t * d2 = (const ggml_fp16_t *)peer_data.data();
-                    for (size_t i = 0; i < bytes / sizeof(ggml_fp16_t); i++) {
-                        d1[i] = ggml_compute_fp32_to_fp16(ggml_compute_fp16_to_fp32(d1[i]) + ggml_compute_fp16_to_fp32(d2[i]));
-                    }
+                    allreduce_add_f16((ggml_fp16_t *)local_data.data(),
+                                      (const ggml_fp16_t *)peer_data.data(),
+                                      bytes / sizeof(ggml_fp16_t));
                 } else {
                     GGML_LOG_ERROR("Unsupported tensor type for RPC_CMD_ALL_REDUCE: %d\n", request.tensor.type);
                     return;
@@ -2589,17 +2655,13 @@ GGML_BACKEND_API bool ggml_backend_rpc_comm_allreduce_tensor(void * comm_ctx, st
                                    local_data.data(), peer_data.data(), bytes);
 
     if (local_tensor->type == GGML_TYPE_F32) {
-        float * d1 = (float *)local_data.data();
-        const float * d2 = (const float *)peer_data.data();
-        for (size_t i = 0; i < bytes / sizeof(float); i++) {
-            d1[i] += d2[i];
-        }
+        allreduce_add_f32((float *)local_data.data(),
+                          (const float *)peer_data.data(),
+                          bytes / sizeof(float));
     } else if (local_tensor->type == GGML_TYPE_F16) {
-        ggml_fp16_t * d1 = (ggml_fp16_t *)local_data.data();
-        const ggml_fp16_t * d2 = (const ggml_fp16_t *)peer_data.data();
-        for (size_t i = 0; i < bytes / sizeof(ggml_fp16_t); i++) {
-            d1[i] = ggml_compute_fp32_to_fp16(ggml_compute_fp16_to_fp32(d1[i]) + ggml_compute_fp16_to_fp32(d2[i]));
-        }
+        allreduce_add_f16((ggml_fp16_t *)local_data.data(),
+                          (const ggml_fp16_t *)peer_data.data(),
+                          bytes / sizeof(ggml_fp16_t));
     } else {
         GGML_LOG_ERROR("rpc allreduce: unsupported type %d\n", (int)local_tensor->type);
         return false;

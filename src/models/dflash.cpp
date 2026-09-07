@@ -3,6 +3,164 @@
 #include "llama-impl.h"
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
+#include "ggml-backend.h"
+#include "ggml-alloc.h"
+#include "ggml-cpp.h"
+
+#include <cinttypes>
+#include <mutex>
+#include <unordered_map>
+#include <vector>
+
+// Target tok_embd is mirrored; output.weight is vocab-split (axis 1) on rpc-tensor.
+// Unwrapping only shard 0 makes DFlash2 score n_vocab/2 logits against a full-vocab
+// selector, which collapses accept (~10% then 0% on the next HTTP request).
+static ggml_tensor * dflash_meta_shard(ggml_tensor * t, size_t index) {
+    if (t && t->buffer && ggml_backend_buffer_is_meta(t->buffer)) {
+        ggml_tensor * s = ggml_backend_meta_buffer_simple_tensor(t, index);
+        if (s) {
+            return s;
+        }
+    }
+    return index == 0 ? t : nullptr;
+}
+
+struct dflash_local_lm_head {
+    ggml_context_ptr ctx;
+    ggml_backend_buffer_ptr buf;
+    ggml_tensor * output   = nullptr;
+    ggml_tensor * output_s = nullptr;
+    bool attempted = false;
+};
+
+static std::mutex g_lm_head_mu;
+static std::unordered_map<const llama_model *, std::unique_ptr<dflash_local_lm_head>> g_lm_heads;
+
+static ggml_tensor * dflash_copy_weight_local(dflash_local_lm_head & cache, ggml_tensor * src) {
+    if (src == nullptr) {
+        return nullptr;
+    }
+    ggml_tensor * dst = ggml_dup_tensor(cache.ctx.get(), src);
+    ggml_set_name(dst, src->name[0] ? src->name : "dflash_tgt_out_local");
+    return dst;
+}
+
+// One-time host gather of vocab-split target output.weight onto a ROCm0 buffer.
+// Live concat of the RPC shard into the draft graph aborts the scheduler.
+static ggml_tensor * dflash_ensure_local_output(
+        const llama_model * draft,
+        ggml_tensor * src,
+        ggml_tensor * src_s,
+        ggml_tensor ** out_s) {
+    if (out_s) {
+        *out_s = src_s;
+    }
+    if (src == nullptr || src->buffer == nullptr || !ggml_backend_buffer_is_meta(src->buffer)) {
+        return nullptr;
+    }
+    const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(src->buffer);
+    ggml_tensor * s0 = dflash_meta_shard(src, 0);
+    if (n_bufs <= 1) {
+        fprintf(stderr, "[DFLASH_LM] skip copy: n_bufs=%zu\n", n_bufs);
+        return nullptr;
+    }
+    ggml_backend_buffer_type_t buft = nullptr;
+    if (s0 && s0 != src && s0->buffer) {
+        buft = ggml_backend_buffer_get_type(s0->buffer);
+    } else {
+        // rank-0 simple tensor not in the map yet; use the first simple buffer's type
+        ggml_backend_buffer_t sb = ggml_backend_meta_buffer_simple_buffer(src->buffer, 0);
+        buft = sb ? ggml_backend_buffer_get_type(sb) : nullptr;
+    }
+
+    std::lock_guard<std::mutex> lock(g_lm_head_mu);
+    auto & slot = g_lm_heads[draft];
+    if (!slot) {
+        slot = std::make_unique<dflash_local_lm_head>();
+    }
+    if (slot->output) {
+        if (out_s) {
+            *out_s = slot->output_s;
+        }
+        return slot->output;
+    }
+    if (slot->attempted) {
+        return nullptr;
+    }
+    slot->attempted = true;
+
+    if (buft == nullptr) {
+        fprintf(stderr, "[DFLASH_LM] no buffer type for local LM head copy\n");
+        return nullptr;
+    }
+
+    const ggml_init_params ip = {
+        /*.mem_size   =*/ ggml_tensor_overhead() * 8 + 1024,
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    slot->ctx.reset(ggml_init(ip));
+    if (!slot->ctx) {
+        LLAMA_LOG_ERROR("%s: ggml_init failed for local LM head\n", __func__);
+        return nullptr;
+    }
+
+    slot->output = dflash_copy_weight_local(*slot, src);
+    if (src_s) {
+        slot->output_s = dflash_copy_weight_local(*slot, src_s);
+    }
+    slot->buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(slot->ctx.get(), buft));
+    if (!slot->buf || slot->output == nullptr || slot->output->data == nullptr) {
+        LLAMA_LOG_ERROR("%s: failed to allocate local LM head (%.2f MiB)\n",
+                __func__, ggml_nbytes(src) / (1024.0 * 1024.0));
+        slot->output = nullptr;
+        slot->output_s = nullptr;
+        slot->buf.reset();
+        slot->ctx.reset();
+        return nullptr;
+    }
+    ggml_backend_buffer_set_usage(slot->buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+    {
+        const size_t nbytes = ggml_nbytes(src);
+        std::vector<uint8_t> host(nbytes);
+        ggml_backend_tensor_get(src, host.data(), 0, nbytes);
+        ggml_backend_tensor_set(slot->output, host.data(), 0, nbytes);
+    }
+    if (src_s && slot->output_s && slot->output_s->data) {
+        const size_t nbytes = ggml_nbytes(src_s);
+        std::vector<uint8_t> host(nbytes);
+        ggml_backend_tensor_get(src_s, host.data(), 0, nbytes);
+        ggml_backend_tensor_set(slot->output_s, host.data(), 0, nbytes);
+    }
+
+    fprintf(stderr, "[DFLASH_LM] copied target output.weight to local %s (ne=[%ld, %ld], %.2f MiB)\n",
+            ggml_backend_buft_name(buft),
+            (long) src->ne[0], (long) src->ne[1], ggml_nbytes(src) / (1024.0 * 1024.0));
+
+    if (out_s) {
+        *out_s = slot->output_s;
+    }
+    return slot->output;
+}
+
+static ggml_tensor * dflash_target_lm_head(
+        llm_graph_context & g,
+        const llama_model & draft,
+        ggml_tensor * output,
+        ggml_tensor * output_s,
+        ggml_tensor * cur) {
+    ggml_tensor * local_s = output_s;
+    ggml_tensor * local = dflash_ensure_local_output(&draft, output, output_s, &local_s);
+    if (local) {
+        return g.build_lora_mm(local, cur, local_s);
+    }
+    if (output && output->buffer && ggml_backend_buffer_is_meta(output->buffer)) {
+        output   = dflash_meta_shard(output, 0);
+        output_s = dflash_meta_shard(output_s, 0);
+    }
+    return g.build_lora_mm(output, cur, output_s);
+}
 
 void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
 
@@ -669,7 +827,7 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
         const auto * model_other = llama_get_model(cparams.ctx_other);
 
         GGML_ASSERT(model_other->tok_embd != nullptr && "DFlash decoder requires the target model's token embeddings");
-        tok_embd = model_other->tok_embd;
+        tok_embd = dflash_meta_shard(model_other->tok_embd, 0);
     }
 
     auto inp = std::make_unique<llm_graph_input_embd>(n_embd);
@@ -773,7 +931,7 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
         output_s = model_other->output_s;
     }
 
-    cur = build_lora_mm(output, cur, output_s);
+    cur = dflash_target_lm_head(*this, model, output, output_s, cur);
 
     // DFlash2 feeds these logits to the selector, so they need the target's output
     // transforms; DFlash1 and DSpark read them through the sampler instead
@@ -876,7 +1034,7 @@ llama_model_dflash::graph_dsv4::graph_dsv4(const llama_model & model, const llm_
         const auto * model_other = llama_get_model(cparams.ctx_other);
 
         GGML_ASSERT(model_other->tok_embd != nullptr && "DSpark decoder requires the target model's token embeddings");
-        tok_embd = model_other->tok_embd;
+        tok_embd = dflash_meta_shard(model_other->tok_embd, 0);
     }
 
     auto inp = std::make_unique<llm_graph_input_embd>(n_embd);
@@ -976,7 +1134,7 @@ llama_model_dflash::graph_dsv4::graph_dsv4(const llama_model & model, const llm_
         output_s = model_other->output_s;
     }
 
-    cur = build_lora_mm(output, cur, output_s);
+    cur = dflash_target_lm_head(*this, model, output, output_s, cur);
     cb(cur, "result_output", -1);
     res->t_logits = cur;
 
