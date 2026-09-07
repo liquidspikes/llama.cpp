@@ -360,6 +360,24 @@ void ggml_backend_tensor_set_2d(struct ggml_tensor * tensor, const void * data, 
     GGML_ASSERT(buf != NULL && "tensor buffer not set");
 
     if (n_copies <= 1 || buf->iface.set_tensor_2d == NULL) {
+        if (n_copies > 1 && stride_tensor == size) {
+            const size_t batch_rows = std::max((size_t)1, (size_t)(16 * 1024 * 1024) / size);
+            std::vector<uint8_t> packed;
+            for (size_t r = 0; r < n_copies; r += batch_rows) {
+                const size_t cur_rows = std::min(batch_rows, n_copies - r);
+                const size_t cur_batch_bytes = cur_rows * size;
+                if (packed.size() < cur_batch_bytes) {
+                    packed.resize(cur_batch_bytes);
+                }
+                for (size_t i = 0; i < cur_rows; ++i) {
+                    memcpy(packed.data() + i * size,
+                           (const char *) data + (r + i) * stride_data,
+                           size);
+                }
+                ggml_backend_tensor_set(tensor, packed.data(), offset + r * size, cur_batch_bytes);
+            }
+            return;
+        }
         for (size_t i = 0; i < n_copies; i++) {
             ggml_backend_tensor_set(tensor, (const char *) data + i*stride_data, offset + i*stride_tensor, size);
         }
@@ -382,6 +400,24 @@ void ggml_backend_tensor_get_2d(const struct ggml_tensor * tensor, void * data, 
     GGML_ASSERT(buf != NULL && "tensor buffer not set");
 
     if (n_copies <= 1 || buf->iface.get_tensor_2d == NULL) {
+        if (n_copies > 1 && stride_tensor == size) {
+            const size_t batch_rows = std::max((size_t)1, (size_t)(16 * 1024 * 1024) / size);
+            std::vector<uint8_t> packed;
+            for (size_t r = 0; r < n_copies; r += batch_rows) {
+                const size_t cur_rows = std::min(batch_rows, n_copies - r);
+                const size_t cur_batch_bytes = cur_rows * size;
+                if (packed.size() < cur_batch_bytes) {
+                    packed.resize(cur_batch_bytes);
+                }
+                ggml_backend_tensor_get(tensor, packed.data(), offset + r * size, cur_batch_bytes);
+                for (size_t i = 0; i < cur_rows; ++i) {
+                    memcpy((char *) data + (r + i) * stride_data,
+                           packed.data() + i * size,
+                           size);
+                }
+            }
+            return;
+        }
         for (size_t i = 0; i < n_copies; i++) {
             ggml_backend_tensor_get(tensor, (char *) data + i*stride_data, offset + i*stride_tensor, size);
         }
@@ -896,8 +932,20 @@ static int ggml_backend_sched_backend_from_buffer(ggml_backend_sched_t sched, co
     // find highest prio backend that supports the buffer type and the op
     for (int i = 0; i < sched->n_backends; i++) {
         if (ggml_backend_supports_buft(sched->backends[i], buffer->buft) &&
-            ggml_backend_supports_op(sched->backends[i], op)) {
+            (op->op == GGML_OP_NONE || ggml_backend_supports_op(sched->backends[i], op))) {
             return i;
+        }
+    }
+
+    if (ggml_backend_buffer_is_meta(buffer)) {
+        for (int i = 0; i < sched->n_backends; i++) {
+            for (size_t b = 0; b < ggml_backend_meta_buffer_n_bufs(buffer); b++) {
+                ggml_backend_buffer_t sub = ggml_backend_meta_buffer_simple_buffer(buffer, b);
+                if (sub && ggml_backend_supports_buft(sched->backends[i], sub->buft) &&
+                    (op->op == GGML_OP_NONE || ggml_backend_supports_op(sched->backends[i], op))) {
+                    return i;
+                }
+            }
         }
     }
 

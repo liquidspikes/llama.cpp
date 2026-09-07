@@ -62,11 +62,18 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         throw std::runtime_error("failed to load model");
     }
 
-    llama_context * ctx = llama_init_from_model(model, *cparams);
+    llama_context * ctx = nullptr;
+    try {
+        ctx = llama_init_from_model(model, *cparams);
+    } catch (const std::exception & e) {
+        ctx = nullptr;
+    } catch (...) {
+        ctx = nullptr;
+    }
     if (ctx == nullptr) {
         llama_model_free(model);
         llama_log_set(ud.original_logger.callback, ud.original_logger.user_data);
-        throw std::runtime_error("failed to create llama_context from model");
+        return {};
     }
 
     const size_t nd = llama_model_n_devices(model);
@@ -224,6 +231,13 @@ static void common_params_fit_impl(
             } catch (const std::runtime_error & e) {
                 // the extra model is optional, fit the main model alone rather than giving up
                 LOG_WRN("%s: failed to measure the memory of the extra model, fitting without it: %s\n", __func__, e.what());
+                dmds_extra = dmds_t(devs.size() + 1);
+                n_ctx_extra = cparams->n_ctx;
+                return;
+            }
+
+            if (measured.empty()) {
+                LOG_WRN("%s: measured memory for extra model is empty, fitting without it\n", __func__);
                 dmds_extra = dmds_t(devs.size() + 1);
                 n_ctx_extra = cparams->n_ctx;
                 return;

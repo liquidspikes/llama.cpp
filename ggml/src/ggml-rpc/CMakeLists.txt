@@ -56,3 +56,8 @@ if (GGML_TBSTRIPE)
     endif()
 endif()
 
+# IMP-24: vector AllReduce add. gfx1151 / Zen 5 has AVX-512F + F16C, not AVX-512-FP16.
+if (NOT MSVC AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
+    target_compile_options(ggml-rpc PRIVATE -mavx512f -mavx512vl -mf16c)
+endif()
+

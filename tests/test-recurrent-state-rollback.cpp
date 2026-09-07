@@ -207,6 +207,77 @@ static bool test_multi_seq_split_replay(const common_params & params, llama_mode
     return true;
 }
 
+// Slot release on the server now llama_memory_clear()s target+draft between HTTP
+// requests. A polluted recurrent context must match a fresh one after clear+re-prefill.
+static bool test_memory_clear_matches_fresh(const common_params & params, llama_model * model, const int n_vocab) {
+    llama_context * ctx_dirty = make_ctx(params, model);
+    llama_context * ctx_fresh = make_ctx(params, model);
+    if (ctx_dirty == nullptr || ctx_fresh == nullptr) {
+        fprintf(stderr, "%s : failed to init contexts\n", __func__);
+        return false;
+    }
+
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+    std::vector<llama_token> prompt;
+    if (llama_vocab_type(vocab) == LLAMA_VOCAB_TYPE_NONE) {
+        prompt = { 1, 2, 3, 4, 5, 6, 7, 8 };
+    } else {
+        prompt = common_tokenize(ctx_fresh, "The quick brown fox", true);
+    }
+    if (prompt.size() < 4) {
+        prompt = { 1, 2, 3, 4 };
+    }
+
+    std::vector<llama_token> polluted = prompt;
+    for (int i = 0; i < 16; ++i) {
+        polluted.push_back(prompt[(size_t) i % prompt.size()]);
+    }
+
+    bool ok = decode_tokens(ctx_dirty, polluted, (uint32_t) polluted.size());
+    if (!ok) {
+        fprintf(stderr, "%s : pollute decode failed\n", __func__);
+        llama_free(ctx_dirty);
+        llama_free(ctx_fresh);
+        return false;
+    }
+
+    llama_memory_clear(llama_get_memory(ctx_dirty), true);
+
+    ok = decode_tokens(ctx_dirty, prompt, (uint32_t) prompt.size()) &&
+         decode_tokens(ctx_fresh, prompt, (uint32_t) prompt.size());
+    if (!ok) {
+        fprintf(stderr, "%s : re-prefill after memory_clear failed\n", __func__);
+        llama_free(ctx_dirty);
+        llama_free(ctx_fresh);
+        return false;
+    }
+
+    const float * logits_dirty = llama_get_logits(ctx_dirty);
+    const float * logits_fresh = llama_get_logits(ctx_fresh);
+    if (logits_dirty == nullptr || logits_fresh == nullptr) {
+        fprintf(stderr, "%s : missing logits\n", __func__);
+        llama_free(ctx_dirty);
+        llama_free(ctx_fresh);
+        return false;
+    }
+
+    constexpr float eps = 1e-4f;
+    for (int token = 0; token < n_vocab; ++token) {
+        if (std::fabs(logits_dirty[token] - logits_fresh[token]) > eps) {
+            fprintf(stderr, "%s : logits mismatch token %d (%g != %g)\n",
+                    __func__, token, (double) logits_dirty[token], (double) logits_fresh[token]);
+            llama_free(ctx_dirty);
+            llama_free(ctx_fresh);
+            return false;
+        }
+    }
+
+    fprintf(stderr, "%s : llama_memory_clear restored logits to a fresh context\n", __func__);
+    llama_free(ctx_dirty);
+    llama_free(ctx_fresh);
+    return true;
+}
+
 int main(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
 
@@ -394,6 +465,10 @@ int main(int argc, char ** argv) {
     llama_free(ctx_dirty);
 
     if (!test_multi_seq_split_replay(params, model, n_vocab)) {
+        return 1;
+    }
+
+    if (!test_memory_clear_matches_fresh(params, model, n_vocab)) {
         return 1;
     }
 
