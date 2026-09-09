@@ -991,18 +991,15 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
     const int64_t key_dim_gdn = head_k_dim * num_k_heads;
     const int64_t head_ratio_gdn = num_v_heads / num_k_heads;
     const int64_t value_dim_gdn = head_v_dim * num_v_heads;
-    if (head_ratio_gdn > 1 && final_output->ne[0] == value_dim_gdn) {
-        if (getenv("LLAMA_TP_SSM_OUT_SEQUENTIAL") != nullptr) {
-            // Sequential inner-K: [3072, 2, T] halves of mirrored 6144.
-            final_output = ggml_reshape_4d(ctx0, final_output, value_dim_gdn / 2, 2,
-                    n_seq_tokens, n_seqs);
-            cb(final_output, "final_output_khalf", il);
-        } else {
-            // 3-rep V-order: [1024, 2, 3, T] = [d0g0,d1g0, d0g1,d1g1, d0g2,d1g2].
-            final_output = ggml_reshape_4d(ctx0, final_output, 1024, 2, head_ratio_gdn,
-                    n_seq_tokens * n_seqs);
-            cb(final_output, "final_output_3rep", il);
-        }
+    // Sequential inner-K is sliced in Meta ([INNERK]). N-split ssm_out uses the
+    // native 6144 GDN layout with a full-K GEMM ([INNERN]); do not 3-rep pack x.
+    if (head_ratio_gdn > 1 && final_output->ne[0] == value_dim_gdn &&
+            getenv("LLAMA_TP_SSM_OUT_SEQUENTIAL") == nullptr &&
+            getenv("LLAMA_TP_SSM_OUT_NSPLIT") == nullptr) {
+        // 3-rep V-order: [1024, 2, 3, T] = [d0g0,d1g0, d0g1,d1g1, d0g2,d1g2].
+        final_output = ggml_reshape_4d(ctx0, final_output, 1024, 2, head_ratio_gdn,
+                n_seq_tokens * n_seqs);
+        cb(final_output, "final_output_3rep", il);
         final_output = ggml_cont(ctx0, final_output);
         final_output = ggml_reshape_3d(ctx0, final_output, value_dim_gdn, n_seq_tokens, n_seqs);
         cb(final_output, "final_output", il);

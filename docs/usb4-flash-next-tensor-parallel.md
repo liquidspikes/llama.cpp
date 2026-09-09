@@ -263,9 +263,34 @@ View log for sequential halves (`tp-khalf.log`):
 
 Both GPUs remain ~4% busy, GTT ~40.6 GiB, `n_subgraphs=97`, ~0.95 tok/s.
 
+### INNERK in Meta + hipBLAS (pid 210450)
+
+`LLAMA_TP_SSM_OUT_SEQUENTIAL=1` now slices `x` in Meta `create_node` (`[INNERK] linear_attn_out j=0 k0=0 wK=3072 / j=1 k0=3072 xnb1=24576`) instead of a graph `khalf` reshape. Same English loop as graph khalf.
+
+`LLAMA_TP_HIPBLAS_Q=1` on that same pid (mmq skipped for Q4_K/Q6_K): **identical** English loop, empty content, **0.972 tok/s**, both `gpu_busy_percent=4`, GTT ~40.6 GiB, `n_subgraphs=97` (`bench-tp-hipblas.json`). Inner-K AllReduce vs full GEMM is **not** an mmq N-order issue.
+
+### N-split `ssm_out` (AXIS_1, full K) — tried, not 323
+
+`LLAMA_TP_SSM_OUT_NSPLIT=1` splits `ssm_out` on **N** (`ne[1]=2560` → 1280/1280) so each device does a **full-K=6144** GEMM. Meta marks the MUL_MAT PARTIAL (full 2560), `[INNERN]` writes a `innern_gemm` view at `n0=0/1280`, memsets the other half to 0, AllReduce-sum concatenates. Launch with `MIRROR_GDN` + `SPLIT_SSM_OUT`; do **not** set `SEQUENTIAL`. Logs (`tp-innern3.log`):
+
+```
+[INNERN] linear_attn_out-0 j=0 n0=0 wN=1280 dstN=2560 wK=6144 xK=6144
+[INNERN] linear_attn_out-0 j=1 n0=1280 wN=1280 dstN=2560 wK=6144 xK=6144
+[META_GC] sub=0 n=78 last=innern_gemm   # was n=77 last=linear_attn_out without the extra GEMM
+```
+
+| Launch | `reasoning_content` | tok/s | 323 |
+|---|---|---|---|
+| INNERN + SCALE 0 with `src[2]=gemm` (pid 213662) | `"assistant"` then stop, 3 tokens | 0.941 | no |
+| INNERN + `NONE` + memset (pid **215081**) | CJK/latin garbage (`prop “ magn快MF…`) | **1.383** | no |
+
+Both GPUs `gpu_busy_percent=6`, GTT ~40.6 GiB, `n_subgraphs=97`. N-split concat is **worse** than inner-K English loop. Do not treat it as the quality path. First launch was a graph-order bug (SCALE after GEMM); the memset launch is a real numeric miss (packing, strided dst, or AR of the padded 2560).
+
+Do not stash the GEMM as `SCALE.src[2]` — the worker can zero the slice. Do not `g_innern_gemm.clear()` on ping-pong rebuild — that dropped the extra node (`n=77`).
+
 ### Remaining
 
-1. Make split `ssm_out` inner-K numerically match mirrored `ssm_out` (content 323). Suspect: AllReduce of `linear_attn_out` vs full local GEMM, not the K-slice of `x`.
+1. Split `ssm_out` still does not match mirrored `ssm_out` (content 323). Inner-K GEMM+AR failed even with K-matched `x` and hipBLAS. N-split full-K concat also failed (garbage, not English).
 2. AllGather split GDN so `MIRROR_GDN` can go away; keep 3-rep W with 3-rep `x`.
 3. uid-keyed `GRAPH_RECOMPUTE` ring after 323, then remeasure vs 19.816.
 
