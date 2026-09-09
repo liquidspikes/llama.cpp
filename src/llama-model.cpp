@@ -471,6 +471,51 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     };
 
     auto get_tensor_config = [&]() -> tensor_config {
+        // Control: replicate every QWEN4EXP tensor. 2-device NMSE must be ~0
+        // if HIP+CPU meta / allreduce_fallback is a valid test harness.
+        static const bool mirror_all_env = getenv("LLAMA_TP_MIRROR_ALL") != nullptr;
+        static const bool mirror_gdn_env = getenv("LLAMA_TP_MIRROR_GDN") != nullptr;
+        static const bool mirror_dense_env = getenv("LLAMA_TP_MIRROR_DENSE") != nullptr;
+        if (mirror_all_env && ud->model->arch == LLM_ARCH_QWEN4EXP) {
+            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+        }
+        auto qwen4exp_mirror = [&]() -> tensor_config {
+            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+        };
+        if (ud->model->arch == LLM_ARCH_QWEN4EXP && (mirror_gdn_env || mirror_dense_env)) {
+            const bool gdn_tensor =
+                std::regex_match(tensor_name, pattern_qkv_weight) ||
+                std::regex_match(tensor_name, pattern_qkv_bias) ||
+                std::regex_match(tensor_name, pattern_attn_gate_weight) ||
+                std::regex_match(tensor_name, pattern_ssm_dt) ||
+                std::regex_match(tensor_name, pattern_ssm_a) ||
+                std::regex_match(tensor_name, pattern_ssm_alpha) ||
+                std::regex_match(tensor_name, pattern_ssm_beta) ||
+                std::regex_match(tensor_name, pattern_ssm_beta_alpha) ||
+                std::regex_match(tensor_name, pattern_r_cache) ||
+                std::regex_match(tensor_name, pattern_s_cache) ||
+                std::regex_match(tensor_name, pattern_ssm_conv1d) ||
+                std::regex_match(tensor_name, pattern_ssm_out_weight);
+            const bool dense_tensor =
+                std::regex_match(tensor_name, pattern_q_weight) ||
+                std::regex_match(tensor_name, pattern_kv_weight) ||
+                std::regex_match(tensor_name, pattern_q_bias) ||
+                std::regex_match(tensor_name, pattern_kv_bias) ||
+                std::regex_match(tensor_name, pattern_qk_norm) ||
+                std::regex_match(tensor_name, pattern_kv_cache) ||
+                std::regex_match(tensor_name, pattern_attn_sinks) ||
+                std::regex_match(tensor_name, pattern_attn_out_weight) ||
+                std::regex_match(tensor_name, pattern_attn_out_bias);
+            if ((mirror_gdn_env && gdn_tensor) || (mirror_dense_env && dense_tensor)) {
+                static const bool split_ssm_out = getenv("LLAMA_TP_SPLIT_SSM_OUT") != nullptr;
+                if (mirror_gdn_env && split_ssm_out &&
+                        std::regex_match(tensor_name, pattern_ssm_out_weight)) {
+                    // keep default ssm_out split (inner-K) while the rest of GDN is mirrored
+                } else {
+                    return qwen4exp_mirror();
+                }
+            }
+        }
         if (is_dsv4) {
             if (std::regex_match(tensor_name, pattern_kv_cache) ||
                     std::regex_match(tensor_name, pattern_dsv4_state)) {
@@ -558,6 +603,24 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         }
 
         // FFN
+        // QWEN4EXP hidden-dim expert TP is the leading quality suspect (tiny
+        // 2-device NMSE 0.48; historical qwen3moe rpc-tensor emitted "G").
+        // LLAMA_TP_MIRROR_EXPS=1 keeps attn/GDN split and replicates experts.
+        static const bool mirror_exps_env = getenv("LLAMA_TP_MIRROR_EXPS") != nullptr;
+        if (mirror_exps_env && ud->model->arch == LLM_ARCH_QWEN4EXP && (
+                std::regex_match(tensor_name, pattern_ffn_up_weight) ||
+                std::regex_match(tensor_name, pattern_ffn_up_bias) ||
+                std::regex_match(tensor_name, pattern_ffn_gate_weight) ||
+                std::regex_match(tensor_name, pattern_ffn_gate_bias) ||
+                std::regex_match(tensor_name, pattern_ffn_gate_up_weight) ||
+                std::regex_match(tensor_name, pattern_ffn_down_weight) ||
+                std::regex_match(tensor_name, pattern_ffn_down_bias) ||
+                std::regex_match(tensor_name, pattern_ffn_down_exps_bias) ||
+                std::regex_match(tensor_name, pattern_ffn_up_shexp_weight) ||
+                std::regex_match(tensor_name, pattern_ffn_gate_shexp_weight) ||
+                std::regex_match(tensor_name, pattern_ffn_down_shexp_weight))) {
+            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+        }
         if (std::regex_match(tensor_name, pattern_ffn_up_weight) || std::regex_match(tensor_name, pattern_ffn_gate_weight)) {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "ffn_down.weight", "ffn_down_exps.weight");
         }
@@ -593,6 +656,15 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
 
         // everything else
         return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+    };
+
+    auto log_split = [&](const tensor_config & tc) {
+        static const bool log_splits = getenv("LLAMA_TP_LOG_SPLITS") != nullptr;
+        if (log_splits && ud->model->arch == LLM_ARCH_QWEN4EXP &&
+                tc.axis != GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+            fprintf(stderr, "[QWEN4EXP_SPLIT] %s axis=%d\n", tensor_name.c_str(), (int) tc.axis);
+        }
+        return tc;
     };
 
     auto get_split_segments = [&](int axis, uint32_t il) -> std::vector<std::pair<int64_t, uint32_t>> {
@@ -786,7 +858,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
 
     ggml_backend_meta_split_state split_state;
     memset(&split_state, 0, sizeof(split_state));
-    tensor_config tc = get_tensor_config();
+    tensor_config tc = log_split(get_tensor_config());
     split_state.axis = tc.axis;
     if (split_state.axis >= 0 && split_state.axis < GGML_MAX_DIMS) {
         const int64_t blck_size = ggml_blck_size(tc.tensor_axis_0->type);

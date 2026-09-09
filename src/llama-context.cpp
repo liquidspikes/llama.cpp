@@ -232,6 +232,10 @@ llama_context::llama_context(
     cparams.fused_gdn_ar = true;
     cparams.fused_gdn_ch = true;
     cparams.auto_fgdn    = false;
+    if (getenv("LLAMA_TP_NO_FUSED_GDN")) {
+        cparams.fused_gdn_ar = false;
+        cparams.fused_gdn_ch = false;
+    }
 
     cparams.fused_lid = true;
     cparams.auto_flid = false;

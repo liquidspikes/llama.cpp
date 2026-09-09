@@ -21,6 +21,7 @@
 #include <filesystem>
 #include <algorithm>
 #include <atomic>
+#include <cstdlib>
 #include <thread>
 #if defined(__x86_64__) || defined(_M_X64)
 #  include <immintrin.h>
@@ -153,7 +154,38 @@ enum rpc_cmd {
 };
 
 // Try RPC_CMD_SET_TENSOR_HASH first for all tensors
-const size_t HASH_THRESHOLD = 0;
+// Skip SET_TENSOR_HASH for USB4STREAM bulk load. Hash-then-body on the same
+// tbstripe pipe desynchronized 4KiB frames (magic mismatch / cmd=7 abort)
+// when meta TP shards ~2MiB SET_TENSOR payloads. Cache still helps after a
+// successful first fill if HASH_THRESHOLD is left 0 via env.
+static size_t rpc_hash_threshold() {
+    static size_t thr = []() {
+        const char * e = std::getenv("GGML_RPC_HASH_THRESHOLD");
+        if (e && *e) {
+            return (size_t) std::strtoull(e, nullptr, 10);
+        }
+        return (size_t) (64ull * 1024ull * 1024ull);
+    }();
+    return thr;
+}
+
+// USB4STREAM drops frames in large tbs_send. Combined SET_TENSOR must
+// fit in one 4064-byte payload (rpc_tensor+hdr ~321 bytes). Default
+// 2048. 4096 is two frames and deadlocks after ~11k tensors. Override
+// with GGML_RPC_SET_TENSOR_CHUNK (min 256).
+static size_t rpc_set_tensor_chunk() {
+    static size_t chunk = []() {
+        const char * e = std::getenv("GGML_RPC_SET_TENSOR_CHUNK");
+        if (e && *e) {
+            size_t v = (size_t) std::strtoull(e, nullptr, 10);
+            if (v >= 256) {
+                return v;
+            }
+        }
+        return (size_t) 2048;
+    }();
+    return chunk;
+}
 
 static inline bool rpc_perf_enabled() {
     static int e = -1;
@@ -357,6 +389,17 @@ static inline uint32_t rpc_cmd_to_channel(enum rpc_cmd cmd) {
 
 static bool send_msg(socket_ptr sock, const void * msg, size_t msg_size, uint32_t channel = RPC_CHANNEL_CONTROL) {
     uint64_t sz = msg_size;
+    if (sock->is_tbstripe()) {
+        std::vector<uint8_t> buf(sizeof(sz) + msg_size);
+        memcpy(buf.data(), &sz, sizeof(sz));
+        if (msg && msg_size > 0) {
+            memcpy(buf.data() + sizeof(sz), msg, msg_size);
+        }
+        if (!sock->send_data(buf.data(), buf.size())) {
+            return false;
+        }
+        return sock->flush();
+    }
     if (!sock->send_data_channel(RPC_CHANNEL_CONTROL, &sz, sizeof(sz))) {
         return false;
     }
@@ -420,6 +463,19 @@ static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, 
     if (tb_debug_enabled()) fprintf(stderr, "[RPC_CMD send cmd=%d in_sz=%zu]\n", (int)cmd, input_size);
     uint32_t channel = rpc_cmd_to_channel(cmd);
     uint8_t opcode = static_cast<uint8_t>(cmd);
+    if (sock->is_tbstripe()) {
+        uint64_t sz = input_size;
+        std::vector<uint8_t> buf(1 + sizeof(sz) + input_size);
+        buf[0] = opcode;
+        memcpy(buf.data() + 1, &sz, sizeof(sz));
+        if (input && input_size > 0) {
+            memcpy(buf.data() + 1 + sizeof(sz), input, input_size);
+        }
+        if (!sock->send_data(buf.data(), buf.size())) {
+            return false;
+        }
+        return sock->flush();
+    }
     if (!sock->send_data_channel(RPC_CHANNEL_CONTROL, &opcode, 1)) {
         return false;
     }
@@ -431,7 +487,8 @@ static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, 
 
 // RPC request : | rpc_cmd (1 byte) on CTRL | request_size (8 bytes) on CTRL | request_data on channel |
 // RPC response: | response_size (8 bytes) on CTRL | response_data on channel |
-static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, size_t input_size, void * output, size_t output_size) {
+static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, size_t input_size, void * output, size_t output_size,
+                         int timeout_ms = -2, int max_try = -1) {
     if (tb_debug_enabled()) fprintf(stderr, "[RPC_CMD send_with_rsp cmd=%d in_sz=%zu out_sz=%zu]\n", (int)cmd, input_size, output_size);
     if (!send_rpc_cmd(sock, cmd, input, input_size)) {
         GGML_LOG_ERROR("send_rpc_cmd: failed to send input for cmd=%d (size=%zu)\n", (int)cmd, input_size);
@@ -445,6 +502,43 @@ static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, 
         }
         if (tb_debug_enabled()) fprintf(stderr, "[RPC_CMD GET_TENSOR recv completed!]\n");
         return true;
+    }
+    if (sock->is_tbstripe()) {
+        std::vector<uint8_t> buf(sizeof(uint64_t) + output_size);
+        if (timeout_ms == -2) {
+            timeout_ms = (cmd == RPC_CMD_SET_TENSOR) ? 100 : -1;
+        }
+        if (max_try < 1) {
+            max_try = (cmd == RPC_CMD_SET_TENSOR) ? 64 : 1;
+        }
+        for (int attempt = 0; attempt < max_try; attempt++) {
+            if (attempt > 0) {
+                if (!send_rpc_cmd(sock, cmd, input, input_size)) {
+                    GGML_LOG_ERROR("send_rpc_cmd: retry send failed cmd=%d\n", (int)cmd);
+                    return false;
+                }
+            }
+            const bool ok = (timeout_ms < 0)
+                ? sock->recv_data(buf.data(), buf.size())
+                : sock->recv_data_timeout(buf.data(), buf.size(), timeout_ms);
+            if (!ok) {
+                continue;
+            }
+            uint64_t out_size = 0;
+            memcpy(&out_size, buf.data(), sizeof(out_size));
+            if (out_size != output_size) {
+                GGML_LOG_ERROR("send_rpc_cmd: out_size mismatch for cmd=%d (got %" PRIu64 ", expected %zu)\n",
+                               (int)cmd, out_size, output_size);
+                return false;
+            }
+            if (output_size > 0) {
+                memcpy(output, buf.data() + sizeof(out_size), output_size);
+            }
+            return true;
+        }
+        GGML_LOG_ERROR("send_rpc_cmd: tbstripe response timeout cmd=%d tries=%d\n",
+                       (int)cmd, max_try);
+        return false;
     }
     uint64_t out_size = 0;
     if (!sock->recv_data_channel(RPC_CHANNEL_CONTROL, &out_size, sizeof(out_size))) {
@@ -534,6 +628,8 @@ public:
 
     void send(enum rpc_cmd cmd, std::shared_ptr<const void> input, size_t input_size);
     void send(enum rpc_cmd cmd, std::shared_ptr<const void> input, size_t input_size, void * output, size_t output_size);
+    void send(enum rpc_cmd cmd, std::shared_ptr<const void> input, size_t input_size, void * output, size_t output_size,
+              int timeout_ms, int max_try);
     void send_async(enum rpc_cmd cmd, std::shared_ptr<const void> input, size_t input_size);
     void send_async(enum rpc_cmd cmd, std::shared_ptr<const void> input, size_t input_size, void * output, size_t output_size);
     // Send cmd+header, then tbs_xchg on the dispatcher thread (owns the pipe).
@@ -558,6 +654,8 @@ private:
         size_t                        input_size;
         void                        * output;
         size_t                        output_size;
+        int                           timeout_ms = -2;
+        int                           max_try    = -1;
         const void                  * xchg_out = nullptr;
         void                        * xchg_in  = nullptr;
         size_t                        xchg_n   = 0;
@@ -603,12 +701,19 @@ void rpc_dispatcher::send_async(enum rpc_cmd cmd, std::shared_ptr<const void> in
 }
 
 void rpc_dispatcher::send(enum rpc_cmd cmd, std::shared_ptr<const void> input, size_t input_size, void * output, size_t output_size) {
+    send(cmd, input, input_size, output, output_size, -2, -1);
+}
+
+void rpc_dispatcher::send(enum rpc_cmd cmd, std::shared_ptr<const void> input, size_t input_size, void * output, size_t output_size,
+                          int timeout_ms, int max_try) {
     auto msg = std::make_shared<rpc_msg>();
     msg->cmd = cmd;
     msg->input = input;
     msg->input_size = input_size;
     msg->output = output;
     msg->output_size = output_size;
+    msg->timeout_ms = timeout_ms;
+    msg->max_try = max_try;
     GGML_ASSERT(queue.push(msg));
     auto future = msg->completion.get_future();
     future.wait();
@@ -708,7 +813,8 @@ void rpc_dispatcher::work() {
                 status = sock->xchg(msg_ptr->xchg_out, msg_ptr->xchg_in, msg_ptr->xchg_n);
                 RPC_STATUS_ASSERT(status);
             } else if (msg_ptr->output) {
-                bool status = send_rpc_cmd(sock, msg_ptr->cmd, msg_ptr->input.get(), msg_ptr->input_size, msg_ptr->output, msg_ptr->output_size);
+                bool status = send_rpc_cmd(sock, msg_ptr->cmd, msg_ptr->input.get(), msg_ptr->input_size, msg_ptr->output, msg_ptr->output_size,
+                                           msg_ptr->timeout_ms, msg_ptr->max_try);
                 RPC_STATUS_ASSERT(status);
             } else {
                 bool status = send_rpc_cmd(sock, msg_ptr->cmd, msg_ptr->input.get(), msg_ptr->input_size);
@@ -859,7 +965,7 @@ static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggm
     int64_t t0 = rpc_perf_enabled() ? ggml_time_us() : 0;
     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
     rpc_tensor rpc_tensor = serialize_tensor(tensor);
-    if (size > HASH_THRESHOLD) {
+    if (size > rpc_hash_threshold()) {
         auto request = std::make_shared<rpc_msg_set_tensor_hash_req>();
         request->tensor = rpc_tensor;
         request->offset = offset;
@@ -878,7 +984,7 @@ static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggm
     const uint8_t * in_ptr = static_cast<const uint8_t *>(data);
     size_t transferred = 0;
     while (transferred < size) {
-        size_t chunk = std::min(size - transferred, (size_t)2097152);
+        size_t chunk = std::min(size - transferred, rpc_set_tensor_chunk());
         size_t cur_offset = offset + transferred;
         size_t input_size = sizeof(rpc_tensor) + sizeof(uint64_t) + chunk;
         uint8_t * input = new uint8_t[input_size]();
@@ -886,7 +992,8 @@ static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggm
         memcpy(input + sizeof(rpc_tensor), &cur_offset, sizeof(cur_offset));
         memcpy(input + sizeof(rpc_tensor) + sizeof(cur_offset), in_ptr + transferred, chunk);
         std::shared_ptr<uint8_t> input_chunk(input, std::default_delete<uint8_t[]>());
-        ctx->dispatcher->send(RPC_CMD_SET_TENSOR, input_chunk, input_size);
+        uint8_t ack = 0;
+        ctx->dispatcher->send(RPC_CMD_SET_TENSOR, input_chunk, input_size, &ack, sizeof(ack));
         transferred += chunk;
     }
     if (t0) {
@@ -1125,7 +1232,7 @@ static void ggml_backend_rpc_free(ggml_backend_t backend) {
 static void ggml_backend_rpc_set_tensor_async(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     ggml_backend_rpc_context * ctx = (ggml_backend_rpc_context *)backend->context;
     rpc_tensor rpc_tensor = serialize_tensor(tensor);
-    if (size > HASH_THRESHOLD) {
+    if (size > rpc_hash_threshold()) {
         auto request = std::make_shared<rpc_msg_set_tensor_hash_req>();
         request->tensor = rpc_tensor;
         request->offset = offset;
@@ -1138,13 +1245,21 @@ static void ggml_backend_rpc_set_tensor_async(ggml_backend_t backend, ggml_tenso
             return;
         }
     }
-    size_t input_size = sizeof(rpc_tensor) + sizeof(uint64_t) + size;
-    uint8_t * input = new uint8_t[input_size]();
-    memcpy(input, &rpc_tensor, sizeof(rpc_tensor));
-    memcpy(input + sizeof(rpc_tensor), &offset, sizeof(offset));
-    memcpy(input + sizeof(rpc_tensor) + sizeof(offset), data, size);
-    std::shared_ptr<uint8_t> input_ptr(input, std::default_delete<uint8_t[]>());
-    ctx->dispatcher->send(RPC_CMD_SET_TENSOR, input_ptr, input_size);
+    const uint8_t * in_ptr = static_cast<const uint8_t *>(data);
+    size_t transferred = 0;
+    while (transferred < size) {
+        size_t chunk = std::min(size - transferred, rpc_set_tensor_chunk());
+        size_t cur_offset = offset + transferred;
+        size_t input_size = sizeof(rpc_tensor) + sizeof(uint64_t) + chunk;
+        uint8_t * input = new uint8_t[input_size]();
+        memcpy(input, &rpc_tensor, sizeof(rpc_tensor));
+        memcpy(input + sizeof(rpc_tensor), &cur_offset, sizeof(cur_offset));
+        memcpy(input + sizeof(rpc_tensor) + sizeof(cur_offset), in_ptr + transferred, chunk);
+        std::shared_ptr<uint8_t> input_ptr(input, std::default_delete<uint8_t[]>());
+        uint8_t ack = 0;
+        ctx->dispatcher->send(RPC_CMD_SET_TENSOR, input_ptr, input_size, &ack, sizeof(ack));
+        transferred += chunk;
+    }
 }
 
 
@@ -1223,6 +1338,9 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
     GGML_ASSERT(cgraph->n_nodes > 0);
     // Wait for a 1-byte ACK so allreduce tbs_xchg cannot start while the
     // remote GPU is still inside GRAPH_COMPUTE on the same tbstripe pipe.
+    // USB4STREAM drops frames in a large tbs_send (SET_TENSOR already chunks
+    // to 2048). Prefix each GRAPH_COMPUTE RPC with | total (8) | offset (8) |
+    // data | so every command fits in one 4KiB frame.
     uint8_t ack = 0;
     bool reuse = cgraph->uid != 0 && rpc_dev_ctx->last_graph_uid == cgraph->uid;
     if (reuse) {
@@ -1233,8 +1351,45 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
         rpc_dev_ctx->last_graph_uid = cgraph->uid;
         size_t input_size = 0;
         uint8_t * input = serialize_graph(rpc_ctx->device, cgraph, rpc_ctx->dispatcher, &input_size);
-        std::shared_ptr<uint8_t> input_ptr(input, std::default_delete<uint8_t[]>());
-        rpc_ctx->dispatcher->send(RPC_CMD_GRAPH_COMPUTE, input_ptr, input_size, &ack, sizeof(ack));
+        const size_t chunk = rpc_set_tensor_chunk();
+        size_t transferred = 0;
+        size_t nchunk = 0;
+        while (transferred < input_size) {
+            const size_t n = std::min(input_size - transferred, chunk);
+            const bool last = transferred + n >= input_size;
+            const size_t msg_size = 2 * sizeof(uint64_t) + n;
+            uint8_t * msg = new uint8_t[msg_size]();
+            const uint64_t total = input_size;
+            const uint64_t offset = transferred;
+            memcpy(msg, &total, sizeof(total));
+            memcpy(msg + sizeof(total), &offset, sizeof(offset));
+            memcpy(msg + 2 * sizeof(uint64_t), input + transferred, n);
+            std::shared_ptr<uint8_t> msg_ptr(msg, std::default_delete<uint8_t[]>());
+            ack = 0;
+            // Intermediate chunks are SET_TENSOR-sized USB4 frames: 100ms ACK
+            // retry. The last chunk runs HIP graph_compute before ACK — wait.
+            const int timeout_ms = last ? -1 : 100;
+            const int max_try    = last ? 1  : 64;
+            rpc_ctx->dispatcher->send(RPC_CMD_GRAPH_COMPUTE, msg_ptr, msg_size, &ack, sizeof(ack),
+                                      timeout_ms, max_try);
+            if (ack != 1) {
+                delete[] input;
+                GGML_LOG_ERROR("rpc graph_compute: bad ack %u chunk off=%zu/%zu last=%d\n",
+                               (unsigned) ack, transferred, input_size, (int) last);
+                return GGML_STATUS_FAILED;
+            }
+            transferred += n;
+            nchunk++;
+            if (!last && (nchunk % 32u) == 0u) {
+                fprintf(stderr, "[rpc graph_compute] chunks %zu off=%zu/%zu\n",
+                        nchunk, transferred, input_size);
+            }
+        }
+        delete[] input;
+        if (t0) {
+            fprintf(stderr, "[RPC_PERF graph_compute] n_nodes=%d bytes=%zu chunks=%zu\n",
+                    cgraph->n_nodes, input_size, (input_size + chunk - 1) / chunk);
+        }
     }
     if (ack != 1) {
         GGML_LOG_ERROR("rpc graph_compute: bad ack %u reuse=%d\n", (unsigned) ack, (int) reuse);
@@ -1362,6 +1517,7 @@ public:
     bool get_tensor(const rpc_msg_get_tensor_req & request, std::vector<uint8_t> & response);
     bool copy_tensor(const rpc_msg_copy_tensor_req & request, rpc_msg_copy_tensor_rsp & response);
     bool graph_compute(const std::vector<uint8_t> & input);
+    bool graph_compute_chunk(const std::vector<uint8_t> & input);
     bool graph_recompute(const rpc_msg_graph_recompute_req & request);
     bool init_tensor(const rpc_msg_init_tensor_req & request);
     bool get_alloc_size(const rpc_msg_get_alloc_size_req & request, rpc_msg_get_alloc_size_rsp & response);
@@ -1386,6 +1542,11 @@ private:
     std::unordered_set<ggml_backend_buffer_t> buffers;
     // store the last computed graph for each backend
     std::vector<stored_graph> stored_graphs;
+    // USB4STREAM GRAPH_COMPUTE is split into SET_TENSOR-sized chunks so each
+    // tbs_send is one 4KiB frame. Accumulate here until total_size is filled.
+    std::vector<uint8_t> gc_pending;
+    uint64_t             gc_total  = 0;
+    uint64_t             gc_filled = 0;
 };
 
 void rpc_server::hello(rpc_msg_hello_rsp & response) {
@@ -1597,8 +1758,19 @@ ggml_tensor * rpc_server::deserialize_tensor(struct ggml_context * ctx, const rp
         uint64_t tensor_size = (uint64_t) ggml_nbytes(result);
         uint64_t buffer_start = (uint64_t) ggml_backend_buffer_get_base(result->buffer);
         uint64_t buffer_size = (uint64_t) ggml_backend_buffer_get_size(result->buffer);
-        GGML_ASSERT(tensor->data + tensor_size >= tensor->data); // check for overflow
-        GGML_ASSERT(tensor->data >= buffer_start && tensor->data + tensor_size <= buffer_start + buffer_size);
+        const bool overflow = tensor->data + tensor_size < tensor->data;
+        const bool oob = tensor->data < buffer_start ||
+                tensor->data + tensor_size > buffer_start + buffer_size;
+        if (overflow || oob) {
+            GGML_LOG_ERROR("[%s] tensor '%s' op=%s type=%d data=%#" PRIx64 " nbytes=%" PRIu64
+                           " buf=[%#" PRIx64 " + %" PRIu64 "] ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "]"
+                           " nb=[%zu,%zu,%zu,%zu]\n",
+                    __func__, tensor->name, ggml_op_name((enum ggml_op) tensor->op), (int) tensor->type,
+                    (uint64_t) tensor->data, tensor_size, buffer_start, buffer_size,
+                    tensor->ne[0], tensor->ne[1], tensor->ne[2], tensor->ne[3],
+                    (size_t) tensor->nb[0], (size_t) tensor->nb[1], (size_t) tensor->nb[2], (size_t) tensor->nb[3]);
+            return nullptr;
+        }
     }
 
     result->op = (ggml_op) tensor->op;
@@ -1885,11 +2057,30 @@ ggml_tensor * rpc_server::create_node(uint64_t id,
         if (result->buffer == nullptr && result->view_src->buffer != nullptr) {
             result->buffer = result->view_src->buffer;
         }
-        if (result->data == nullptr && result->view_src->data != nullptr) {
-            result->data = (char *) result->view_src->data + tensor->view_offs;
+        result->view_offs = tensor->view_offs;
+        // Only HC mix stream views: [n_embd, T] of [n_embd, hc, T] with
+        // parent nb[1] == n_embd*esz. Rebasing every VIEW also rewrote QSA
+        // [64,4] of [64,64,4] to nb[1]=parent.nb[2] and double-offset ROPE
+        // srcs; worker then HSA-faulted in rope_multi (tiny STREAM hang).
+        const ggml_tensor * p = result->view_src;
+        const size_t esz = ggml_type_size(result->type);
+        const bool hc_stream =
+            p->ne[1] > 1 && p->ne[1] <= 16 &&
+            result->ne[0] == p->ne[0] && result->ne[1] == p->ne[2] &&
+            result->nb[1] == p->nb[2] &&
+            p->nb[1] == (size_t) result->ne[0] * esz &&
+            p->nb[1] > 0 && result->view_offs % p->nb[1] == 0;
+        if (hc_stream && p->data != nullptr) {
+            result->data = (char *) p->data + result->view_offs;
+            result->nb[0] = p->nb[0];
+            result->nb[1] = p->nb[2];
+            result->nb[2] = result->nb[1] * (size_t) result->ne[1];
+            result->nb[3] = result->nb[2];
         }
     }
-    result->view_offs = tensor->view_offs;
+    if (tensor->view_src == 0) {
+        result->view_offs = tensor->view_offs;
+    }
     return result;
 }
 
@@ -1961,6 +2152,61 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
             graph->use_counts[hash_pos] = tensor_ptrs.at(id)->use_count;
         }
     }
+    {
+        static int ngraphs;
+        if (ngraphs < 30) {
+            ngraphs++;
+            int nadd = 0, nviewsrc = 0, nstrided = 0;
+            for (uint32_t i = 0; i < n_nodes; i++) {
+                ggml_tensor * node = graph->nodes[i];
+                if (!node || node->op != GGML_OP_ADD) {
+                    continue;
+                }
+                nadd++;
+                for (int s = 0; s < 2; s++) {
+                    ggml_tensor * src = node->src[s];
+                    if (!src) {
+                        continue;
+                    }
+                    if (src->op == GGML_OP_VIEW) {
+                        nviewsrc++;
+                    }
+                    const bool strided = src->nb[1] != (size_t) src->ne[0] * ggml_type_size(src->type)
+                            && src->ne[1] > 1;
+                    if ((strided || nadd <= 3) && nstrided < 8) {
+                        fprintf(stderr, "[RPC_ADD] g=%d i=%u src%d op=%s ne=[%lld,%lld,%lld] nb=[%zu,%zu,%zu] offs=%zu cont=%d\n",
+                                ngraphs, i, s, ggml_op_name(src->op),
+                                (long long) src->ne[0], (long long) src->ne[1], (long long) src->ne[2],
+                                src->nb[0], src->nb[1], src->nb[2],
+                                (size_t) src->view_offs, (int) ggml_is_contiguous(src));
+                    }
+                    nstrided += (int) strided;
+                }
+            }
+            fprintf(stderr, "[RPC_GC] n_nodes=%u n_tensors=%u nadd=%d nviewsrc=%d nstrided_add_src=%d\n",
+                    n_nodes, n_tensors, nadd, nviewsrc, nstrided);
+            int nrope = 0;
+            for (uint32_t i = 0; i < n_nodes && nrope < 4; i++) {
+                ggml_tensor * node = graph->nodes[i];
+                if (!node || node->op != GGML_OP_ROPE) {
+                    continue;
+                }
+                nrope++;
+                const ggml_tensor * s0 = node->src[0];
+                const ggml_tensor * s1 = node->src[1];
+                fprintf(stderr, "[RPC_ROPE] g=%d i=%u dst ne=[%lld,%lld,%lld] nb=[%zu,%zu] data=%p src0=%s ne=[%lld,%lld,%lld] nb=[%zu,%zu] data=%p src1=%s ne=[%lld,%lld] data=%p\n",
+                        ngraphs, i,
+                        (long long) node->ne[0], (long long) node->ne[1], (long long) node->ne[2],
+                        node->nb[0], node->nb[1], node->data,
+                        s0 ? ggml_op_name(s0->op) : "nil",
+                        s0 ? (long long) s0->ne[0] : -1, s0 ? (long long) s0->ne[1] : -1, s0 ? (long long) s0->ne[2] : -1,
+                        s0 ? s0->nb[0] : 0, s0 ? s0->nb[1] : 0, s0 ? s0->data : nullptr,
+                        s1 ? ggml_op_name(s1->op) : "nil",
+                        s1 ? (long long) s1->ne[0] : -1, s1 ? (long long) s1->ne[1] : -1,
+                        s1 ? s1->data : nullptr);
+            }
+        }
+    }
     if (tb_debug_enabled()) {
         for (uint32_t i = 0; i < n_nodes; i++) {
             ggml_tensor * node = graph->nodes[i];
@@ -1998,6 +2244,68 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
     }
     stored_graphs[device].graph = graph;
     return true;
+}
+
+bool rpc_server::graph_compute_chunk(const std::vector<uint8_t> & input) {
+    // | total_size (8) | offset (8) | data |
+    if (input.size() < 2 * sizeof(uint64_t)) {
+        return false;
+    }
+    uint64_t total = 0;
+    uint64_t offset = 0;
+    memcpy(&total, input.data(), sizeof(total));
+    memcpy(&offset, input.data() + sizeof(total), sizeof(offset));
+    const size_t n = input.size() - 2 * sizeof(uint64_t);
+    const uint8_t * data = input.data() + 2 * sizeof(uint64_t);
+
+    constexpr uint64_t GC_MAX = 64ull * 1024ull * 1024ull;
+    if (total == 0 || total > GC_MAX || n == 0) {
+        GGML_LOG_ERROR("[%s] invalid GRAPH_COMPUTE chunk total=%" PRIu64 " n=%zu\n",
+                       __func__, total, n);
+        gc_pending.clear();
+        gc_total = 0;
+        gc_filled = 0;
+        return false;
+    }
+    if (offset == 0) {
+        gc_pending.resize(total);
+        gc_total = total;
+        gc_filled = 0;
+    }
+    if (gc_total != total || offset + n > gc_total) {
+        GGML_LOG_ERROR("[%s] GRAPH_COMPUTE chunk mismatch expect_total=%" PRIu64
+                       " got_total=%" PRIu64 " offset=%" PRIu64 " filled=%" PRIu64 " n=%zu\n",
+                       __func__, gc_total, total, offset, gc_filled, n);
+        gc_pending.clear();
+        gc_total = 0;
+        gc_filled = 0;
+        return false;
+    }
+    // Retransmit of an already-applied chunk (USB4 ACK drop): rewrite in place.
+    if (offset + n <= gc_filled) {
+        memcpy(gc_pending.data() + offset, data, n);
+        if (gc_filled < gc_total) {
+            return true;
+        }
+    } else if (offset == gc_filled) {
+        memcpy(gc_pending.data() + offset, data, n);
+        gc_filled += n;
+        if (gc_filled < gc_total) {
+            return true;
+        }
+    } else {
+        GGML_LOG_ERROR("[%s] GRAPH_COMPUTE chunk gap offset=%" PRIu64 " filled=%" PRIu64 " n=%zu\n",
+                       __func__, offset, gc_filled, n);
+        gc_pending.clear();
+        gc_total = 0;
+        gc_filled = 0;
+        return false;
+    }
+    const bool ok = graph_compute(gc_pending);
+    gc_pending.clear();
+    gc_total = 0;
+    gc_filled = 0;
+    return ok;
 }
 
 bool rpc_server::graph_recompute(const rpc_msg_graph_recompute_req & request) {
@@ -2071,12 +2379,13 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                              socket_ptr sock) {
     rpc_server server(backends, cache_dir);
     uint8_t cmd;
-    if (!sock->recv_data(&cmd, 1)) {
+    uint32_t ch = RPC_CHANNEL_CONTROL;
+    if (!sock->recv_cmd(&cmd, &ch)) {
         return;
     }
     while (cmd != RPC_CMD_HELLO) {
-        GGML_LOG_WARN("Ignoring stale byte %d before HELLO handshake\n", (int)cmd);
-        if (!sock->recv_data(&cmd, 1)) {
+        GGML_LOG_WARN("Ignoring stale cmd %d before HELLO handshake\n", (int)cmd);
+        if (!sock->recv_cmd(&cmd, &ch)) {
             return;
         }
     }
@@ -2228,6 +2537,10 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                 if (!server.set_tensor(input)) {
                     return;
                 }
+                uint8_t ack = 1;
+                if (!send_msg(sock, &ack, sizeof(ack), cmd_channel)) {
+                    return;
+                }
                 break;
             }
             case RPC_CMD_SET_TENSOR_HASH: {
@@ -2301,7 +2614,7 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                 if (!recv_msg(sock, input, cmd_channel)) {
                     return;
                 }
-                const uint8_t ack = server.graph_compute(input) ? 1 : 0;
+                const uint8_t ack = server.graph_compute_chunk(input) ? 1 : 0;
                 if (!send_msg(sock, &ack, sizeof(ack), cmd_channel)) {
                     return;
                 }

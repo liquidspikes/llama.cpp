@@ -297,17 +297,24 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
     ggml_tensor * gated = ggml_mul(ctx0, xn, gate);
     gated = ggml_reshape_3d(ctx0, gated, n_embd, hc, nt);
 
-    // collapse the streams by their mean
-    ggml_tensor * mixed = ggml_view_2d(ctx0, gated, n_embd, nt,
-            ggml_row_size(gated->type, n_embd) * hc, 0);
-    mixed = ggml_cont(ctx0, mixed);
-    for (int64_t c = 1; c < hc; ++c) {
-        ggml_tensor * s = ggml_view_2d(ctx0, gated, n_embd, nt,
+    // Mean over hc with VIEW+ADD (no extra CONT/SUM_ROWS nodes). Extra
+    // materialize nodes inflate GRAPH_COMPUTE and either hang USB4 or make
+    // HIP sigmoid see a non-contiguous src. rpc-tensor still adds the
+    // parent [n_embd,hc,T] (NMSE ~1e2); do not claim 323 until that is fixed.
+    auto view_stream = [&](int64_t c) {
+        ggml_tensor * v = ggml_view_2d(ctx0, gated, n_embd, nt,
                 ggml_row_size(gated->type, n_embd) * hc,
                 ggml_row_size(gated->type, n_embd) * c);
-        mixed = ggml_add(ctx0, mixed, s);
+        ggml_format_name(v, "hc_v_%d_%d", (int) il, (int) c);
+        return v;
+    };
+    ggml_tensor * mixed = view_stream(0);
+    for (int64_t c = 1; c < hc; ++c) {
+        mixed = ggml_add(ctx0, mixed, view_stream(c));
+        ggml_format_name(mixed, "hc_add_%d_%d", (int) il, (int) c);
     }
     mixed = ggml_scale(ctx0, mixed, 1.0f / (float) hc);
+    ggml_set_output(mixed);
     cb(mixed, "hc_mixed", il);
 
     if (inject) {
@@ -379,6 +386,7 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
     ggml_tensor * res_hc = ggml_repeat_4d(ctx0,
             ggml_reshape_3d(ctx0, inpL, n_embd, 1, n_tokens),
             n_embd, hc, n_tokens, 1);
+    res_hc = ggml_cont(ctx0, res_hc);
     cb(res_hc, "hc_init", -1);
 
     for (int il = 0; il < n_layer; ++il) {
@@ -939,6 +947,13 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
             nb1_qkv * n_seq_tokens,
             ggml_row_size(conv_qkv_mix->type, 2 * head_k_dim * num_k_heads));
 
+    // TP shards pack Q/K/V as 5-rep slices of the 10240-wide conv row. The V
+    // view therefore has token stride 5120, not 24*128. HIP GDN at T>1 walks
+    // that stride; materialize so Q/K/V are compact [S, H_local, T] like L2(Q).
+    q_conv = ggml_cont(ctx0, q_conv);
+    k_conv = ggml_cont(ctx0, k_conv);
+    v_conv = ggml_cont(ctx0, v_conv);
+
     cb(q_conv, "q_conv", il);
     cb(k_conv, "k_conv", il);
     cb(v_conv, "v_conv", il);
@@ -969,6 +984,18 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
 
     ggml_tensor * final_output = ggml_reshape_3d(ctx0, attn_out_norm, head_v_dim * num_v_heads, n_seq_tokens, n_seqs);
     cb(final_output, "final_output", il);
+
+    // Sequential 6144 (mirrored GDN, or AllGather'd split GDN) → [key_dim, head_ratio]
+    // so Meta can 50/50-split each 2048 group into 3-rep V-order for ssm_out.
+    const int64_t key_dim_gdn = head_k_dim * num_k_heads;
+    const int64_t head_ratio_gdn = num_v_heads / num_k_heads;
+    if (head_ratio_gdn > 1 && final_output->ne[0] == key_dim_gdn * head_ratio_gdn) {
+        final_output = ggml_reshape_4d(ctx0, final_output, key_dim_gdn, head_ratio_gdn, n_seq_tokens, n_seqs);
+        cb(final_output, "final_output_3rep", il);
+        final_output = ggml_cont(ctx0, final_output);
+        final_output = ggml_reshape_3d(ctx0, final_output, head_v_dim * num_v_heads, n_seq_tokens, n_seqs);
+        cb(final_output, "final_output", il);
+    }
 
     cur = build_lora_mm(model.layers[il].ssm_out, final_output, model.layers[il].ssm_out_s);
     cb(cur, "linear_attn_out", il);

@@ -220,6 +220,22 @@ static void launch_gated_delta_net(
     }
 }
 
+static __global__ void pack_contiguous_f32(
+        const float * src, float * dst,
+        const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t ne3,
+        const size_t s0, const size_t s1, const size_t s2, const size_t s3) {
+    const int64_t i = (int64_t) blockDim.x * blockIdx.x + threadIdx.x;
+    const int64_t n = ne0 * ne1 * ne2 * ne3;
+    if (i >= n) {
+        return;
+    }
+    const int64_t i0 = i % ne0;
+    const int64_t i1 = (i / ne0) % ne1;
+    const int64_t i2 = (i / (ne0 * ne1)) % ne2;
+    const int64_t i3 =  i / (ne0 * ne1 * ne2);
+    dst[i] = src[i0*s0 + i1*s1 + i2*s2 + i3*s3];
+}
+
 static void ggml_cuda_op_gated_delta_net_impl(
         ggml_backend_cuda_context & ctx, ggml_tensor * dst, const ggml_cuda_gated_delta_net_fused_cache * cache) {
     ggml_tensor * src_q     = dst->src[0];
@@ -263,9 +279,30 @@ static void ggml_cuda_op_gated_delta_net_impl(
     GGML_ASSERT(ggml_is_contiguous_rows(src_v));
     GGML_ASSERT(ggml_are_same_stride(src_q, src_k));
     GGML_ASSERT(src_g->ne[0] == 1 || kda);
-    GGML_ASSERT(ggml_is_contiguous(src_g));
-    GGML_ASSERT(ggml_is_contiguous(src_beta));
     GGML_ASSERT(ggml_is_contiguous(src_state));
+
+    ggml_cuda_pool_alloc<float> g_pack(ctx.pool());
+    ggml_cuda_pool_alloc<float> b_pack(ctx.pool());
+    auto pack_f32 = [&](const ggml_tensor * t, ggml_cuda_pool_alloc<float> & pool, const float *& ptr) {
+        if (ggml_is_contiguous(t)) {
+            return;
+        }
+        const int64_t n = ggml_nelements(t);
+        pool.alloc((size_t) n);
+        const size_t ts = sizeof(float);
+        const int nbk = (int) ((n + 255) / 256);
+        const ggml_cuda_kernel_launch_params lp =
+            ggml_cuda_kernel_launch_params((dim3) nbk, 256, 0, ctx.stream());
+        ggml_cuda_kernel_launch(pack_contiguous_f32, lp,
+                (const float *) t->data, pool.get(),
+                t->ne[0], t->ne[1], t->ne[2], t->ne[3],
+                t->nb[0]/ts, t->nb[1]/ts, t->nb[2]/ts, t->nb[3]/ts);
+        ptr = pool.get();
+    };
+    const bool packed_g = !ggml_is_contiguous(src_g);
+    const bool packed_b = !ggml_is_contiguous(src_beta);
+    pack_f32(src_g, g_pack, g_d);
+    pack_f32(src_beta, b_pack, b_d);
 
     // strides in floats (beta strides used for both g and beta offset computation)
     const int64_t sq1 = nbq1 / sizeof(float);
@@ -274,9 +311,51 @@ static void ggml_cuda_op_gated_delta_net_impl(
     const int64_t sv1 = nbv1 / sizeof(float);
     const int64_t sv2 = nbv2 / sizeof(float);
     const int64_t sv3 = nbv3 / sizeof(float);
-    const int64_t sb1 = nbb1 / sizeof(float);
-    const int64_t sb2 = nbb2 / sizeof(float);
-    const int64_t sb3 = nbb3 / sizeof(float);
+    // pack_f32 writes C-contiguous data; original nbb is the strided source.
+    // Using nbb against the packed pointer garbles TP (split g/beta are views).
+    int64_t sb1, sb2, sb3;
+    if (packed_g || packed_b) {
+        sb1 = src_beta->ne[0];
+        sb2 = sb1 * src_beta->ne[1];
+        sb3 = sb2 * src_beta->ne[2];
+    } else {
+        sb1 = nbb1 / sizeof(float);
+        sb2 = nbb2 / sizeof(float);
+        sb3 = nbb3 / sizeof(float);
+    }
+    {
+        static int nlog;
+        static int nlog1;
+        const bool log = (nlog < 4) || (n_tokens == 1 && nlog1 < 3);
+        if (log) {
+            if (n_tokens == 1) {
+                nlog1++;
+            } else {
+                nlog++;
+            }
+            fprintf(stderr, "[GDN_HIP] H=%lld T=%lld q1=%lld packed_g=%d packed_b=%d sb=%lld,%lld,%lld gne=[%lld,%lld,%lld] gnb=[%zu,%zu,%zu] qnb=[%zu,%zu,%zu] vnb=[%zu,%zu,%zu] qcont=%d vcont=%d\n",
+                    (long long) H, (long long) n_tokens, (long long) neq1,
+                    (int) packed_g, (int) packed_b,
+                    (long long) sb1, (long long) sb2, (long long) sb3,
+                    (long long) src_g->ne[0], (long long) src_g->ne[1], (long long) src_g->ne[2],
+                    src_g->nb[1], src_g->nb[2], src_g->nb[3],
+                    src_q->nb[1], src_q->nb[2], src_q->nb[3],
+                    src_v->nb[1], src_v->nb[2], src_v->nb[3],
+                    (int) ggml_is_contiguous(src_q), (int) ggml_is_contiguous(src_v));
+            float hq=0, hk=0, hv0=0, hv8=0, hv16=0;
+            CUDA_CHECK(cudaMemcpy(&hq, q_d, sizeof(float), cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(&hk, k_d, sizeof(float), cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(&hv0, v_d, sizeof(float), cudaMemcpyDeviceToHost));
+            if (H > 8) {
+                CUDA_CHECK(cudaMemcpy(&hv8, v_d + 8 * sv1, sizeof(float), cudaMemcpyDeviceToHost));
+            }
+            if (H > 16) {
+                CUDA_CHECK(cudaMemcpy(&hv16, v_d + 16 * sv1, sizeof(float), cudaMemcpyDeviceToHost));
+            }
+            fprintf(stderr, "[GDN_ACT] q0=%g k0=%g v0=%g v8=%g v16=%g sv1=%lld\n",
+                    hq, hk, hv0, hv8, hv16, (long long) sv1);
+        }
+    }
 
     const float scale = 1.0f / sqrtf((float) S_v);
 

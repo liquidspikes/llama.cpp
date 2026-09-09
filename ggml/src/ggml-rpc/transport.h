@@ -50,6 +50,10 @@ struct rpc_transport {
 
     virtual bool send_exact(const void * data, size_t size) = 0;
     virtual bool recv_exact(void * data, size_t size) = 0;
+    virtual bool recv_exact_timeout(void * data, size_t size, int timeout_ms) {
+        (void)timeout_ms;
+        return recv_exact(data, size);
+    }
 
     virtual bool send_exact_channel(uint32_t channel_id, const void * data, size_t size) {
         (void)channel_id;
@@ -85,6 +89,7 @@ struct rpc_transport {
     virtual void update_caps(const uint8_t * remote_caps) { (void)remote_caps; }
 
     virtual bool is_stream() const { return false; }
+    virtual bool is_tbstripe() const { return false; }
 };
 
 using rpc_transport_ptr = std::shared_ptr<rpc_transport>;
@@ -96,6 +101,7 @@ struct socket_t {
 
     bool send_data(const void * data, size_t size);
     bool recv_data(void * data, size_t size);
+    bool recv_data_timeout(void * data, size_t size, int timeout_ms);
 
     bool send_data_channel(uint32_t channel_id, const void * data, size_t size);
     bool recv_data_channel(uint32_t channel_id, void * data, size_t size);
@@ -111,6 +117,7 @@ struct socket_t {
     void update_caps(const uint8_t * remote_caps);
 
     bool is_stream() const;
+    bool is_tbstripe() const;
     rpc_transport_ptr get_transport() const { return transport; }
 
     static std::shared_ptr<socket_t> create_server(const char * host, int port);

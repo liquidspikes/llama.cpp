@@ -3425,13 +3425,33 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
 
 // try and fuse nodes and return the number of nodes to skip
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+    ggml_tensor * node = cgraph->nodes[i];
+
+    // GDN -> cache CPY is layout-critical for head-split TP. Keep it even when
+    // GGML_CUDA_DISABLE_FUSION=1 (that flag is for other HIP fusions).
+    if (node->op == GGML_OP_GATED_DELTA_NET) {
+        ggml_cuda_gated_delta_net_fused_cache fused_state_cpy;
+        const int nodes_to_skip = ggml_cuda_try_gdn_cache_fusion(cgraph, i, fused_state_cpy);
+        {
+            static int nlog;
+            if (nlog < 6) {
+                nlog++;
+                fprintf(stderr, "[GDN_FUSE] name=%s skip=%d H_v=%lld S_v=%lld\n",
+                        node->name, nodes_to_skip,
+                        node->src[2] ? (long long) node->src[2]->ne[1] : -1,
+                        node->src[2] ? (long long) node->src[2]->ne[0] : -1);
+            }
+        }
+        if (nodes_to_skip > 0) {
+            ggml_cuda_op_gated_delta_net_fused_cache(*cuda_ctx, node, fused_state_cpy);
+            return nodes_to_skip;
+        }
+    }
 
     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
     if (disable_fusion) {
         return 0;
     }
-
-    ggml_tensor * node = cgraph->nodes[i];
 
     if (node->op == GGML_OP_MUL) {
         ggml_cuda_moe_weighted_reduction_match match;
@@ -3442,20 +3462,6 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                     *cuda_ctx, match.experts, match.expert_scale, match.weights, match.dst);
                 return match.node_count - 1;
             }
-        }
-    }
-
-    // gated_delta_net -> cpy: scatter recurrent-state snapshots into the cache
-    if (node->op == GGML_OP_GATED_DELTA_NET) {
-        ggml_cuda_gated_delta_net_fused_cache fused_state_cpy;
-        const int nodes_to_skip = ggml_cuda_try_gdn_cache_fusion(cgraph, i, fused_state_cpy);
-        if (nodes_to_skip > 0) {
-#ifdef GGML_CUDA_DEBUG
-            GGML_LOG_INFO("%s: fused gated_delta_net snapshot copies for %s (skipped %d nodes)\n",
-                          __func__, node->name, nodes_to_skip);
-#endif
-            ggml_cuda_op_gated_delta_net_fused_cache(*cuda_ctx, node, fused_state_cpy);
-            return nodes_to_skip;
         }
     }
 
@@ -5466,6 +5472,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return true;
 #endif
         case GGML_OP_SUM_ROWS:
+            return ggml_is_contiguous(op->src[0]) ||
+                (op->src[0]->type == GGML_TYPE_F32 && op->src[0]->ne[0] <= 64 && op->src[0]->ne[3] == 1);
         case GGML_OP_MEAN:
         case GGML_OP_GROUP_NORM:
             return ggml_is_contiguous(op->src[0]);
