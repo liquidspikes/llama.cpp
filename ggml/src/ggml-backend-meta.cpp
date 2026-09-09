@@ -891,34 +891,41 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         if (ggml_backend_meta_is_gdn_state_view(tensor, &gdn)) {
             return gdn_state_view_split(gdn);
         }
-        // Sequential GDN x [value_dim] MIRRORED → [key_dim, head_ratio]. Split key_dim
-        // 50/50 so each device holds 3-rep V-order (heads 0-7,16-23,32-39 on dev0).
+        // Sequential inner-K: [3072, 2, T] MIRRORED → one 3072-half per device.
         if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED &&
-                strstr(tensor->name, "final_output_3rep") != nullptr &&
-                tensor->ne[1] > 1 && tensor->src[0] != nullptr &&
-                tensor->ne[0] * tensor->ne[1] == tensor->src[0]->ne[0]) {
+                strstr(tensor->name, "final_output_khalf") != nullptr &&
+                tensor->ne[1] == (int64_t) n_bufs) {
             ggml_backend_meta_split_state ret;
             memset(&ret, 0, sizeof(ret));
-            ret.axis = GGML_BACKEND_SPLIT_AXIS_0;
+            ret.axis = GGML_BACKEND_SPLIT_AXIS_1;
             ret.n_segments = 1;
             ret.nr[0] = 1;
-            int64_t low = 0;
             for (size_t j = 0; j < n_bufs; j++) {
-                int64_t high = (j + 1 == n_bufs) ? tensor->ne[0] : tensor->ne[0] * (int64_t) (j + 1) / (int64_t) n_bufs;
-                high -= high % 128; // head_dim
-                if (j + 1 == n_bufs) {
-                    high = tensor->ne[0];
-                }
-                ret.ne[j] = high - low;
-                low = high;
+                ret.ne[j] = 1;
+            }
+            fprintf(stderr, "[GDN_KHALF] name=%s ne0=%lld\n", tensor->name, (long long) tensor->ne[0]);
+            return ret;
+        }
+        // Sequential GDN x [6144] MIRRORED → [1024, 2, 3, T] = [d0g0,d1g0, d0g1,d1g1, d0g2,d1g2].
+        // Split the device axis so each GPU holds groups 0,1,2 of its 1024 (3-rep V-order).
+        if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED &&
+                strstr(tensor->name, "final_output_3rep") != nullptr &&
+                tensor->ne[0] == 1024 && tensor->ne[1] == (int64_t) n_bufs && tensor->ne[2] > 1) {
+            ggml_backend_meta_split_state ret;
+            memset(&ret, 0, sizeof(ret));
+            ret.axis = GGML_BACKEND_SPLIT_AXIS_1;
+            ret.n_segments = 1;
+            ret.nr[0] = 1;
+            for (size_t j = 0; j < n_bufs; j++) {
+                ret.ne[j] = 1;
             }
             {
                 static int n3;
                 if (n3 < 4) {
                     n3++;
-                    fprintf(stderr, "[GDN_3REP] name=%s ne=[%lld,%lld] j0=%lld j1=%lld\n",
+                    fprintf(stderr, "[GDN_3REP] name=%s ne=[%lld,%lld,%lld] axis=1 ne_j=%lld\n",
                             tensor->name, (long long) tensor->ne[0], (long long) tensor->ne[1],
-                            (long long) ret.ne[0], n_bufs > 1 ? (long long) ret.ne[1] : 0);
+                            (long long) tensor->ne[2], (long long) ret.ne[0]);
                 }
             }
             return ret;
@@ -1732,8 +1739,9 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
             GGML_ABORT("multi buffers are not supported by the meta backend");
         }
 
-        const bool pack_3rep = strstr(tensor->name, "final_output_3rep") != nullptr &&
-                split_dim == 0 && tensor->ne[1] > 1 && tensor->op == GGML_OP_RESHAPE;
+        const bool pack_3rep = tensor->op == GGML_OP_RESHAPE && split_dim == 1 &&
+                (strstr(tensor->name, "final_output_3rep") != nullptr ||
+                 strstr(tensor->name, "final_output_khalf") != nullptr);
         if (split_dim >= 0 && split_dim < GGML_MAX_DIMS) {
             // TODO: the following assert fails for llama-parallel even though the results are correct:
             // GGML_ASSERT(ggml_is_contiguously_allocated(tensor));
@@ -1770,15 +1778,17 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
                 p = ggml_backend_meta_buffer_simple_tensor(p, j);
             }
             t_ij->view_src = p;
-            t_ij->view_offs = (size_t) j * (size_t) ne[0] * tensor->nb[0];
+            // Skip the other device's 1024 in each (device, group) pair.
+            t_ij->view_offs = (size_t) j * tensor->nb[1];
             t_ij->nb[1] = tensor->nb[1];
             t_ij->nb[2] = tensor->nb[2];
             t_ij->nb[3] = tensor->nb[3];
             static int n3v;
             if (n3v < 4) {
                 n3v++;
-                fprintf(stderr, "[GDN_3REP_VIEW] j=%zu ne0=%lld offs=%zu nb1=%zu pne0=%lld\n",
-                        j, (long long) ne[0], (size_t) t_ij->view_offs, t_ij->nb[1],
+                fprintf(stderr, "[GDN_3REP_VIEW] j=%zu ne=[%lld,%lld,%lld] offs=%zu nb1=%zu nb2=%zu pne0=%lld\n",
+                        j, (long long) t_ij->ne[0], (long long) t_ij->ne[1], (long long) t_ij->ne[2],
+                        (size_t) t_ij->view_offs, t_ij->nb[1], t_ij->nb[2],
                         p ? (long long) p->ne[0] : -1);
             }
         }
@@ -3622,7 +3632,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 continue;
             }
             bool backend_allreduce_success = false;
-            if (backend_ctx->comm_ctx) {
+            if (backend_ctx->comm_ctx && getenv("LLAMA_TP_AR_FALLBACK") == nullptr) {
                 backend_allreduce_success = backend_ctx->comm_allreduce(backend_ctx->comm_ctx, nodes.data());
             }
 
