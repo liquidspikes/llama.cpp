@@ -22,10 +22,15 @@
 #include <utility>
 #include <vector>
 
-// N-split ssm_out: MUL_MAT dest is full n_embd (PARTIAL) while W is [K, N/2].
-// Extra per-device GEMM writes the local N-slice; t_ij SCALE 0 zeros the rest
-// so AllReduce concatenates. Keyed by the full-size simple tensor.
-static std::unordered_map<ggml_tensor *, ggml_tensor *> g_innern_gemm;
+// N-split ssm_out: dest is full n_embd (PARTIAL) while W is [K, N/2].
+// Shrink dst.ne[0] to W.N and offset data for HIP, restore before AllReduce
+// so the two slices concat-via-sum. No extra graph node (views wrote garbage).
+struct ggml_backend_meta_innern_off {
+    int64_t n0;
+    int64_t full_ne0;
+    int64_t wN;
+};
+static std::unordered_map<ggml_tensor *, ggml_backend_meta_innern_off> g_innern_off;
 
 // Unallocated / poisoned shard pointers (qwen4exp Flash Next TP SIGSEGV:
 // dest 0x555500000032, memset ~29GB). Odd or near-null addresses are never
@@ -1997,9 +2002,9 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
             }
         }
 
-        // N-split: W is AXIS_1 (full K, half N) and dst was widened to full n_embd
-        // (PARTIAL). HIP MUL_MAT needs dst.ne[0]==W.ne[1]. Write the local slice
-        // through a view; SCALE 0 on t_ij zeros the other half so AR concatenates.
+        // N-split: W AXIS_1 (full K, half N), dest widened to full n_embd (PARTIAL).
+        // Record the N offset; graph_compute shrinks dst.ne[0] around HIP MUL_MAT
+        // then restores so AllReduce concatenates. Do not insert a view node.
         if ((tensor->op == GGML_OP_MUL_MAT || tensor->op == GGML_OP_MUL_MAT_ID) &&
                 t_ij->src[0] != nullptr && t_ij->src[1] != nullptr) {
             ggml_tensor * w = t_ij->src[0];
@@ -2008,7 +2013,7 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
                 ggml_backend_meta_get_split_state(stc, tensor->src[0], /*assume_sync =*/ true);
             if (wss.axis == GGML_BACKEND_SPLIT_AXIS_1 && wss.n_segments == 1 && wss.nr[0] == 1 &&
                     t_ij->type == GGML_TYPE_F32 && w->ne[1] > 0 && t_ij->ne[0] > w->ne[1] &&
-                    x->type == GGML_TYPE_F32 && x->ne[0] == w->ne[0] && t_ij->data != nullptr) {
+                    x->type == GGML_TYPE_F32 && x->ne[0] == w->ne[0]) {
                 int64_t n0 = 0;
                 for (size_t jj = 0; jj < j; jj++) {
                     ggml_tensor * wj = ggml_backend_meta_buffer_simple_tensor(tensor->src[0], jj);
@@ -2017,38 +2022,7 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
                     }
                 }
                 GGML_ASSERT(n0 + w->ne[1] <= t_ij->ne[0]);
-                int64_t gne[GGML_MAX_DIMS];
-                for (int d = 0; d < GGML_MAX_DIMS; d++) {
-                    gne[d] = t_ij->ne[d];
-                }
-                gne[0] = w->ne[1];
-                ggml_tensor * gemm = ggml_new_tensor(simple_ctx, t_ij->type, GGML_MAX_DIMS, gne);
-                gemm->op = GGML_OP_MUL_MAT;
-                for (int d = 0; d < GGML_MAX_DIMS; d++) {
-                    gemm->nb[d] = t_ij->nb[d];
-                }
-                memcpy(gemm->op_params, tensor->op_params, sizeof(tensor->op_params));
-                ggml_set_name(gemm, "innern_gemm");
-                gemm->flags     = GGML_TENSOR_FLAG_COMPUTE;
-                gemm->buffer    = t_ij->buffer;
-                gemm->extra     = t_ij->extra;
-                gemm->view_src  = t_ij;
-                gemm->view_offs = (size_t) n0 * t_ij->nb[0];
-                gemm->data      = (char *) t_ij->data + gemm->view_offs;
-                gemm->src[0]    = w;
-                gemm->src[1]    = x;
-                if (simple_buf) {
-                    ggml_backend_buffer_init_tensor(simple_buf, gemm);
-                }
-                // NONE: do not SCALE with src[2]=gemm (worker may zero after GEMM).
-                // graph_compute memsets t_ij before the subgraph; GEMM fills the slice.
-                t_ij->op = GGML_OP_NONE;
-                t_ij->src[0] = nullptr;
-                t_ij->src[1] = nullptr;
-                for (int s = 2; s < GGML_MAX_SRC; s++) {
-                    t_ij->src[s] = nullptr;
-                }
-                g_innern_gemm[t_ij] = gemm;
+                g_innern_off[t_ij] = {n0, t_ij->ne[0], w->ne[1]};
                 static int ninnern;
                 if (ninnern < 8) {
                     ninnern++;
@@ -2486,6 +2460,29 @@ static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
         case GGML_BACKEND_SPLIT_AXIS_1:
         case GGML_BACKEND_SPLIT_AXIS_2: {
             ggml_backend_meta_xfer_split_chunks(tensor, split_state, n_bufs, const_cast<void *>(data), offset, size, /*is_set=*/true);
+            if (split_state.axis == GGML_BACKEND_SPLIT_AXIS_1 && n_bufs >= 2 &&
+                    strstr(tensor->name, "ssm_out") != nullptr && offset == 0 &&
+                    tensor->nb[1] > 0) {
+                static int nchk_a1;
+                if (nchk_a1 < 2) {
+                    nchk_a1++;
+                    const size_t col = tensor->nb[1];
+                    ggml_tensor * d0 = ggml_backend_meta_buffer_simple_tensor(tensor, 0);
+                    ggml_tensor * d1 = ggml_backend_meta_buffer_simple_tensor(tensor, 1);
+                    if (d0 && d1 && col <= ggml_nbytes(d0) && col <= ggml_nbytes(d1) &&
+                            size >= col * (size_t) tensor->ne[1]) {
+                        std::vector<char> g0(col), g1(col);
+                        ggml_backend_tensor_get(d0, g0.data(), 0, col);
+                        ggml_backend_tensor_get(d1, g1.data(), 0, col);
+                        const char * src = (const char *) data;
+                        const int eq0 = memcmp(g0.data(), src, col) == 0;
+                        const int eq1_n = memcmp(g1.data(), src + (size_t) (tensor->ne[1] / 2) * col, col) == 0;
+                        const int eq1_c1 = memcmp(g1.data(), src + col, col) == 0;
+                        fprintf(stderr, "[SET_AXIS1_CHK] %s dest0==src0 %d dest1==srcN/2 %d dest1==src1 %d col=%zu N=%lld\n",
+                                tensor->name, eq0, eq1_n, eq1_c1, col, (long long) tensor->ne[1]);
+                    }
+                }
+            }
         } break;
         case GGML_BACKEND_SPLIT_AXIS_MIRRORED: {
             for (size_t j = 0; j < n_bufs; j++) {
@@ -3066,8 +3063,8 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             }
             stc.simple_tensors.clear();
         }
-        // Keep g_innern_gemm: fill runs against the live stc (not the reset ping-pong
-        // slot). Clearing here dropped the GEMM from every subgraph (n=77 not 78).
+        // Do not clear g_innern_off: init_tensor already filled it for the live
+        // stc. Clearing dropped INNERN shrink (HIP then saw dstN=2560 vs wN=1280).
         size_t n_subgraphs  = 0;
         size_t max_tmp_size = 0;
 
@@ -3499,16 +3496,6 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                         cgraph_ij->use_counts[hash_pos_ij] = cgraph->use_counts[hash_pos_orig];
                     }
                     n_kept++;
-                    auto it_gemm = g_innern_gemm.find(node_ij);
-                    if (it_gemm != g_innern_gemm.end() && it_gemm->second != nullptr &&
-                            n_kept < cgraph_ij->size) {
-                        ggml_tensor * gemm = it_gemm->second;
-                        if (gemm->data != nullptr && ggml_backend_meta_data_ptr_ok(gemm->data)) {
-                            cgraph_ij->nodes[n_kept] = gemm;
-                            ggml_hash_insert(&cgraph_ij->visited_hash_set, gemm);
-                            n_kept++;
-                        }
-                    }
                 }
                 cgraph_ij->n_nodes = n_kept;
                 cgraph_ij->uid = ggml_graph_next_uid();
@@ -3721,6 +3708,11 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
 
     for (size_t i = 0; i < backend_ctx->n_subgraphs; i++) {
         bool any_nodes = false;
+        bool innern_ag = false;
+        int64_t innern_wN = 0;
+        int64_t innern_nT = 0;
+        std::vector<std::vector<float>> innern_parts(n_backends);
+        std::vector<ggml_tensor *> innern_dev(n_backends, nullptr);
         for (size_t j = 0; j < n_backends; j++) {
             auto & bcj = backend_ctx->backend_configs[j];
             ggml_cgraph * cgraph_ij = bcj.cgraphs[i].cgraph_main;
@@ -3728,23 +3720,97 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 continue;
             }
             any_nodes = true;
+            struct innern_shape {
+                ggml_tensor * nd;
+                int64_t ne0;
+                size_t nb[GGML_MAX_DIMS];
+            };
+            std::vector<innern_shape> innern_sv;
             for (int ni = 0; ni < cgraph_ij->n_nodes; ni++) {
                 ggml_tensor * nd = cgraph_ij->nodes[ni];
-                if (nd == nullptr || g_innern_gemm.find(nd) == g_innern_gemm.end()) {
+                if (nd == nullptr || nd->data == nullptr ||
+                        !ggml_backend_meta_data_ptr_ok(nd->data) ||
+                        (nd->op != GGML_OP_MUL_MAT && nd->op != GGML_OP_MUL_MAT_ID) ||
+                        nd->src[0] == nullptr || nd->src[1] == nullptr) {
                     continue;
                 }
-                if (nd->data != nullptr && ggml_backend_meta_data_ptr_ok(nd->data)) {
-                    ggml_backend_tensor_memset(nd, 0, 0, ggml_nbytes(nd));
+                ggml_tensor * w = nd->src[0];
+                ggml_tensor * x = nd->src[1];
+                if (nd->type != GGML_TYPE_F32 || x->type != GGML_TYPE_F32 ||
+                        w->ne[1] <= 0 || nd->ne[0] <= w->ne[1] || x->ne[0] != w->ne[0] ||
+                        nd->nb[0] != sizeof(float)) {
+                    continue;
                 }
+                innern_shape s;
+                s.nd = nd;
+                s.ne0 = nd->ne[0];
+                for (int d = 0; d < GGML_MAX_DIMS; d++) {
+                    s.nb[d] = nd->nb[d];
+                }
+                innern_sv.push_back(s);
+                nd->ne[0] = w->ne[1];
+                nd->nb[0] = sizeof(float);
+                nd->nb[1] = nd->nb[0] * (size_t) nd->ne[0];
+                nd->nb[2] = nd->nb[1] * (size_t) nd->ne[1];
+                nd->nb[3] = nd->nb[2] * (size_t) nd->ne[2];
             }
             const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, cgraph_ij);
+            ggml_backend_synchronize(bcj.backend);
             if (status != GGML_STATUS_SUCCESS) {
+                for (const innern_shape & s : innern_sv) {
+                    s.nd->ne[0] = s.ne0;
+                    for (int d = 0; d < GGML_MAX_DIMS; d++) {
+                        s.nd->nb[d] = s.nb[d];
+                    }
+                }
                 return status;
+            }
+            if (!innern_sv.empty() && innern_sv.back().nd != nullptr) {
+                ggml_tensor * nd = innern_sv.back().nd;
+                const size_t nb = ggml_nbytes(nd);
+                innern_parts[j].assign(nb / sizeof(float), 0.f);
+                ggml_backend_tensor_get(nd, innern_parts[j].data(), 0, nb);
+                innern_wN = nd->ne[0];
+                innern_nT = ggml_nrows(nd);
+                innern_dev[j] = nd;
+                innern_ag = true;
+                static int nag;
+                if (nag < 6) {
+                    nag++;
+                    fprintf(stderr, "[INNERN_AG] j=%zu %s wN=%lld nT=%lld nbytes=%zu\n",
+                            j, nd->name, (long long) innern_wN, (long long) innern_nT, nb);
+                }
+            }
+            for (const innern_shape & s : innern_sv) {
+                s.nd->ne[0] = s.ne0;
+                for (int d = 0; d < GGML_MAX_DIMS; d++) {
+                    s.nd->nb[d] = s.nb[d];
+                }
             }
         }
 
         if (!any_nodes) {
             continue;
+        }
+
+        if (innern_ag && n_backends >= 2 && innern_wN > 0 && innern_nT > 0 &&
+                innern_parts[0].size() == (size_t) innern_wN * (size_t) innern_nT &&
+                innern_parts[1].size() == innern_parts[0].size() &&
+                innern_dev[0] != nullptr && innern_dev[1] != nullptr) {
+            const int64_t N = innern_wN * 2;
+            std::vector<float> full((size_t) N * (size_t) innern_nT);
+            for (int64_t t = 0; t < innern_nT; t++) {
+                memcpy(full.data() + t * N,
+                       innern_parts[0].data() + t * innern_wN,
+                       (size_t) innern_wN * sizeof(float));
+                memcpy(full.data() + t * N + innern_wN,
+                       innern_parts[1].data() + t * innern_wN,
+                       (size_t) innern_wN * sizeof(float));
+            }
+            const size_t full_nb = full.size() * sizeof(float);
+            ggml_backend_tensor_set(innern_dev[0], full.data(), 0, full_nb);
+            ggml_backend_tensor_set(innern_dev[1], full.data(), 0, full_nb);
+            continue; // already concatenated; AllReduce would double
         }
 
         if (n_backends > 1 && i < backend_ctx->n_subgraphs - 1 && getenv("LLAMA_TP_SKIP_AR") == nullptr) {
