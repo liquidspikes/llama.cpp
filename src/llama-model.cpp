@@ -599,6 +599,10 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "ssm_out.weight");
         }
         if (std::regex_match(tensor_name, pattern_ssm_out_weight)) {
+            static const bool nspl = getenv("LLAMA_TP_SSM_OUT_NSPLIT") != nullptr;
+            if (nspl) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1);
+            }
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0);
         }
 
@@ -698,7 +702,8 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                     // Sequential 50/50 of value_dim matches mirrored GDN x[:K/2].
                     // 3-rep {{key_dim, head_ratio}} is for split-GDN V-order x.
                     if (std::regex_match(tensor_name, pattern_ssm_out_weight) &&
-                            getenv("LLAMA_TP_SSM_OUT_SEQUENTIAL") != nullptr) {
+                            (getenv("LLAMA_TP_SSM_OUT_SEQUENTIAL") != nullptr ||
+                             getenv("LLAMA_TP_SSM_OUT_NSPLIT") != nullptr)) {
                         return {{tensor->ne[axis], 1}};
                     }
                     return {{key_dim, head_ratio}};
