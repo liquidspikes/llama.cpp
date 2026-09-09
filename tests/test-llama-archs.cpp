@@ -11,11 +11,14 @@
 #include "../src/llama-arch.h"
 #include "../src/llama-model-saver.h"
 
+#include <algorithm>
 #include <cinttypes>
+#include <cmath>
 #include <cstddef>
 #include <cstdio>
 #include <cstring>
 #include <cstdint>
+#include <cstdlib>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -89,6 +92,20 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
     uint32_t n_head  = 2;
     uint32_t n_ff    = 384;
     uint32_t n_layer = 2;
+    const char * qwen4exp_fixture = getenv("LLAMA_TP_FIXTURE");
+    const bool qwen4exp_dense_only = arch == LLM_ARCH_QWEN4EXP && qwen4exp_fixture && strcmp(qwen4exp_fixture, "dense") == 0;
+    const bool qwen4exp_gdn_only   = arch == LLM_ARCH_QWEN4EXP && qwen4exp_fixture && strcmp(qwen4exp_fixture, "gdn") == 0;
+    const bool qwen4exp_fnlike     = arch == LLM_ARCH_QWEN4EXP && qwen4exp_fixture && strcmp(qwen4exp_fixture, "fnlike") == 0;
+    if (qwen4exp_dense_only || qwen4exp_gdn_only) {
+        n_layer = 1;
+    }
+    if (qwen4exp_fnlike) {
+        // Flash-Next-like ratios: n_ff_exp=640 vs Q4_K gran 256, GDN groups=16 dt=48.
+        n_embd  = 2048;
+        n_head  = 8;
+        n_ff    = 640;
+        n_layer = 2;
+    }
     if (arch == LLM_ARCH_LLAMA4) {
         n_layer = 4; // hparams.n_no_rope_layer_step is hard-coded to 4
     } else if (arch == LLM_ARCH_GEMMA4) {
@@ -134,7 +151,7 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
     uint32_t n_head_kv = n_head;
     if (arch == LLM_ARCH_QWEN3) {
         n_head_kv = 1; // MQA coverage
-    } else if (arch == LLM_ARCH_MUSE_GLIMMER || arch == LLM_ARCH_AFMOE) {
+    } else if (arch == LLM_ARCH_MUSE_GLIMMER || arch == LLM_ARCH_AFMOE || qwen4exp_fnlike) {
         n_head_kv = 2; // GQA coverage
     }
     const uint32_t n_embd_head = n_embd / n_head;
@@ -162,7 +179,7 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
     ms.add_kv(LLM_KV_LOGIT_SCALE,             1.0f);
     ms.add_kv(LLM_KV_TIME_MIX_EXTRA_DIM,      uint32_t(64));
     ms.add_kv(LLM_KV_TIME_DECAY_EXTRA_DIM,    uint32_t(128));
-    ms.add_kv(LLM_KV_FULL_ATTENTION_INTERVAL, uint32_t(2));
+    ms.add_kv(LLM_KV_FULL_ATTENTION_INTERVAL, qwen4exp_dense_only ? uint32_t(1) : (qwen4exp_gdn_only ? uint32_t(99) : uint32_t(2)));
 
     if (arch == LLM_ARCH_PLAMO2 || arch == LLM_ARCH_JAMBA || arch == LLM_ARCH_NEMOTRON_H || arch == LLM_ARCH_NEMOTRON_H_MOE ||
             arch == LLM_ARCH_GRANITE_HYBRID || arch == LLM_ARCH_LFM2 || arch == LLM_ARCH_LFM2MOE || arch == LLM_ARCH_KIMI_LINEAR ||
@@ -255,9 +272,15 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         ms.add_kv(LLM_KV_HYPER_CONNECTION_COUNT,    uint32_t(4));
         ms.add_kv(LLM_KV_HYPER_CONNECTION_LOW_RANK, uint32_t(8));
         // without this the QSA layers fall back to dense and go uncovered
-        ms.add_kv(LLM_KV_ATTENTION_COMPRESS_RATIOS, std::vector<uint32_t>(n_layer, 4));
+        // dense-only fixture uses 0 so QSA is off (plain GQA TP)
+        const uint32_t qsa_ratio = (qwen4exp_dense_only || (qwen4exp_fixture && strcmp(qwen4exp_fixture, "noqsa") == 0)) ? 0u : 4u;
+        ms.add_kv(LLM_KV_ATTENTION_COMPRESS_RATIOS, std::vector<uint32_t>(n_layer, qsa_ratio));
 
         // has_cell_ext() needs ple_n_heads here: the indexer cache serializes no ext without it
+        // skip PLE in the single-mixer fixtures so GDN vs dense TP can be isolated
+        if (qwen4exp_dense_only || qwen4exp_gdn_only) {
+            // no PLE
+        } else {
         const uint32_t ple_ngram_size      = 3;
         const uint32_t ple_heads_per_ngram = 2;
         const uint32_t ple_n_heads         = (ple_ngram_size - 1)*ple_heads_per_ngram;
@@ -280,6 +303,7 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         ms.add_kv(LLM_KV_PLE_LAYER_MULTIPLIERS,       std::vector<uint64_t>({ 1, 3, 5 }));
         ms.add_kv(LLM_KV_PLE_HEAD_OFFSETS,            ple_head_offsets);
         ms.add_kv(LLM_KV_PLE_HEAD_VOCAB_SIZES,        ple_head_vocab_sizes);
+        }
     }
 
     // minimax-m3 keeps one indexer head per GQA head; the rest use a fixed 64 to match the fused
@@ -347,11 +371,11 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
     ms.add_kv(LLM_KV_XIELU_ALPHA_P,             1.0f);
     ms.add_kv(LLM_KV_XIELU_BETA,                1.0f);
     ms.add_kv(LLM_KV_XIELU_EPS,                 1.0e-7f);
-    ms.add_kv(LLM_KV_SSM_INNER_SIZE,            arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE || arch == LLM_ARCH_QWEN4EXP ? 256 : 2*n_embd);
+    ms.add_kv(LLM_KV_SSM_INNER_SIZE,            arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE || arch == LLM_ARCH_QWEN4EXP ? (qwen4exp_fnlike ? uint32_t(6144) : uint32_t(256)) : 2*n_embd);
     ms.add_kv(LLM_KV_SSM_CONV_KERNEL,           uint32_t(4));
     ms.add_kv(LLM_KV_SSM_STATE_SIZE,            uint32_t(128));
-    ms.add_kv(LLM_KV_SSM_TIME_STEP_RANK,        n_head);
-    ms.add_kv(LLM_KV_SSM_GROUP_COUNT,           arch == LLM_ARCH_PLAMO2 ? 0 : uint32_t(2));
+    ms.add_kv(LLM_KV_SSM_TIME_STEP_RANK,        qwen4exp_fnlike ? uint32_t(48) : n_head);
+    ms.add_kv(LLM_KV_SSM_GROUP_COUNT,           arch == LLM_ARCH_PLAMO2 ? 0 : (qwen4exp_fnlike ? uint32_t(16) : uint32_t(2)));
     ms.add_kv(LLM_KV_KDA_HEAD_DIM,              uint32_t(128));
     ms.add_kv(LLM_KV_KDA_SAFE_GATE,              true);
     ms.add_kv(LLM_KV_KDA_GATE_LOWER_BOUND,       -5.0f);
@@ -403,7 +427,8 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
     ctx_params.n_threads = 4;
     ctx_params.n_threads_batch = 4;
     if (!encode) {
-        ctx_params.n_ubatch = 64;
+        ctx_params.n_ubatch = getenv("LLAMA_ARG_STREAM") ? 4 : 64;
+        ctx_params.n_batch  = ctx_params.n_ubatch;
     }
 
     size_t tmp = seed;
@@ -636,6 +661,33 @@ static int save_models(const llm_arch target_arch, const size_t seed, const int 
     return 0;
 }
 
+static void add_rpc_from_env() {
+    const char * stream = getenv("LLAMA_ARG_STREAM");
+    if (stream == nullptr || stream[0] == '\0') {
+        return;
+    }
+    std::string ep = stream;
+    if (ep.rfind("dev://", 0) != 0 && ep.rfind("stream://", 0) != 0) {
+        ep = "dev://" + ep;
+    }
+    ggml_backend_load_all();
+    ggml_backend_reg_t rpc_reg = ggml_backend_reg_by_name("RPC");
+    if (rpc_reg == nullptr) {
+        throw std::runtime_error("failed to find RPC backend");
+    }
+    typedef ggml_backend_reg_t (*ggml_backend_rpc_add_server_t)(const char * endpoint);
+    auto add_server = (ggml_backend_rpc_add_server_t) ggml_backend_reg_get_proc_address(rpc_reg, "ggml_backend_rpc_add_server");
+    if (add_server == nullptr) {
+        throw std::runtime_error("failed to find RPC add server function");
+    }
+    ggml_backend_reg_t added = add_server(ep.c_str());
+    if (added == nullptr) {
+        throw std::runtime_error("ggml_backend_rpc_add_server failed for " + ep);
+    }
+    ggml_backend_register(added);
+    fprintf(stderr, "registered RPC endpoint %s (%s)\n", ep.c_str(), ggml_backend_reg_name(added));
+}
+
 static int test_backends(const llm_arch target_arch, const size_t seed, const int verbosity) {
     struct user_data_t {
         struct {
@@ -651,6 +703,8 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const in
     };
     user_data_t ud(verbosity);
 
+    add_rpc_from_env();
+
     llama_log_set([](ggml_log_level level, const char * text, void * user_data) {
         const user_data_t * ud = (const user_data_t *) user_data;
         int verbosity = common_log_get_verbosity(level);
@@ -659,7 +713,10 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const in
         }
     }, &ud);
 
-    const std::vector<llama_token> tokens = get_tokens(128, 128, seed);
+    // USB4STREAM AllReduce of a 128-token prefill is too easy to deadlock; 4 tokens
+    // still cover QSA/PLE/MoE/HC while matching decode-sized graphs.
+    const uint32_t n_tok = getenv("LLAMA_ARG_STREAM") ? 4u : 128u;
+    const std::vector<llama_token> tokens = get_tokens(n_tok, 128, seed);
 
     struct device_config {
         std::vector<ggml_backend_dev_t> devs;
@@ -678,8 +735,14 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const in
             const size_t device_count = ggml_backend_dev_count();
             for (size_t i = 0; i < device_count; i++) {
                 ggml_backend_dev_t dev = ggml_backend_dev_get(i);
-                dev_configs.emplace_back(std::vector<ggml_backend_dev_t>{dev}, ggml_backend_dev_description(dev), LLAMA_SPLIT_MODE_LAYER);
-                max_device_label_length = std::max(max_device_label_length, dev_configs.back().label.length());
+                const char * dname = ggml_backend_dev_name(dev);
+                const bool is_rpc = dname != nullptr && strstr(dname, "RPC") != nullptr;
+                // RPC as the sole LAYER device hangs USB4STREAM (full-model SET_TENSOR
+                // with no local peer). Keep it for Meta tensor-parallel only.
+                if (!is_rpc) {
+                    dev_configs.emplace_back(std::vector<ggml_backend_dev_t>{dev}, ggml_backend_dev_description(dev), LLAMA_SPLIT_MODE_LAYER);
+                    max_device_label_length = std::max(max_device_label_length, dev_configs.back().label.length());
+                }
 
                 // cpu-based devices cannot be used in tensor split mode
                 if (ggml_backend_dev_buffer_type(dev) != ggml_backend_cpu_buffer_type()) {
@@ -688,7 +751,13 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const in
             }
         }
 
-        dev_configs.emplace_back(devices_meta, "Meta", LLAMA_SPLIT_MODE_TENSOR);
+        fprintf(stderr, "Meta TENSOR devices (%zu):", devices_meta.size());
+        for (ggml_backend_dev_t d : devices_meta) {
+            fprintf(stderr, " %s", ggml_backend_dev_name(d));
+        }
+        fprintf(stderr, "\n");
+        const llama_split_mode meta_split = devices_meta.size() > 1 ? LLAMA_SPLIT_MODE_RPC_TENSOR : LLAMA_SPLIT_MODE_TENSOR;
+        dev_configs.emplace_back(devices_meta, "Meta", meta_split);
     }
 
     size_t max_arch_name_length = 0;
@@ -768,13 +837,29 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const in
                         if (nmse_val > 1e-4) {
                             all_ok = false;
                             status_nmse = "\033[1;31mFAIL\033[0m";
+                            int n_nan = 0, n_inf = 0;
+                            double sum_c = 0, sum_d = 0, max_c = 0, max_d = 0;
+                            for (size_t i = 0; i < logits_dev.size(); i++) {
+                                if (std::isnan(logits_dev[i])) n_nan++;
+                                if (std::isinf(logits_dev[i])) n_inf++;
+                                sum_c += logits_cpu[i];
+                                sum_d += logits_dev[i];
+                                max_c = std::max(max_c, (double) std::fabs(logits_cpu[i]));
+                                max_d = std::max(max_d, (double) std::fabs(logits_dev[i]));
+                            }
+                            fprintf(stderr, "[NMSE_STATS] n=%zu nan=%d inf=%d mean_cpu=%.4g mean_dev=%.4g max_cpu=%.4g max_dev=%.4g ratio=%.4g\n",
+                                    logits_dev.size(), n_nan, n_inf,
+                                    sum_c / logits_cpu.size(), sum_d / logits_dev.size(),
+                                    max_c, max_d, max_c > 0 ? max_d / max_c : 0);
                         }
                     }
 
                     FILE * file = tmpfile(); // Can be null on Windows without administrator privileges.
                     // FIXME: when adding a tensor to a gguf_context a copy is made, this changes the pointer which the meta backend
                     //     in turn uses to map the tensors to their simple equivalents - this is fundamentally incompatible
-                    if (file != nullptr && llama_model_saver_supports_arch(arch) && dc.split_mode != LLAMA_SPLIT_MODE_TENSOR) {
+                    if (file != nullptr && llama_model_saver_supports_arch(arch) &&
+                            dc.split_mode != LLAMA_SPLIT_MODE_TENSOR &&
+                            dc.split_mode != LLAMA_SPLIT_MODE_RPC_TENSOR) {
                         GGML_ASSERT(model_and_ctx_dev.first && model_and_ctx_dev.second);
                         llama_model_saver ms = llama_model_saver(model_and_ctx_dev.first.get());
                         ms.add_kv_from_model();

@@ -260,6 +260,11 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
 #ifdef GGML_CUDA_FORCE_CUBLAS
     return false;
 #endif // GGML_CUDA_FORCE_CUBLAS
+    // QWEN4EXP TP: 5-rep/3-rep packed Q6_K/Q4_K shards. hipBLAS GEMM keeps
+    // dst row i = weight column i; MMQ tile order was a quality suspect.
+    if (getenv("LLAMA_TP_HIPBLAS_Q") && (type == GGML_TYPE_Q6_K || type == GGML_TYPE_Q4_K)) {
+        return false;
+    }
 
     bool mmq_supported;
 

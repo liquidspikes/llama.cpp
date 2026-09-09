@@ -579,6 +579,8 @@ private:
 
 #ifdef GGML_TBSTRIPE
     tbs_pipe * tbs_pipe_handle = nullptr;
+    std::vector<uint8_t> tbs_pending;
+    size_t tbs_pending_off = 0;
 #endif
 
     void start_stripe_worker() {
@@ -880,10 +882,41 @@ public:
 #ifdef GGML_TBSTRIPE
         if (tbs_pipe_handle) {
             if (size == 0 || data == nullptr) return true;
+            if (!tbs_pending.empty()) {
+                if (tbs_pending_off + size > tbs_pending.size()) {
+                    GGML_LOG_ERROR("tbstripe pending underrun want=%zu have=%zu off=%zu\n",
+                                   size, tbs_pending.size(), tbs_pending_off);
+                    tbs_pending.clear();
+                    tbs_pending_off = 0;
+                    return false;
+                }
+                memcpy(data, tbs_pending.data() + tbs_pending_off, size);
+                tbs_pending_off += size;
+                if (tbs_pending_off == tbs_pending.size()) {
+                    tbs_pending.clear();
+                    tbs_pending_off = 0;
+                }
+                return true;
+            }
             return tbs_recv(tbs_pipe_handle, data, size) == 0;
         }
 #endif
         return recv_exact_channel(RPC_CHANNEL_CONTROL, data, size);
+    }
+    bool recv_exact_timeout(void * data, size_t size, int timeout_ms) override {
+#ifdef GGML_TBSTRIPE
+        if (tbs_pipe_handle) {
+            if (size == 0 || data == nullptr) return true;
+            if (!tbs_pending.empty()) {
+                return recv_exact(data, size);
+            }
+            int rc = tbs_recv_timeout(tbs_pipe_handle, data, size, timeout_ms);
+            return rc == 0;
+        }
+#else
+        (void)timeout_ms;
+#endif
+        return recv_exact(data, size);
     }
 
     static int open_stream_device(const std::string & path, int max_wait_sec = 10) {
@@ -995,7 +1028,7 @@ public:
 #ifdef GGML_TBSTRIPE
         if (tbs_pipe_handle) {
             (void)channel_id;
-            return tbs_recv(tbs_pipe_handle, data, size) == 0;
+            return recv_exact(data, size);
         }
 #endif
         if (channel_id == RPC_CHANNEL_STRIPED) {
@@ -1026,12 +1059,34 @@ public:
         if (out_channel) *out_channel = RPC_CHANNEL_CONTROL;
 #ifdef GGML_TBSTRIPE
         if (tbs_pipe_handle) {
-            return recv_exact(cmd, 1);
+            void * raw = nullptr;
+            size_t n = 0;
+            if (tbs_recv_malloc(tbs_pipe_handle, &raw, &n) != 0 || raw == nullptr || n < 1) {
+                free(raw);
+                return false;
+            }
+            uint8_t * p = (uint8_t *)raw;
+            *cmd = p[0];
+            tbs_pending.clear();
+            tbs_pending_off = 0;
+            if (n > 1) {
+                tbs_pending.assign(p + 1, p + n);
+            }
+            free(raw);
+            return true;
         }
 #endif
         return recv_exact_channel(RPC_CHANNEL_CONTROL, cmd, 1);
 #else
         (void)cmd; (void)out_channel;
+        return false;
+#endif
+    }
+
+    bool is_tbstripe() const override {
+#ifdef GGML_TBSTRIPE
+        return tbs_pipe_handle != nullptr;
+#else
         return false;
 #endif
     }
@@ -1060,6 +1115,8 @@ public:
                 // once, with a short pause so we do not spin at 100% CPU.
                 tbs_close(tbs_pipe_handle);
                 tbs_pipe_handle = nullptr;
+                tbs_pending.clear();
+                tbs_pending_off = 0;
                 std::this_thread::sleep_for(std::chrono::milliseconds(100));
                 if (!init_tbstripe()) {
                     return nullptr;
@@ -1138,6 +1195,9 @@ socket_t::socket_t(rpc_transport_ptr transport) : transport(std::move(transport)
 socket_t::~socket_t() = default;
 bool socket_t::send_data(const void * data, size_t size) { return transport && transport->send_exact(data, size); }
 bool socket_t::recv_data(void * data, size_t size) { return transport && transport->recv_exact(data, size); }
+bool socket_t::recv_data_timeout(void * data, size_t size, int timeout_ms) {
+    return transport && transport->recv_exact_timeout(data, size, timeout_ms);
+}
 bool socket_t::send_data_channel(uint32_t channel_id, const void * data, size_t size) { return transport && transport->send_exact_channel(channel_id, data, size); }
 bool socket_t::recv_data_channel(uint32_t channel_id, void * data, size_t size) { return transport && transport->recv_exact_channel(channel_id, data, size); }
 bool socket_t::recv_cmd(uint8_t * cmd, uint32_t * out_channel) { return transport && transport->recv_cmd(cmd, out_channel); }
@@ -1150,6 +1210,7 @@ std::shared_ptr<socket_t> socket_t::accept() {
 void socket_t::get_caps(uint8_t * local_caps) { if (transport) transport->get_caps(local_caps); else memset(local_caps, 0, RPC_CONN_CAPS_SIZE); }
 void socket_t::update_caps(const uint8_t * remote_caps) { if (transport) transport->update_caps(remote_caps); }
 bool socket_t::is_stream() const { return transport && transport->is_stream(); }
+bool socket_t::is_tbstripe() const { return transport && transport->is_tbstripe(); }
 
 socket_ptr socket_t::create_server(const char * host, int port) {
     auto sockfd = socket(AF_INET, SOCK_STREAM, 0);
