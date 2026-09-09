@@ -287,11 +287,11 @@ HIP must GEMM with `dst.ne[0]==W.ne[1]==1280` (contiguous). Writing into a 2560-
 
 Both GPUs busy ~4–5%, GTT ~40.6 GiB, `n_subgraphs=97`. Correct N-split concat matches INNERK, **not** mirrored `ssm_out` (`170+153`). Concat/AR is not the remaining gap: **HIP Q4_K GEMM of a 1280-col shard ≠ the corresponding slice of a 2560-col full GEMM** on gfx1151 (CPU dequant of those same bytes is exact).
 
-Do not stash GEMM as `SCALE.src[2]`. Do not GEMM into a 2560-wide dest.
+Do not stash GEMM as `SCALE.src[2]`. Do not GEMM into a 2560-wide dest. Do not shrink a 2560 dest in place — HIP extra stays 2560 and quality collapses. Native 1280 dest + host allgather (`[INNERN_SETCHK]` round-trips) still **English-loops**. Isolation `hip-ssm-gemm` on ROCm0: **HIP shard-cat vs HIP full NMSE 0** (T=1 and T=8). Layer-0 GDN `x` matches across devices; layer-1 `x` already diverges (`x0` 0.00021 vs 0.00957). Concat of `ssm_out` is not the remaining gap — residual/FFN after a correct layer-0 concat still desyncs the two GPUs.
 
 ### Remaining
 
-1. Content 323 still needs HIP shard GEMM to match a full-W slice (or keep `ssm_out` mirrored). Packing and concat are no longer the suspects.
+1. Content 323: HIP shard GEMM equals full-W on a standalone graph, but the live TP graph diverges at layer 1 GDN `x`. Next: why residual/FFN after layer-0 allgather desyncs devices (MIRROR_GDN + mirrored `ssm_out` still does `170+153`).
 2. AllGather split GDN so `MIRROR_GDN` can go away; keep 3-rep W with 3-rep `x`.
 3. uid-keyed `GRAPH_RECOMPUTE` ring after 323, then remeasure vs 19.816.
 

@@ -9668,6 +9668,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, m, 2, 1024, { 1, 1 }, { 1, 1 }));
     }
 
+    // QWEN4EXP ssm_out Q4_K: K=6144, N=2560 full or 1280 TP shard
+    for (int64_t m : {1280, 2560}) {
+        for (int n : {1, 2, 8}) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, m, n, 6144, {1, 1}, {1, 1}));
+        }
+    }
+
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 2880, 32, 2880, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 2880, 32, 2880, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_MXFP4, GGML_TYPE_F32, 2880, 32, 2880, {1, 1}, {1, 1}));
@@ -10935,6 +10942,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     for (int64_t m : {4096, 6144, 6272, 14336}) {
         for (int bs : {1, 2, 3, 4, 8}) {
             test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, m, bs, 4096, {1, 1}, {1, 1}));
+        }
+    }
+
+    // QWEN4EXP ssm_out: K=6144, N=2560 (full) or 1280 (2-way TP shard)
+    for (int64_t m : {1280, 2560}) {
+        for (int n : {1, 2, 8}) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, m, n, 6144, {1, 1}, {1, 1}));
         }
     }
 
