@@ -269,28 +269,29 @@ Both GPUs remain ~4% busy, GTT ~40.6 GiB, `n_subgraphs=97`, ~0.95 tok/s.
 
 `LLAMA_TP_HIPBLAS_Q=1` on that same pid (mmq skipped for Q4_K/Q6_K): **identical** English loop, empty content, **0.972 tok/s**, both `gpu_busy_percent=4`, GTT ~40.6 GiB, `n_subgraphs=97` (`bench-tp-hipblas.json`). Inner-K AllReduce vs full GEMM is **not** an mmq N-order issue.
 
-### N-split `ssm_out` (AXIS_1, full K) — tried, not 323
+### N-split `ssm_out` (AXIS_1, full K)
 
-`LLAMA_TP_SSM_OUT_NSPLIT=1` splits `ssm_out` on **N** (`ne[1]=2560` → 1280/1280) so each device does a **full-K=6144** GEMM. Meta marks the MUL_MAT PARTIAL (full 2560), `[INNERN]` writes a `innern_gemm` view at `n0=0/1280`, memsets the other half to 0, AllReduce-sum concatenates. Launch with `MIRROR_GDN` + `SPLIT_SSM_OUT`; do **not** set `SEQUENTIAL`. Logs (`tp-innern3.log`):
+`LLAMA_TP_SSM_OUT_NSPLIT=1` splits `ssm_out` on **N** (`ne[1]=2560` → 1280/1280). CPU dequant+numpy (`test-ssm-out-split.py`): K-split+sum NMSE **1.8e-12**, N-split concat NMSE **0** vs full GEMM. Weight SET packing is correct:
 
 ```
-[INNERN] linear_attn_out-0 j=0 n0=0 wN=1280 dstN=2560 wK=6144 xK=6144
-[INNERN] linear_attn_out-0 j=1 n0=1280 wN=1280 dstN=2560 wK=6144 xK=6144
-[META_GC] sub=0 n=78 last=innern_gemm   # was n=77 last=linear_attn_out without the extra GEMM
+[SET_AXIS1_CHK] blk.0.ssm_out.weight dest0==src0 1 dest1==srcN/2 1 dest1==src1 0 col=3456 N=2560
 ```
 
-| Launch | `reasoning_content` | tok/s | 323 |
-|---|---|---|---|
-| INNERN + SCALE 0 with `src[2]=gemm` (pid 213662) | `"assistant"` then stop, 3 tokens | 0.941 | no |
-| INNERN + `NONE` + memset (pid **215081**) | CJK/latin garbage (`prop “ magn快MF…`) | **1.383** | no |
+HIP must GEMM with `dst.ne[0]==W.ne[1]==1280` (contiguous). Writing into a 2560-wide dest (view, data-offset, or scatter of a 2560 GEMM) is **CJK garbage**. Current path: shrink dst to 1280, compute, host-allgather concat, skip AllReduce (`[INNERN_AG] wN=1280 nT=2 nbytes=10240`).
 
-Both GPUs `gpu_busy_percent=6`, GTT ~40.6 GiB, `n_subgraphs=97`. N-split concat is **worse** than inner-K English loop. Do not treat it as the quality path. First launch was a graph-order bug (SCALE after GEMM); the memset launch is a real numeric miss (packing, strided dst, or AR of the padded 2560).
+| Launch | Result | tok/s |
+|---|---|---|
+| extra `innern_gemm` view / data-offset / scatter of 2560 dest | CJK (`prop “ magn快MF…` / `programm工蚣…`) | 0.97–1.38 |
+| shrink to 1280 + host allgather (pid **222449**, mixed mmq/hipBLAS) | **English loop** (same as INNERK) | 1.065 |
+| same, mmq both GPUs (pid **224383**, worker `hipblas-q.conf` removed) | **English loop** | 0.948 |
 
-Do not stash the GEMM as `SCALE.src[2]` — the worker can zero the slice. Do not `g_innern_gemm.clear()` on ping-pong rebuild — that dropped the extra node (`n=77`).
+Both GPUs busy ~4–5%, GTT ~40.6 GiB, `n_subgraphs=97`. Correct N-split concat matches INNERK, **not** mirrored `ssm_out` (`170+153`). Concat/AR is not the remaining gap: **HIP Q4_K GEMM of a 1280-col shard ≠ the corresponding slice of a 2560-col full GEMM** on gfx1151 (CPU dequant of those same bytes is exact).
+
+Do not stash GEMM as `SCALE.src[2]`. Do not GEMM into a 2560-wide dest.
 
 ### Remaining
 
-1. Split `ssm_out` still does not match mirrored `ssm_out` (content 323). Inner-K GEMM+AR failed even with K-matched `x` and hipBLAS. N-split full-K concat also failed (garbage, not English).
+1. Content 323 still needs HIP shard GEMM to match a full-W slice (or keep `ssm_out` mirrored). Packing and concat are no longer the suspects.
 2. AllGather split GDN so `MIRROR_GDN` can go away; keep 3-rep W with 3-rep `x`.
 3. uid-keyed `GRAPH_RECOMPUTE` ring after 323, then remeasure vs 19.816.
 
