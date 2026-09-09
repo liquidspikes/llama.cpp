@@ -238,11 +238,36 @@ This pack **turns `umpsumps` into coherent English**. It is not bit-exact vs ful
 
 ~0.95 tok/s vs `B_single` 19.816. 97 subgraphs, RPC `GRAPH_RECOMPUTE` still one-graph. Do not treat this as a kernel-theory problem. Strix Halo forks (halo-box, Gaetan Puleo pull-18, halogen-flash-server) are single-node prefill/decode kernels and do not replace USB4STREAM rpc-tensor.
 
+### K-matching inner-K (later the same night)
+
+Slicing mirrored GDN `x` so `W.K` equals `x.K` (either sequential halves `[3072,2,T]` or 3-rep `[1024,2,3,T]`) is required. Without a slice, HIP sees `W.K=3072` vs `x.K=6144` and quality collapses (`5555…`).
+
+With a K-matched slice + split `ssm_out` + `MIRROR_GDN`:
+
+| Slice | `reasoning_content` | 323 |
+|---|---|---|
+| 3-rep `[1024,2,3]` | English, loops `17 × 19 = 17 × 19 =` | no |
+| sequential `[3072,2]` | same English loop | no |
+| no slice, sequential W | `545555…` collapse | no |
+| `ssm_out` fully mirrored (no inner-K) | `170 + 153` then loop | no content |
+
+So **K-matching is necessary but not sufficient**. Fully mirrored `ssm_out` still does the arithmetic (`170+153`); split inner-K AllReduce of the 2560-wide `linear_attn_out` does not. Butterfly `LLAMA_TP_AR_FALLBACK=1` hung the 128-token POST (200s, 0 bytes). Keep `tbs_xchg` AllReduce.
+
+View log for sequential halves (`tp-khalf.log`):
+
+```
+[GDN_KHALF] name=final_output_khalf-0 ne0=3072
+[GDN_3REP_VIEW] j=0 ne=[3072,1,2] offs=0 nb1=12288 nb2=24576 pne0=6144
+[GDN_3REP_VIEW] j=1 ne=[3072,1,2] offs=12288 nb1=12288 nb2=24576 pne0=6144
+```
+
+Both GPUs remain ~4% busy, GTT ~40.6 GiB, `n_subgraphs=97`, ~0.95 tok/s.
+
 ### Remaining
 
-1. Make the 3-rep `x` pack bit-exact with mirrored `ssm_out` (content 323).
-2. AllGather split GDN (24+24 heads) so `MIRROR_GDN` can go away.
-3. uid-keyed `GRAPH_RECOMPUTE` ring after 323, then remeasure vs 19.816. If USB4 AR count still floors below that, stop and report.
+1. Make split `ssm_out` inner-K numerically match mirrored `ssm_out` (content 323). Suspect: AllReduce of `linear_attn_out` vs full local GEMM, not the K-slice of `x`.
+2. AllGather split GDN so `MIRROR_GDN` can go away; keep 3-rep W with 3-rep `x`.
+3. uid-keyed `GRAPH_RECOMPUTE` ring after 323, then remeasure vs 19.816.
 
 ## Files that matter
 
