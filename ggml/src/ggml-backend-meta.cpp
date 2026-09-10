@@ -2033,7 +2033,10 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
         // N-split: W AXIS_1 (full K, half N), dest is full n_embd (PARTIAL).
         // HIP MUL_MAT into a native 1280 dest (own buffer). Host allgather fills t_ij.
         if ((tensor->op == GGML_OP_MUL_MAT || tensor->op == GGML_OP_MUL_MAT_ID) &&
-                t_ij->src[0] != nullptr && t_ij->src[1] != nullptr && simple_buf != nullptr) {
+                t_ij->src[0] != nullptr && t_ij->src[1] != nullptr && simple_buf != nullptr &&
+                getenv("LLAMA_TP_SSM_OUT_NSPLIT") != nullptr &&
+                (strstr(tensor->name, "linear_attn_out") != nullptr ||
+                 (tensor->src[0]->name[0] && strstr(tensor->src[0]->name, "ssm_out") != nullptr))) {
             ggml_tensor * w = t_ij->src[0];
             ggml_tensor * x = t_ij->src[1];
             const ggml_backend_meta_split_state wss =
@@ -2862,8 +2865,21 @@ struct ggml_backend_meta_context {
     uint64_t                    uid           = 0;
     uint64_t                    graph_sig     = 0;
 
+    using comm_graph_seq_t = bool (*)(
+            void * comm_ctx,
+            ggml_backend_t local_backend,
+            ggml_cgraph ** local_graphs,
+            ggml_tensor ** local_ar,
+            uint64_t * rpc_uids,
+            ggml_tensor ** rpc_ar,
+            size_t n);
+    using comm_set_pending_ar_t = void (*)(void * comm_ctx, ggml_tensor * rpc_ar);
+    using comm_finish_ar_t      = bool (*)(void * comm_ctx, ggml_tensor * local_ar);
     void *                               comm_ctx       = nullptr;
     ggml_backend_comm_allreduce_tensor_t comm_allreduce = nullptr;
+    comm_graph_seq_t                     comm_graph_seq = nullptr;
+    comm_set_pending_ar_t                comm_set_pending_ar = nullptr;
+    comm_finish_ar_t                     comm_finish_ar      = nullptr;
 
     ggml_backend_meta_context(ggml_backend_dev_t meta_dev, const char * params) {
         const size_t n_devs = ggml_backend_meta_dev_n_devs(meta_dev);
@@ -2911,6 +2927,12 @@ struct ggml_backend_meta_context {
             comm_allreduce = (ggml_backend_comm_allreduce_tensor_t)
                 ggml_backend_reg_get_proc_address(comm_reg, "ggml_backend_comm_allreduce_tensor");
             GGML_ASSERT(comm_allreduce != nullptr);
+            comm_graph_seq = (comm_graph_seq_t)
+                ggml_backend_reg_get_proc_address(comm_reg, "ggml_backend_comm_graph_seq");
+            comm_set_pending_ar = (comm_set_pending_ar_t)
+                ggml_backend_reg_get_proc_address(comm_reg, "ggml_backend_comm_set_pending_ar");
+            comm_finish_ar = (comm_finish_ar_t)
+                ggml_backend_reg_get_proc_address(comm_reg, "ggml_backend_comm_finish_ar");
             GGML_LOG_INFO("%s: initialized comm_ctx=%p comm_allreduce=%p for meta backend (n_devs=%zu)\n",
                           __func__, comm_ctx, (void*)comm_allreduce, n_devs);
             fprintf(stderr, "[META_COMM] initialized comm_ctx=%p comm_allreduce=%p n_devs=%zu\n",
@@ -3563,6 +3585,9 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     }
                 }
                 cgraph_ij->n_nodes = n_kept;
+                // Fresh uid on rebuild so T=8 prefill graphs are not GRAPH_RECOMPUTE'd
+                // onto T=1 decode buffers (k_set_rows aperture fault). Skip-rebuild
+                // graph_sig keeps these uids for token 2+ of the same shape.
                 cgraph_ij->uid = ggml_graph_next_uid();
             }
         }
@@ -3783,6 +3808,77 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         }
     }
 
+    if (backend_ctx->comm_graph_seq != nullptr && backend_ctx->comm_ctx != nullptr &&
+            backend_ctx->n_subgraphs >= 2 && n_backends >= 2 &&
+            getenv("LLAMA_TP_SEQ") != nullptr &&
+            getenv("LLAMA_TP_SSM_OUT_NSPLIT") == nullptr) {
+        size_t j_local = n_backends, j_rpc = n_backends;
+        for (size_t j = 0; j < n_backends; j++) {
+            const char * bname = ggml_backend_name(backend_ctx->backend_configs[j].backend);
+            const bool is_rpc = bname != nullptr && strncmp(bname, "RPC", 3) == 0;
+            if (is_rpc) {
+                j_rpc = j;
+            } else if (j_local == n_backends) {
+                j_local = j;
+            }
+        }
+        if (j_local < n_backends && j_rpc < n_backends) {
+            const size_t ns = backend_ctx->n_subgraphs;
+            std::vector<ggml_cgraph *> local_gs(ns, nullptr);
+            std::vector<ggml_tensor *> local_ar(ns, nullptr);
+            std::vector<uint64_t> rpc_uids(ns, 0);
+            std::vector<ggml_tensor *> rpc_ar(ns, nullptr);
+            bool seq_ok = true;
+            for (size_t i = 0; i < ns; i++) {
+                ggml_cgraph * lg = backend_ctx->backend_configs[j_local].cgraphs[i].cgraph_main;
+                ggml_cgraph * rg = backend_ctx->backend_configs[j_rpc].cgraphs[i].cgraph_main;
+                local_gs[i] = lg;
+                if (rg == nullptr || rg->uid == 0) {
+                    seq_ok = false;
+                    break;
+                }
+                rpc_uids[i] = rg->uid;
+                if (i + 1 >= ns) {
+                    continue;
+                }
+                const size_t i_node_stop = backend_ctx->backend_configs[0].cgraphs[i + 1].offset;
+                if (i_node_stop == 0) {
+                    continue;
+                }
+                ggml_tensor * orig_last = cgraph->nodes[i_node_stop - 1];
+                if (orig_last == nullptr) {
+                    continue;
+                }
+                const ggml_backend_meta_split_axis last_axis =
+                    ggml_backend_meta_get_split_state(orig_last, /*assume_sync =*/ false).axis;
+                const bool last_partial = last_axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL;
+                const bool last_ffn = strstr(orig_last->name, "ffn_moe") != nullptr;
+                if (!last_partial && !last_ffn) {
+                    continue;
+                }
+                local_ar[i] = ggml_backend_meta_buffer_simple_tensor(orig_last, j_local);
+                rpc_ar[i] = ggml_backend_meta_buffer_simple_tensor(orig_last, j_rpc);
+            }
+            if (seq_ok) {
+                static int nseq;
+                if (nseq < 4) {
+                    nseq++;
+                    fprintf(stderr, "[META_SEQ] n_subgraphs=%zu\n", ns);
+                }
+                if (backend_ctx->comm_graph_seq(backend_ctx->comm_ctx,
+                        backend_ctx->backend_configs[j_local].backend,
+                        local_gs.data(), local_ar.data(), rpc_uids.data(), rpc_ar.data(), ns)) {
+                    return GGML_STATUS_SUCCESS;
+                }
+                static int nseq_skip;
+                if (nseq_skip < 4) {
+                    nseq_skip++;
+                    fprintf(stderr, "[META_SEQ] skip (uids not cached yet)\n");
+                }
+            }
+        }
+    }
+
     for (size_t i = 0; i < backend_ctx->n_subgraphs; i++) {
         bool any_nodes = false;
         bool innern_ag = false;
@@ -3790,17 +3886,107 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         int64_t innern_nT = 0;
         std::vector<std::vector<float>> innern_parts(n_backends);
         std::vector<ggml_tensor *> innern_dev(n_backends, nullptr);
+        // Local HIP graph_compute queues kernels and returns. RPC RECOMPUTE
+        // blocks on the USB4 ACK (worker HIP). Launch non-RPC first so local
+        // kernels overlap the RPC round-trip. Syncing inside the j-loop
+        // serialized them (~1ms * 97 subgraphs).
+        // Piggyback FFN AllReduce onto GRAPH_RECOMPUTE (one USB4 RTT instead of
+        // RECOMPUTE+ALL_REDUCE). Skip when INNERN/NSPLIT owns the residual.
+        ggml_tensor * piggy_local = nullptr;
+        ggml_tensor * piggy_rpc   = nullptr;
+        const bool skip_piggy = getenv("LLAMA_TP_AR_PIGGY") == nullptr ||
+                                getenv("LLAMA_TP_SSM_OUT_NSPLIT") != nullptr ||
+                                getenv("LLAMA_TP_SKIP_AR") != nullptr;
+        if (!skip_piggy && n_backends > 1 && i < backend_ctx->n_subgraphs - 1 &&
+                backend_ctx->comm_set_pending_ar != nullptr && backend_ctx->comm_ctx != nullptr) {
+            const size_t i_node_stop = backend_ctx->backend_configs[0].cgraphs[i + 1].offset;
+            if (i_node_stop != 0) {
+                ggml_tensor * orig_last = cgraph->nodes[i_node_stop - 1];
+                ggml_backend_meta_split_axis last_axis = GGML_BACKEND_SPLIT_AXIS_UNKNOWN;
+                if (orig_last != nullptr) {
+                    last_axis = ggml_backend_meta_get_split_state(orig_last, /*assume_sync =*/ false).axis;
+                }
+                const bool last_partial = last_axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL;
+                const bool last_ffn = orig_last != nullptr && strstr(orig_last->name, "ffn_moe") != nullptr;
+                if (orig_last != nullptr && (last_partial || last_ffn)) {
+                    for (size_t j = 0; j < n_backends; j++) {
+                        ggml_tensor * shard = ggml_backend_meta_buffer_simple_tensor(orig_last, j);
+                        if (shard == nullptr || shard->data == nullptr ||
+                                !ggml_backend_meta_data_ptr_ok(shard->data)) {
+                            piggy_local = nullptr;
+                            piggy_rpc = nullptr;
+                            break;
+                        }
+                        const char * bname = ggml_backend_name(backend_ctx->backend_configs[j].backend);
+                        const bool is_rpc = bname != nullptr && strncmp(bname, "RPC", 3) == 0;
+                        if (is_rpc) {
+                            piggy_rpc = shard;
+                        } else if (piggy_local == nullptr) {
+                            piggy_local = shard;
+                        }
+                    }
+                    if (piggy_local != nullptr && piggy_rpc != nullptr) {
+                        bool rpc_has_nodes = false;
+                        for (size_t j = 0; j < n_backends; j++) {
+                            const char * bname = ggml_backend_name(backend_ctx->backend_configs[j].backend);
+                            const bool is_rpc = bname != nullptr && strncmp(bname, "RPC", 3) == 0;
+                            ggml_cgraph * rg = backend_ctx->backend_configs[j].cgraphs[i].cgraph_main;
+                            if (is_rpc && rg != nullptr && rg->n_nodes > 0) {
+                                rpc_has_nodes = true;
+                                break;
+                            }
+                        }
+                        if (rpc_has_nodes) {
+                            backend_ctx->comm_set_pending_ar(backend_ctx->comm_ctx, piggy_rpc);
+                        } else {
+                            piggy_local = nullptr;
+                            piggy_rpc = nullptr;
+                        }
+                    } else {
+                        piggy_local = nullptr;
+                        piggy_rpc = nullptr;
+                    }
+                }
+            }
+        }
+        ggml_status compute_status = GGML_STATUS_SUCCESS;
+        auto launch = [&](bool rpc) {
+            for (size_t j = 0; j < n_backends; j++) {
+                auto & bcj = backend_ctx->backend_configs[j];
+                const char * bname = ggml_backend_name(bcj.backend);
+                const bool is_rpc = bname != nullptr && strncmp(bname, "RPC", 3) == 0;
+                if (is_rpc != rpc) {
+                    continue;
+                }
+                ggml_cgraph * cgraph_ij = bcj.cgraphs[i].cgraph_main;
+                if (cgraph_ij == nullptr || cgraph_ij->n_nodes <= 0) {
+                    continue;
+                }
+                any_nodes = true;
+                const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, cgraph_ij);
+                if (status != GGML_STATUS_SUCCESS) {
+                    compute_status = status;
+                }
+            }
+        };
+        launch(false);
+        launch(true);
         for (size_t j = 0; j < n_backends; j++) {
             auto & bcj = backend_ctx->backend_configs[j];
             ggml_cgraph * cgraph_ij = bcj.cgraphs[i].cgraph_main;
             if (cgraph_ij == nullptr || cgraph_ij->n_nodes <= 0) {
                 continue;
             }
-            any_nodes = true;
-            const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, cgraph_ij);
             ggml_backend_synchronize(bcj.backend);
-            if (status != GGML_STATUS_SUCCESS) {
-                return status;
+        }
+        if (compute_status != GGML_STATUS_SUCCESS) {
+            return compute_status;
+        }
+        for (size_t j = 0; j < n_backends; j++) {
+            auto & bcj = backend_ctx->backend_configs[j];
+            ggml_cgraph * cgraph_ij = bcj.cgraphs[i].cgraph_main;
+            if (cgraph_ij == nullptr || cgraph_ij->n_nodes <= 0) {
+                continue;
             }
             for (int ni = 0; ni < cgraph_ij->n_nodes; ni++) {
                 ggml_tensor * nd = cgraph_ij->nodes[ni];
@@ -3971,7 +4157,10 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 }
             }
             bool backend_allreduce_success = false;
-            if (backend_ctx->comm_ctx && getenv("LLAMA_TP_AR_FALLBACK") == nullptr) {
+            if (backend_ctx->comm_finish_ar != nullptr && piggy_local != nullptr) {
+                backend_allreduce_success = backend_ctx->comm_finish_ar(backend_ctx->comm_ctx, piggy_local);
+            }
+            if (!backend_allreduce_success && backend_ctx->comm_ctx && getenv("LLAMA_TP_AR_FALLBACK") == nullptr) {
                 backend_allreduce_success = backend_ctx->comm_allreduce(backend_ctx->comm_ctx, nodes.data());
             }
 

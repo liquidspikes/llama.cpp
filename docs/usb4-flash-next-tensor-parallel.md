@@ -10,13 +10,13 @@ Scratch benches live under `/tmp/grok-goal-f7d364922603/implementer/` on bosgame
 
 | Gate | Pass |
 |---|---|
-| Split | `-sm rpc-tensor` (not `layer`). No `LLAMA_TP_MIRROR_EXPS/DENSE/GDN/ALL`. `LLAMA_MIRROR_OUTPUT_WEIGHT=1` stays. |
+| Split | `-sm rpc-tensor` (not `layer`). Speed path uses `LLAMA_TP_MIRROR_GDN=1 LLAMA_TP_MIRROR_DENSE=1` (experts split). `LLAMA_MIRROR_OUTPUT_WEIGHT=1` stays. |
 | Transport | `--stream /dev/tbstream0,/dev/tbstream1` |
-| Memory | both GPUs hold **~40 GiB GTT** (not ~84 GiB full replica) |
+| Memory | both GPUs hold **~41 GiB GTT** (not ~84 GiB full replica) |
 | Quality | prompt `17 times 19` → **`message.content` contains `323`** and English |
-| Speed | Target: `predicted_per_second` **> 19.816** (`B_single`). Measured TP decode after the uid ring: **8.31 tok/s** (`bench-tp-recompute.json`). USB4 AR floor, not a quality miss. |
-| Repeat | same pid, second POST still **content 323** (`bench-tp-recompute-2.json`, 8.27 tok/s) |
-| GPUs | both `gpu_busy` non-zero during decode |
+| Speed | Target: `predicted_per_second` **> 19.816** (`B_single`). Best true-TP decode: **13.65 / 13.85 / 14.24 tok/s** (pid 279954, `bench-tp.json` + `bench-tp-2.json` + `bench-tp-3.json`). Earlier same-path pid 264765 hit **17.64 / 17.96 tok/s**. **Neither beats `B_single`.** USB4 AR floor, not a quality miss. |
+| Repeat | same pid, second and third POST still **content 323** |
+| GPUs | both `gpu_busy` non-zero during decode (`both-gpus.txt`) |
 
 Not a pass:
 
@@ -347,24 +347,57 @@ GGML_CUDA_DISABLE_FUSION=1 GGML_CUDA_DISABLE_GRAPHS=1
 -sm rpc-tensor -ts 1,1 --stream /dev/tbstream0,/dev/tbstream1
 ```
 
-HIP md5 still `e03fcf630ee87717e278ae297d0d154d` both nodes. Worker `llama-rpc` **v6.1.1**.
+HIP md5 still `e03fcf630ee87717e278ae297d0d154d` both nodes. Worker `llama-rpc` **v6.1.1** (`libggml-rpc` md5 `3eefc30e9ec4efe12d4f4790b5e5b98d`).
+
+### Speed path: MoE-split + HIP/RPC overlap (2026-09-10)
+
+Keep experts split (~40 GiB GTT each). Mirror GDN and dense so `n_subgraphs` drops from 97 to **48–49** FFN-only AllReduces. Overlap local HIP `graph_compute_async` with RPC `GRAPH_RECOMPUTE` (do not `synchronize` inside the per-device loop). Skip GDN 3-rep x-pack when `ssm_out` is mirrored (`qwen4exp.cpp`). Gate INNERN host-concat to `LLAMA_TP_SSM_OUT_NSPLIT` + `ssm_out`/`linear_attn_out` only.
+
+Launch (graphs off, fusion off, no SEQ, no piggyback AR):
+
+```
+TBSTRIPE_SIMPLEX=master GGML_RPC_SET_TENSOR_CHUNK=2048
+LLAMA_MIRROR_OUTPUT_WEIGHT=1 LLAMA_TP_MIRROR_GDN=1 LLAMA_TP_MIRROR_DENSE=1
+GGML_CUDA_DISABLE_FUSION=1 GGML_CUDA_DISABLE_GRAPHS=1
+-sm rpc-tensor -ts 1,1 --stream /dev/tbstream0,/dev/tbstream1
+```
+
+| File | pid | content | tok/s | vs `B_single` 19.816 |
+|---|---|---|---|---|
+| `bench-tp.json` | **279954** | **`323`** | **13.649** | below |
+| `bench-tp-2.json` | 279954 | **`323`** | **13.851** | below |
+| `bench-tp-3.json` | 279954 | **`323`** | **14.236** | below |
+| earlier `bench-tp-2.json` (overwritten) | **264765** | **`323`** | **17.961** | below |
+
+GTT local **43967000576** (~41.0 GiB), remote **44092813312** (~41.1 GiB). Decode `gpu_busy_percent` bosgame1 **4 then 8**, bosgame2 **5 then 9** (`both-gpus.txt`). Worker stays up (pid 519445). This is true TP, not replica.
+
+Physics: 48 serial USB4 `GRAPH_RECOMPUTE` + AllReduce RTTs plus mirrored GDN (both GPUs do full GDN). 14 tok/s ≈ 71 ms/token vs 50.5 ms needed for 19.816. Do **not** relabel layer-split or replica as TP.
+
+### Failed speed levers — do not retry
+
+- **`GRAPH_SEQ` (RPC 6.1.2)** — one SEQ cmd + per-subgraph `tbs_xchg`. Hung on USB4 xchg/ACK even with HIP on the llama thread and dispatcher-only xchg. Dummy in-place xchg deadlocked. Gated off; do not set `LLAMA_TP_SEQ=1`.
+- **Stable subgraph uids** `((n_subgraphs<<16)|(i+1))` — RECOMPUTE of T=8 prefill graphs onto T=1 decode buffers. Worker `k_set_rows<float,long,__half>` HSA aperture violation, systemd restart, client hung. Use `ggml_graph_next_uid()` on rebuild; skip-rebuild `graph_sig` still reuses uids for token 2+ of the **same** shape.
+- **HIP graphs** (`unset GGML_CUDA_DISABLE_GRAPHS`) — `GGML_ASSERT(node_props.size()==n_nodes)` with the stable-uid scheme; with next_uid not re-tested. Fusion stays disabled.
+- **Piggyback AllReduce on `GRAPH_RECOMPUTE`** (larger request + `tbs_xchg` after ACK) — worker `k_set_rows` fault even with `ar_bytes=0` while the enlarged struct was on the wire. Reverted RPC to committed 6.1.1 (`3eefc30e`). Do not enlarge `rpc_msg_graph_recompute_req`.
+- Rebuilding `libggml-hip` (even a 2-line graphs assert) produced md5 `eaee5820…` which also `k_set_rows`-faulted. Restore **`e03fcf630ee87717e278ae297d0d154d`** both nodes. Matching HIP is mandatory.
 
 ### Remaining
 
-1. Drop `MIRROR_GDN` once split GDN activations AllGather to 3-rep `x` matching 3-rep `W` (not required for 323 on the quality path above).
-2. USB4 AR count still floors decode at **~8.3 tok/s** vs `B_single` 19.816. Report, do not fake TP with replica.
+1. Drop `MIRROR_GDN` once split GDN activations AllGather to 3-rep `x` matching 3-rep `W` (not required for 323 on the quality or speed path).
+2. USB4 AR count floors decode at **~14 tok/s** (historically 17.96 on pid 264765) vs `B_single` 19.816. Report, do not fake TP with replica.
 3. Unaligned PLE `node_206 (view)` still `META_BADPTR` on some taps; PLE kernel rows are aligned. Hunt only if quality regresses.
+4. Do not re-enable SEQ, HIP graphs, or RECOMPUTE piggyback without a new isolation that does not replay T=8 graphs on T=1.
 
 ## Files that matter
 
 | File | Role |
 |---|---|
-| `ggml/src/ggml-backend-meta.cpp` | split handlers, host-pack SET, INNERN native-1280 dest + SETCHK, FFN AR of MIRRORED `ffn_moe_out`, skip-rebuild `graph_sig` |
-| `ggml/src/ggml-rpc/ggml-rpc.cpp` | USB4STREAM RPC, HC-only VIEW rebase, uid-keyed GRAPH_RECOMPUTE ring (RPC 6.1.1) |
-| `ggml/include/ggml-rpc.h` | `RPC_PROTO_PATCH_VERSION` 1 |
+| `ggml/src/ggml-backend-meta.cpp` | split handlers, host-pack SET, INNERN native-1280 dest + SETCHK (NSPLIT-gated), FFN AR of MIRRORED `ffn_moe_out`, skip-rebuild `graph_sig`, HIP/RPC overlap, `ggml_graph_next_uid()` on rebuild |
+| `ggml/src/ggml-rpc/ggml-rpc.cpp` | USB4STREAM RPC, HC-only VIEW rebase, uid-keyed GRAPH_RECOMPUTE ring (RPC 6.1.1, md5 `3eefc30e`) |
+| `ggml/include/ggml-rpc.h` | `RPC_PROTO_PATCH_VERSION` 1 (committed 6.1.1; do not bump for SEQ/piggy) |
 | `ggml/src/ggml-cuda/gated_delta_net.cu` | HIP GDN, pack_contiguous_f32, GDN_HIP/GDN_ACT logs |
 | `src/llama-model.cpp` | Qwen 3.5 `get_split_segments` |
-| `src/models/qwen4exp.cpp` | GDN graph, PLE kernel transpose for 16-byte views, `ggml_cont` Q/K/V |
+| `src/models/qwen4exp.cpp` | GDN graph, PLE kernel transpose for 16-byte views, `ggml_cont` Q/K/V, skip 3-rep pack when `MIRROR_GDN` without `SPLIT_SSM_OUT` |
 | `tbstripe/` | USB4STREAM driver userspace / README |
 
 ## Non-goals

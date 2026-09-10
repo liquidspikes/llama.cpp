@@ -993,9 +993,14 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
     const int64_t value_dim_gdn = head_v_dim * num_v_heads;
     // Sequential inner-K is sliced in Meta ([INNERK]). N-split ssm_out uses the
     // native 6144 GDN layout with a full-K GEMM ([INNERN]); do not 3-rep pack x.
+    // Mirrored ssm_out (MIRROR_GDN without SPLIT_SSM_OUT) also needs sequential
+    // 6144 x; 3-rep pack makes x AXIS_0 against a MIRRORED weight and aborts.
+    const bool ssm_out_mirrored = getenv("LLAMA_TP_MIRROR_GDN") != nullptr &&
+            getenv("LLAMA_TP_SPLIT_SSM_OUT") == nullptr;
     if (head_ratio_gdn > 1 && final_output->ne[0] == value_dim_gdn &&
             getenv("LLAMA_TP_SSM_OUT_SEQUENTIAL") == nullptr &&
-            getenv("LLAMA_TP_SSM_OUT_NSPLIT") == nullptr) {
+            getenv("LLAMA_TP_SSM_OUT_NSPLIT") == nullptr &&
+            !ssm_out_mirrored) {
         // 3-rep V-order: [1024, 2, 3, T] = [d0g0,d1g0, d0g1,d1g1, d0g2,d1g2].
         final_output = ggml_reshape_4d(ctx0, final_output, 1024, 2, head_ratio_gdn,
                 n_seq_tokens * n_seqs);
