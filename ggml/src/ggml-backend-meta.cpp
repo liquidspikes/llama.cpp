@@ -3894,7 +3894,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         // RECOMPUTE+ALL_REDUCE). Skip when INNERN/NSPLIT owns the residual.
         ggml_tensor * piggy_local = nullptr;
         ggml_tensor * piggy_rpc   = nullptr;
-        const bool skip_piggy = getenv("LLAMA_TP_AR_PIGGY") == nullptr ||
+        static const bool skip_piggy = getenv("LLAMA_TP_NO_PIGGY") != nullptr ||
                                 getenv("LLAMA_TP_SSM_OUT_NSPLIT") != nullptr ||
                                 getenv("LLAMA_TP_SKIP_AR") != nullptr;
         if (!skip_piggy && n_backends > 1 && i < backend_ctx->n_subgraphs - 1 &&
