@@ -2576,9 +2576,11 @@ bool rpc_server::allreduce_concat_last(socket_ptr sock, uint32_t device, uint64_
     full.resize((size_t) dest->ne[0] * (size_t) nT);
     // Worker is TP rank 1: peer is the left half.
     if (kind == 2 && wN == 3072 && dest->ne[0] == 6144) {
-        allgather_interleave_f32(full.data(),
+        // Sequential halves: local 24 heads flatten to 3072, then d0|d1 → 6144.
+        // 1024-chunk 3-rep interleave was also garbage (pid 304455 / 309878).
+        allgather_concat_f32(full.data(),
                 (const float *) peer_data.data(), (const float *) local_data.data(),
-                1024, 3, nT);
+                wN, nT);
     } else {
         allgather_concat_f32(full.data(),
                 (const float *) peer_data.data(), (const float *) local_data.data(),
@@ -3519,9 +3521,9 @@ GGML_BACKEND_API bool ggml_backend_rpc_comm_graph_seq(
             }
             concat_full.resize((size_t) dest->ne[0] * (size_t) nT);
             if (local_ar[i]->ne[0] == 3072 && dest->ne[0] == 6144) {
-                allgather_interleave_f32(concat_full.data(),
+                allgather_concat_f32(concat_full.data(),
                         (const float *) local_data.data(), (const float *) peer_data.data(),
-                        1024, 3, nT);
+                        wN, nT);
             } else {
                 allgather_concat_f32(concat_full.data(),
                         (const float *) local_data.data(), (const float *) peer_data.data(),

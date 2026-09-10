@@ -10,11 +10,11 @@ Scratch benches live under `/tmp/grok-goal-f7d364922603/implementer/` on bosgame
 
 | Gate | Pass |
 |---|---|
-| Split | `-sm rpc-tensor` (not `layer`). Speed path uses `LLAMA_TP_MIRROR_GDN=1 LLAMA_TP_MIRROR_DENSE=1` (experts split). `LLAMA_MIRROR_OUTPUT_WEIGHT=1` stays. |
+| Split | `-sm rpc-tensor` (not `layer`). Speed path: `LLAMA_TP_MIRROR_GDN=1 LLAMA_TP_MIRROR_DENSE=1` (experts split). **Do not set `LLAMA_MIRROR_OUTPUT_WEIGHT`** — `output.weight` stays AXIS_1 (vocab split). |
 | Transport | `--stream /dev/tbstream0,/dev/tbstream1` |
-| Memory | both GPUs hold **~41 GiB GTT** (not ~84 GiB full replica) |
+| Memory | both GPUs hold **~40.7 GiB GTT** (not ~84 GiB full replica) |
 | Quality | prompt `17 times 19` → **`message.content` contains `323`** and English |
-| Speed | Target: `predicted_per_second` **> 19.816** (`B_single`). Best true-TP **323** decode: **17.46 / 17.48 tok/s** (pid 284828 / recapture pid 287196, GRAPH_SEQ last-node xchg + HIP graphs). **Does not beat `B_single`.** GDN-split (no `MIRROR_GDN`) hit **18.42 tok/s** but **garbage**. USB4 + mirrored GDN floor ~57.2 ms/token vs 50.5 ms. Simplex `tbs_xchg` was 1:1 frame ping-pong (default `TBS_XCHG_WINDOW=1` on the client); concurrent windowed xchg is the next lever. |
+| Speed | Target: `predicted_per_second` **> 19.816** (`B_single`). **Pass (warmed decode):** pid **314457** `bench-tp.json` **20.058** tok/s, `bench-tp-2.json` **20.108** tok/s, content **`323`** both. First 1–2 POSTs after load are slower (~18 tok/s) until HIP graphs warm up; recapture after a couple of 17×19 completions. |
 | GPUs | both `gpu_busy` non-zero during decode (`both-gpus.txt`) |
 
 Not a pass:
@@ -58,7 +58,6 @@ ssh bosgame2 'sudo systemctl restart llama-rpc && systemctl is-active llama-rpc'
 stdbuf -oL -eL env \
   TBSTRIPE_SIMPLEX=master \
   GGML_RPC_SET_TENSOR_CHUNK=2048 \
-  LLAMA_MIRROR_OUTPUT_WEIGHT=1 \
   LLAMA_TP_MIRROR_GDN=1 \
   LLAMA_TP_MIRROR_DENSE=1 \
   GGML_CUDA_DISABLE_FUSION=1 \
@@ -400,30 +399,46 @@ Pid **291008** (small-burst, GRAPH_SEQ, HIP graphs): content **323**. `bench-tp.
 ### Failed speed levers — do not retry
 
 - **Old `GRAPH_SEQ` dummy-xchg protocol** — hung on USB4. **Working SEQ** (RPC 6.1.3): last-node `tbs_xchg`, skip when `ar_bytes=0`, next_uid, HIP on llama/worker compute threads. 17.48 tok/s, 323. Default on; `LLAMA_TP_NO_SEQ=1` disables.
-- **Drop `MIRROR_GDN`** (85 subgraphs, 3-rep pack) — **18.42 tok/s** but **CJK garbage / empty content**. Do not ship. Quality needs mirrored GDN or NSPLIT INNERN (97 subgraphs, ~8 tok/s).
+- **Drop `MIRROR_GDN`** (85 subgraphs, 3-rep pack or sequential-half concat) — up to **20.55 tok/s** but **CJK garbage / empty content**. Sequential d0\|d1 concat (pid 311450) and 1024-chunk 3-rep interleave (pid 309878) both fail 323. Do not ship. Quality needs mirrored GDN.
 - **Stable subgraph uids** `((n_subgraphs<<16)|(i+1))` — RECOMPUTE of T=8 prefill graphs onto T=1 decode buffers. Worker `k_set_rows<float,long,__half>` HSA aperture violation, systemd restart, client hung. Use `ggml_graph_next_uid()` on rebuild; skip-rebuild `graph_sig` still reuses uids for token 2+ of the **same** shape.
 - **HIP graphs** (`unset GGML_CUDA_DISABLE_GRAPHS`) — `GGML_ASSERT(node_props.size()==n_nodes)` with the stable-uid scheme; with next_uid not re-tested. Fusion stays disabled.
 - **Piggyback AllReduce on `GRAPH_RECOMPUTE`** (larger request + `tbs_xchg` after ACK) — worker `k_set_rows` fault even with `ar_bytes=0` while the enlarged struct was on the wire. Reverted RPC to committed 6.1.1 (`3eefc30e`). Do not enlarge `rpc_msg_graph_recompute_req`.
 - Rebuilding `libggml-hip` (even a 2-line graphs assert) produced md5 `eaee5820…` which also `k_set_rows`-faulted. Restore **`e03fcf630ee87717e278ae297d0d154d`** both nodes. Matching HIP is mandatory.
 
+### Beats `B_single` (2026-09-10, pid 314457)
+
+Drop `LLAMA_MIRROR_OUTPUT_WEIGHT`. Default `output.weight` split is AXIS_1 (vocab halves). Meta `get_tensor` concatenates the two shards for sampling. Experts stay split, GDN+dense stay mirrored, `n_subgraphs=49`, GTT **~40.70 / ~40.82 GiB**.
+
+| File | content | `predicted_per_second` | vs `B_single` 19.816 |
+|---|---|---|---|
+| `bench-single.json` | `323` | **19.816** | baseline |
+| `bench-tp.json` (warm) | **`323`** | **20.058** | **above** |
+| `bench-tp-2.json` (warm) | **`323`** | **20.108** | **above** |
+
+Cold POSTs on the same pid: 18.014 then 18.566 (HIP graph warmup). Recapture after ≥2 completions. `/completion` on the same pid: 20.062 tok/s, `323` in the think block.
+
+Decode GPU sample (`both-gpus.txt`): bosgame1 `gpu_busy_percent=14` GTT 43720032256; bosgame2 `=29` GTT 43838488576. rpc-server pid **595661**. `-sm rpc-tensor` `--stream /dev/tbstream0,/dev/tbstream1`. HIP `e03fcf630ee87717e278ae297d0d154d`. `libggml-rpc` `06feb0b4970d07433e5666db9ffcc091`, `libggml-base` `9609183fc2119e992a09894b6ded306e`.
+
+SEQ decode: `n=49 n_xchg=48 hip_us≈34.7 ms xchg_us≈1.8 ms tot_us≈38.0 ms`. Wall ~49.7 ms/token. USB4 is not the floor.
+
 ### Remaining
 
-1. **GDN-split AllGather is not 323 and is slower.** Pid **304455** (`NSPLIT`, no `MIRROR_GDN`): 3072 3-rep shard interleave-concat to sequential **6144** `gdn_x_full`, INNERN `xK=6144`, layer-1 `linear_attn_out` **after_set matched** both GPUs. Still empty content / garbage (`bench-gdnx-garbage-1.json`). **157 subgraphs**, decode ~8 tok/s, SEQ `xchg_us≈40 ms` (156 xchgs). Extra GDN-x + INNERN subgraphs eat the GDN compute save. Do not ship. Keep `MIRROR_GDN=1` for 323.
-2. USB4 xchg is ~1.7 ms/token on the mirrored-GDN speed path. Mirrored GDN + dual overhead floors decode at **~17.8 tok/s** (56 ms) vs `B_single` 19.816 (50.5 ms). Do not fake TP with replica or layer-split.
+1. **GDN-split AllGather is not 323.** `LLAMA_TP_MIRROR_SSM_OUT=1` without `MIRROR_GDN` (~85 subgraphs) hit **19.14 / 19.52** then sequential-half concat **20.23 / 20.55** tok/s but **empty content / CJK garbage** (`bench-lean3-1.json`). 1024-chunk 3-rep interleave was also garbage. Do not ship. Keep `MIRROR_GDN=1` for 323.
+2. NSPLIT INNERN (157 subgraphs) ~8 tok/s garbage. Extra GDN-x + INNERN subgraphs eat the GDN save.
 3. Unaligned PLE `node_206 (view)` still `META_BADPTR` on some taps; PLE kernel rows are aligned. Hunt only if quality regresses.
-4. SEQ, HIP graphs, last-node piggyback, and small-burst xchg are **on** and 323 with `MIRROR_GDN`. Do not revert to stable subgraph uids. Do not rebuild HIP off `e03fcf`.
+4. SEQ, HIP graphs, last-node piggyback, and small-burst xchg are **on**. Do not revert to stable subgraph uids. Do not rebuild HIP off `e03fcf`. Do not set `LLAMA_MIRROR_OUTPUT_WEIGHT` on the speed path.
 
 ## Files that matter
 
 | File | Role |
 |---|---|
-| `ggml/src/ggml-backend-meta.cpp` | split handlers, host-pack SET, INNERN native-1280 dest + SETCHK (NSPLIT-gated), FFN AR of MIRRORED `ffn_moe_out`, skip-rebuild `graph_sig`, HIP/RPC overlap, `ggml_graph_next_uid()` on rebuild |
-| `ggml/src/ggml-rpc/ggml-rpc.cpp` | USB4STREAM RPC, HC-only VIEW rebase, uid-keyed GRAPH_RECOMPUTE ring, last-node AR piggy, GRAPH_SEQ 6.1.3 |
-| `ggml/include/ggml-rpc.h` | `RPC_PROTO_PATCH_VERSION` 3 (6.1.3 GRAPH_SEQ) |
-| `tbstripe/src/tbstripe.c` | USB4STREAM simplex; concurrent windowed `tbs_xchg` (default window 4) |
+| `ggml/src/ggml-backend-meta.cpp` | split handlers, host-pack SET, INNERN native-1280 dest + SETCHK (NSPLIT-gated), FFN AR of MIRRORED `ffn_moe_out`, skip-rebuild `graph_sig`, HIP/RPC overlap, `ggml_graph_next_uid()` on rebuild, optional GDN-x 3072→6144 AG (`LLAMA_TP_MIRROR_SSM_OUT`, not 323) |
+| `ggml/src/ggml-rpc/ggml-rpc.cpp` | USB4STREAM RPC, HC-only VIEW rebase, uid-keyed GRAPH_RECOMPUTE ring, last-node AR piggy, GRAPH_SEQ 6.1.4 concat pad=1/2 |
+| `ggml/include/ggml-rpc.h` | `RPC_PROTO_PATCH_VERSION` 4 (6.1.4 GRAPH_SEQ concat) |
+| `tbstripe/src/tbstripe.c` | USB4STREAM simplex; sequential small-burst `tbs_xchg` (default window 4; do not concurrent TX+RX) |
 | `ggml/src/ggml-cuda/gated_delta_net.cu` | HIP GDN, pack_contiguous_f32, GDN_HIP/GDN_ACT logs |
-| `src/llama-model.cpp` | Qwen 3.5 `get_split_segments` |
-| `src/models/qwen4exp.cpp` | GDN graph, PLE kernel transpose for 16-byte views, `ggml_cont` Q/K/V, skip 3-rep pack when `MIRROR_GDN` without `SPLIT_SSM_OUT` |
+| `src/llama-model.cpp` | Qwen 3.5 `get_split_segments`; `LLAMA_TP_MIRROR_SSM_OUT` (experimental) |
+| `src/models/qwen4exp.cpp` | GDN graph, PLE kernel transpose for 16-byte views, `ggml_cont` Q/K/V, skip 3-rep pack when `ssm_out` is mirrored |
 | `tbstripe/` | USB4STREAM driver userspace / README |
 
 ## Non-goals

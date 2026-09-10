@@ -476,6 +476,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         static const bool mirror_all_env = getenv("LLAMA_TP_MIRROR_ALL") != nullptr;
         static const bool mirror_gdn_env = getenv("LLAMA_TP_MIRROR_GDN") != nullptr;
         static const bool mirror_dense_env = getenv("LLAMA_TP_MIRROR_DENSE") != nullptr;
+        static const bool mirror_ssm_out_env = getenv("LLAMA_TP_MIRROR_SSM_OUT") != nullptr;
         if (mirror_all_env && ud->model->arch == LLM_ARCH_QWEN4EXP) {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
         }
@@ -515,6 +516,10 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                     return qwen4exp_mirror();
                 }
             }
+        }
+        if (ud->model->arch == LLM_ARCH_QWEN4EXP && mirror_ssm_out_env &&
+                std::regex_match(tensor_name, pattern_ssm_out_weight)) {
+            return qwen4exp_mirror();
         }
         if (is_dsv4) {
             if (std::regex_match(tensor_name, pattern_kv_cache) ||
