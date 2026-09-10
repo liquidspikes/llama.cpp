@@ -14,8 +14,7 @@ Scratch benches live under `/tmp/grok-goal-f7d364922603/implementer/` on bosgame
 | Transport | `--stream /dev/tbstream0,/dev/tbstream1` |
 | Memory | both GPUs hold **~41 GiB GTT** (not ~84 GiB full replica) |
 | Quality | prompt `17 times 19` → **`message.content` contains `323`** and English |
-| Speed | Target: `predicted_per_second` **> 19.816** (`B_single`). Best true-TP decode: **17.08 / 17.09 tok/s** (pid 283027, HIP graphs + last-node AR piggyback, `bench-tp-2.json` / `bench-tp-3.json`). First POST **16.78** (`bench-tp.json`). **Does not beat `B_single`.** USB4 48× RECOMPUTE+xchg floor (~58.5 ms/token vs 50.5 ms). |
-| Repeat | same pid, POSTs 2–4 still **content 323** at **17.08–17.09 tok/s** |
+| Speed | Target: `predicted_per_second` **> 19.816** (`B_single`). Best true-TP **323** decode: **17.46 / 17.48 tok/s** (pid 284828 / recapture pid 287196, GRAPH_SEQ last-node xchg + HIP graphs). **Does not beat `B_single`.** GDN-split (no `MIRROR_GDN`) hit **18.42 tok/s** but **garbage**. USB4 + mirrored GDN floor ~57.2 ms/token vs 50.5 ms. Simplex `tbs_xchg` was 1:1 frame ping-pong (default `TBS_XCHG_WINDOW=1` on the client); concurrent windowed xchg is the next lever. |
 | GPUs | both `gpu_busy` non-zero during decode (`both-gpus.txt`) |
 
 Not a pass:
@@ -60,8 +59,10 @@ stdbuf -oL -eL env \
   TBSTRIPE_SIMPLEX=master \
   GGML_RPC_SET_TENSOR_CHUNK=2048 \
   LLAMA_MIRROR_OUTPUT_WEIGHT=1 \
+  LLAMA_TP_MIRROR_GDN=1 \
+  LLAMA_TP_MIRROR_DENSE=1 \
   GGML_CUDA_DISABLE_FUSION=1 \
-  GGML_CUDA_DISABLE_GRAPHS=1 \
+  TBS_XCHG_WINDOW=4 \
   LD_LIBRARY_PATH=/home/alexzimmerman/llama.cpp/build/bin:/usr/local/lib:/opt/rocm/core-10.0/lib \
   /home/alexzimmerman/llama.cpp/build/bin/llama-server \
     --stream /dev/tbstream0,/dev/tbstream1 \
@@ -364,22 +365,41 @@ GGML_CUDA_DISABLE_FUSION=1 GGML_CUDA_DISABLE_GRAPHS=1
 
 | File | pid | content | tok/s | vs `B_single` 19.816 |
 |---|---|---|---|---|
-| `bench-tp.json` | **283027** (graphs+piggy, capture) | **`323`** | **16.781** | below |
-| `bench-tp-2.json` | 283027 | **`323`** | **17.080** | below |
-| `bench-tp-3.json` | 283027 | **`323`** | **17.092** | below |
-| pid 281809 piggy only | 281809 | **`323`** | **14.96 / 14.91** | below |
-| pid 279954 next_uid only | 279954 | **`323`** | **13.65–14.24** | below |
+| `bench-tp.json` / `bench-tp-2.json` | **292466** SEQ+small-burst+async | **`323`** | **17.697 / 17.845** | below |
+| pid **291008** small-burst SEQ | 291008 | **`323`** | **17.150 / 18.128** | below |
+| pid **284828** GRAPH_SEQ+graphs | 284828 | **`323`** | **17.456 / 17.476** | below |
+| pid 283027 graphs+piggy | 283027 | **`323`** | **16.78 / 17.08 / 17.09** | below |
+| no `MIRROR_GDN` (85 subgraphs) | 286042 | **garbage / empty content** | **18.42** | n/a (not 323) |
 | earlier pid **264765** | 264765 | **`323`** | **17.64 / 17.96** | below |
 
-GTT local **43967000576** (~41.0 GiB), remote **44092813312** (~41.1 GiB). Decode `gpu_busy_percent` bosgame1 **4 then 8**, bosgame2 **5 then 9** (`both-gpus.txt`). Worker stays up (pid 519445). This is true TP, not replica.
+Pid 292466 GTT local **43982770176** (~41.0 GiB), remote **44108439552** (~41.1 GiB). Decode `gpu_busy_percent` bosgame1 **52 then 31**, bosgame2 **62 then 54** (`both-gpus.txt`). Worker rpc-server pid 552982. True TP, not replica. Still **< B_single**.
 
 Physics: 48 serial USB4 `GRAPH_RECOMPUTE` + xchg RTTs plus mirrored GDN (both GPUs do full GDN). 17.09 tok/s ≈ 58.5 ms/token vs 50.5 ms needed for 19.816. Do **not** relabel layer-split or replica as TP.
 
 Last-node AR piggyback (RPC 6.1.2): `rpc_msg_graph_recompute_req.ar_bytes` is 4 extra bytes. After RECOMPUTE ACK the worker `tbs_xchg`s the last F32/F16 node of the cached graph; the client `xchg_raw`s the local shard. No second `ALL_REDUCE` cmd. HIP graphs on both nodes (`UnsetEnvironment=GGML_CUDA_DISABLE_GRAPHS` on llama-rpc; client omits `GGML_CUDA_DISABLE_GRAPHS`). Fusion stays off. `ggml_graph_next_uid()` on rebuild (do not use stable `(n_subgraphs<<16)|i`).
 
+### GRAPH_SEQ (RPC 6.1.3)
+
+One `RPC_CMD_GRAPH_SEQ` after the ring is populated: payload is `device, n, [{uid, ar_bytes, pad}]`. Worker ACK then, per subgraph, `graph_recompute` + last-node `tbs_xchg` iff `ar_bytes>0` (no dummy xchg). Client HIP on the llama thread, then `xchg_raw`. Fall through to per-subgraph RECOMPUTE if any uid is not in `live_graph_uids` (first T=8 prefill). Default on unless `LLAMA_TP_NO_SEQ=1` or `LLAMA_TP_SSM_OUT_NSPLIT=1`. `RPC_PROTO_PATCH_VERSION` 3.
+
+Recapture pid **287196** (same env as 284828): `bench-tp.json` **17.284** tok/s content **323**; `bench-tp-2.json` **17.464** tok/s content **323**. GTT ~41.0 / ~41.1 GiB. Both GPUs 4–9% busy during decode. Still **< B_single**.
+
+`[RPC_SEQ]` hip vs xchg timing is logged for the first few tokens (`hip_us` / `xchg_us`).
+
+### Simplex xchg window (speed)
+
+`tbs_xchg_simplex` defaulted to `WINDOW=1` (TX one 4KiB frame, RX one, repeat). A 10 KiB FFN AllReduce is 3 frames = 3 USB4 RTTs. Worker already had `TBS_XCHG_WINDOW=4` via `llama-rpc.service.d/xchg-window.conf`; the client did not.
+
+**Do not** run TX and RX on two threads in one process — USB4STREAM deadlocks (pid 288767 spun on the first AllReduce, GPUs 0%, log stuck at `RESID ar_pre`). Sequential `WINDOW=total` of a **large** payload also deadlocks (fills the RX ring).
+
+Safe small-burst: if the whole xchg fits in **8 frames (32 KiB)**, TX all frames then RX all (one cable RTT). 3-frame AR fits. `TBS_XCHG_WINDOW=1` forces 1:1. `libtbstripe.so` md5 `f593d4d1276be41e565b41120119be31` both nodes. HIP remains `e03fcf630ee87717e278ae297d0d154d`.
+
+Pid **291008** (small-burst, GRAPH_SEQ, HIP graphs): content **323**. `bench-tp.json` **17.150** tok/s; `bench-tp-2.json` **18.128** tok/s (55.16 ms/token). Still **< B_single 19.816**. `[RPC_SEQ]` decode: `hip_us≈33800` `xchg_us≈1600–1800` `tot_us≈40000` for 48 AllReduces — USB4 is no longer the floor (~33 µs/xchg). Remaining gap is HIP D2H/H2D around AR (~4.6 ms of extra stream syncs) plus mirrored GDN. Both GPUs 4–9% busy, GTT ~41.0 / 41.1 GiB.
+
 ### Failed speed levers — do not retry
 
-- **`GRAPH_SEQ` (RPC 6.1.2)** — one SEQ cmd + per-subgraph `tbs_xchg`. Hung on USB4 xchg/ACK even with HIP on the llama thread and dispatcher-only xchg. Dummy in-place xchg deadlocked. Gated off; do not set `LLAMA_TP_SEQ=1`.
+- **Old `GRAPH_SEQ` dummy-xchg protocol** — hung on USB4. **Working SEQ** (RPC 6.1.3): last-node `tbs_xchg`, skip when `ar_bytes=0`, next_uid, HIP on llama/worker compute threads. 17.48 tok/s, 323. Default on; `LLAMA_TP_NO_SEQ=1` disables.
+- **Drop `MIRROR_GDN`** (85 subgraphs, 3-rep pack) — **18.42 tok/s** but **CJK garbage / empty content**. Do not ship. Quality needs mirrored GDN or NSPLIT INNERN (97 subgraphs, ~8 tok/s).
 - **Stable subgraph uids** `((n_subgraphs<<16)|(i+1))` — RECOMPUTE of T=8 prefill graphs onto T=1 decode buffers. Worker `k_set_rows<float,long,__half>` HSA aperture violation, systemd restart, client hung. Use `ggml_graph_next_uid()` on rebuild; skip-rebuild `graph_sig` still reuses uids for token 2+ of the **same** shape.
 - **HIP graphs** (`unset GGML_CUDA_DISABLE_GRAPHS`) — `GGML_ASSERT(node_props.size()==n_nodes)` with the stable-uid scheme; with next_uid not re-tested. Fusion stays disabled.
 - **Piggyback AllReduce on `GRAPH_RECOMPUTE`** (larger request + `tbs_xchg` after ACK) — worker `k_set_rows` fault even with `ar_bytes=0` while the enlarged struct was on the wire. Reverted RPC to committed 6.1.1 (`3eefc30e`). Do not enlarge `rpc_msg_graph_recompute_req`.
@@ -387,18 +407,19 @@ Last-node AR piggyback (RPC 6.1.2): `rpc_msg_graph_recompute_req.ar_bytes` is 4 
 
 ### Remaining
 
-1. Drop `MIRROR_GDN` once split GDN activations AllGather to 3-rep `x` matching 3-rep `W` (not required for 323 on the quality or speed path).
-2. USB4 AR count floors decode at **~14 tok/s** (historically 17.96 on pid 264765) vs `B_single` 19.816. Report, do not fake TP with replica.
+1. Drop `MIRROR_GDN` once split GDN activations AllGather to 3-rep `x` matching 3-rep `W` (not required for 323 on the quality or speed path). Extra GDN subgraphs without folding AllGather into the FFN xchg add RTTs; NSPLIT INNERN quality is ~8 tok/s.
+2. USB4 AR count + mirrored GDN floors decode at **~17.5 tok/s** (57.2 ms/token) vs `B_single` 19.816 (50.5 ms). Concurrent windowed `tbs_xchg` is the attempt to cut the 3-frame ping-pong. Report, do not fake TP with replica or layer-split.
 3. Unaligned PLE `node_206 (view)` still `META_BADPTR` on some taps; PLE kernel rows are aligned. Hunt only if quality regresses.
-4. Do not re-enable SEQ, HIP graphs, or RECOMPUTE piggyback without a new isolation that does not replay T=8 graphs on T=1.
+4. SEQ, HIP graphs, and last-node piggyback are **on** and 323. Do not revert to stable subgraph uids. Do not enlarge `rpc_msg_graph_recompute_req` beyond `ar_bytes`. Do not rebuild HIP off `e03fcf`.
 
 ## Files that matter
 
 | File | Role |
 |---|---|
 | `ggml/src/ggml-backend-meta.cpp` | split handlers, host-pack SET, INNERN native-1280 dest + SETCHK (NSPLIT-gated), FFN AR of MIRRORED `ffn_moe_out`, skip-rebuild `graph_sig`, HIP/RPC overlap, `ggml_graph_next_uid()` on rebuild |
-| `ggml/src/ggml-rpc/ggml-rpc.cpp` | USB4STREAM RPC, HC-only VIEW rebase, uid-keyed GRAPH_RECOMPUTE ring (RPC 6.1.1, md5 `3eefc30e`) |
-| `ggml/include/ggml-rpc.h` | `RPC_PROTO_PATCH_VERSION` 1 (committed 6.1.1; do not bump for SEQ/piggy) |
+| `ggml/src/ggml-rpc/ggml-rpc.cpp` | USB4STREAM RPC, HC-only VIEW rebase, uid-keyed GRAPH_RECOMPUTE ring, last-node AR piggy, GRAPH_SEQ 6.1.3 |
+| `ggml/include/ggml-rpc.h` | `RPC_PROTO_PATCH_VERSION` 3 (6.1.3 GRAPH_SEQ) |
+| `tbstripe/src/tbstripe.c` | USB4STREAM simplex; concurrent windowed `tbs_xchg` (default window 4) |
 | `ggml/src/ggml-cuda/gated_delta_net.cu` | HIP GDN, pack_contiguous_f32, GDN_HIP/GDN_ACT logs |
 | `src/llama-model.cpp` | Qwen 3.5 `get_split_segments` |
 | `src/models/qwen4exp.cpp` | GDN graph, PLE kernel transpose for 16-byte views, `ggml_cont` Q/K/V, skip 3-rep pack when `MIRROR_GDN` without `SPLIT_SSM_OUT` |

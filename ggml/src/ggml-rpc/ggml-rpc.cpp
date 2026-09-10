@@ -22,6 +22,7 @@
 #include <filesystem>
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <thread>
 #if defined(__x86_64__) || defined(_M_X64)
@@ -154,6 +155,7 @@ enum rpc_cmd {
     RPC_CMD_GRAPH_RECOMPUTE,
     RPC_CMD_MEMSET_TENSOR,
     RPC_CMD_ALL_REDUCE,
+    RPC_CMD_GRAPH_SEQ,
     RPC_CMD_NONE,
     RPC_CMD_COUNT,
 };
@@ -1584,6 +1586,7 @@ public:
     bool graph_compute_chunk(const std::vector<uint8_t> & input);
     bool graph_recompute(const rpc_msg_graph_recompute_req & request);
     bool allreduce_last(socket_ptr sock, uint32_t device, uint64_t uid, uint32_t ar_bytes);
+    bool graph_seq(const std::vector<uint8_t> & input, socket_ptr sock);
     bool init_tensor(const rpc_msg_init_tensor_req & request);
     bool get_alloc_size(const rpc_msg_get_alloc_size_req & request, rpc_msg_get_alloc_size_rsp & response);
     bool get_device_memory(const rpc_msg_get_device_memory_req & request, rpc_msg_get_device_memory_rsp & response);
@@ -2451,13 +2454,24 @@ bool rpc_server::allreduce_last(socket_ptr sock, uint32_t device, uint64_t uid, 
     }
     if (ar == nullptr) {
         GGML_LOG_ERROR("RECOMPUTE AR: no last F32/F16 node with %u bytes (dummy xchg)\n", ar_bytes);
-        std::vector<uint8_t> dummy(ar_bytes, 0);
-        std::vector<uint8_t> peer(ar_bytes);
+        static thread_local std::vector<uint8_t> dummy;
+        static thread_local std::vector<uint8_t> peer;
+        dummy.assign(ar_bytes, 0);
+        if (peer.size() < ar_bytes) {
+            peer.resize(ar_bytes);
+        }
         return sock->xchg(dummy.data(), peer.data(), ar_bytes);
     }
-    std::vector<uint8_t> local_data(ar_bytes);
-    std::vector<uint8_t> peer_data(ar_bytes);
-    ggml_backend_tensor_get(ar, local_data.data(), 0, ar_bytes);
+    static thread_local std::vector<uint8_t> local_data;
+    static thread_local std::vector<uint8_t> peer_data;
+    if (local_data.size() < ar_bytes) {
+        local_data.resize(ar_bytes);
+    }
+    if (peer_data.size() < ar_bytes) {
+        peer_data.resize(ar_bytes);
+    }
+    ggml_backend_tensor_get_async(backends[device], ar, local_data.data(), 0, ar_bytes);
+    ggml_backend_synchronize(backends[device]);
     if (!sock->xchg(local_data.data(), peer_data.data(), ar_bytes)) {
         GGML_LOG_ERROR("RECOMPUTE AR tbs_xchg failed bytes=%u\n", ar_bytes);
         return false;
@@ -2469,7 +2483,49 @@ bool rpc_server::allreduce_last(socket_ptr sock, uint32_t device, uint64_t uid, 
         allreduce_add_f16((ggml_fp16_t *) local_data.data(),
                 (const ggml_fp16_t *) peer_data.data(), ar_bytes / sizeof(ggml_fp16_t));
     }
-    ggml_backend_tensor_set(ar, local_data.data(), 0, ar_bytes);
+    ggml_backend_tensor_set_async(backends[device], ar, local_data.data(), 0, ar_bytes);
+    return true;
+}
+
+bool rpc_server::graph_seq(const std::vector<uint8_t> & input, socket_ptr sock) {
+    if (input.size() < 8) {
+        return false;
+    }
+    uint32_t device = 0, n = 0;
+    memcpy(&device, input.data(), 4);
+    memcpy(&n, input.data() + 4, 4);
+    if (device >= backends.size() || n == 0 || n > RPC_GRAPH_RING) {
+        return false;
+    }
+    struct seq_item {
+        uint64_t uid;
+        uint32_t ar_bytes;
+        uint32_t pad;
+    };
+    if (input.size() < 8 + n * sizeof(seq_item)) {
+        return false;
+    }
+    const uint8_t ack1 = 1;
+    if (!send_msg(sock, &ack1, 1, RPC_CHANNEL_CONTROL)) {
+        return false;
+    }
+    for (uint32_t i = 0; i < n; i++) {
+        seq_item it;
+        memcpy(&it, input.data() + 8 + i * sizeof(seq_item), sizeof(it));
+        rpc_msg_graph_recompute_req req{};
+        req.device = device;
+        req.uid = it.uid;
+        req.ar_bytes = 0;
+        if (!graph_recompute(req)) {
+            return false;
+        }
+        if (it.ar_bytes == 0) {
+            continue;
+        }
+        if (!allreduce_last(sock, device, it.uid, it.ar_bytes)) {
+            return false;
+        }
+    }
     return true;
 }
 
@@ -2779,6 +2835,16 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                     if (!server.allreduce_last(sock, request.device, request.uid, request.ar_bytes)) {
                         return;
                     }
+                }
+                break;
+            }
+            case RPC_CMD_GRAPH_SEQ: {
+                std::vector<uint8_t> input;
+                if (!recv_msg(sock, input, cmd_channel)) {
+                    return;
+                }
+                if (!server.graph_seq(input, sock)) {
+                    return;
                 }
                 break;
             }
@@ -3207,6 +3273,134 @@ GGML_BACKEND_API bool ggml_backend_rpc_comm_finish_ar(void * comm_ctx, struct gg
     return true;
 }
 
+GGML_BACKEND_API bool ggml_backend_rpc_comm_graph_seq(
+        void * comm_ctx,
+        ggml_backend_t local_backend,
+        ggml_cgraph ** local_graphs,
+        ggml_tensor ** local_ar,
+        uint64_t * rpc_uids,
+        ggml_tensor ** rpc_ar,
+        size_t n) {
+    GGML_UNUSED(rpc_ar);
+    if (comm_ctx == nullptr || local_backend == nullptr || n == 0 || n > RPC_GRAPH_RING) {
+        return false;
+    }
+    rpc_comm_context * ctx = (rpc_comm_context *) comm_ctx;
+    ggml_backend_t rpc_backend = nullptr;
+    for (ggml_backend_t b : ctx->backends) {
+        if (ggml_backend_is_rpc(b)) {
+            rpc_backend = b;
+            break;
+        }
+    }
+    if (rpc_backend == nullptr) {
+        return false;
+    }
+    ggml_backend_rpc_context * rpc_ctx = (ggml_backend_rpc_context *) rpc_backend->context;
+    ggml_backend_dev_t rpc_dev = ggml_backend_get_device(rpc_backend);
+    ggml_backend_rpc_device_context * rpc_dev_ctx =
+            (ggml_backend_rpc_device_context *) rpc_dev->context;
+    for (size_t i = 0; i < n; i++) {
+        if (rpc_uids[i] == 0 ||
+                rpc_dev_ctx->live_graph_uids.find(rpc_uids[i]) == rpc_dev_ctx->live_graph_uids.end()) {
+            return false;
+        }
+    }
+    struct seq_item {
+        uint64_t uid;
+        uint32_t ar_bytes;
+        uint32_t pad;
+    };
+    std::vector<uint8_t> payload(8 + n * sizeof(seq_item));
+    uint32_t device = rpc_ctx->device;
+    uint32_t nn = (uint32_t) n;
+    memcpy(payload.data(), &device, 4);
+    memcpy(payload.data() + 4, &nn, 4);
+    for (size_t i = 0; i < n; i++) {
+        seq_item it{};
+        it.uid = rpc_uids[i];
+        it.ar_bytes = (local_ar[i] != nullptr) ? (uint32_t) ggml_nbytes(local_ar[i]) : 0;
+        it.pad = 0;
+        memcpy(payload.data() + 8 + i * sizeof(seq_item), &it, sizeof(it));
+    }
+    uint8_t ack = 0;
+    auto payload_ptr = std::make_shared<std::vector<uint8_t>>(std::move(payload));
+    rpc_ctx->dispatcher->send(RPC_CMD_GRAPH_SEQ,
+            std::shared_ptr<const void>(payload_ptr, payload_ptr->data()),
+            payload_ptr->size(), &ack, sizeof(ack));
+    if (ack != 1) {
+        return false;
+    }
+    static int nseq;
+    if (nseq < 4) {
+        nseq++;
+        fprintf(stderr, "[RPC_SEQ] n=%zu\n", n);
+    }
+    static thread_local std::vector<uint8_t> local_data;
+    static thread_local std::vector<uint8_t> peer_data;
+    using clock = std::chrono::steady_clock;
+    const auto t_seq0 = clock::now();
+    long hip_us = 0;
+    long xchg_us = 0;
+    int n_xchg = 0;
+    for (size_t i = 0; i < n; i++) {
+        const uint32_t ar_bytes = (local_ar[i] != nullptr) ? (uint32_t) ggml_nbytes(local_ar[i]) : 0;
+        if (local_graphs[i] != nullptr && local_graphs[i]->n_nodes > 0) {
+            const auto t0 = clock::now();
+            const ggml_status st = ggml_backend_graph_compute_async(local_backend, local_graphs[i]);
+            if (st != GGML_STATUS_SUCCESS) {
+                return false;
+            }
+            if (ar_bytes == 0) {
+                continue;
+            }
+            if (local_data.size() < ar_bytes) {
+                local_data.resize(ar_bytes);
+            }
+            if (peer_data.size() < ar_bytes) {
+                peer_data.resize(ar_bytes);
+            }
+            ggml_backend_tensor_get_async(local_backend, local_ar[i], local_data.data(), 0, ar_bytes);
+            ggml_backend_synchronize(local_backend);
+            hip_us += (long) std::chrono::duration_cast<std::chrono::microseconds>(clock::now() - t0).count();
+        } else if (ar_bytes == 0) {
+            continue;
+        } else {
+            if (local_data.size() < ar_bytes) {
+                local_data.resize(ar_bytes);
+            }
+            if (peer_data.size() < ar_bytes) {
+                peer_data.resize(ar_bytes);
+            }
+            ggml_backend_tensor_get_async(local_backend, local_ar[i], local_data.data(), 0, ar_bytes);
+            ggml_backend_synchronize(local_backend);
+        }
+        const auto tx0 = clock::now();
+        rpc_ctx->dispatcher->xchg_raw(local_data.data(), peer_data.data(), ar_bytes);
+        xchg_us += (long) std::chrono::duration_cast<std::chrono::microseconds>(clock::now() - tx0).count();
+        n_xchg++;
+        if (local_ar[i]->type == GGML_TYPE_F32) {
+            allreduce_add_f32((float *) local_data.data(),
+                    (const float *) peer_data.data(), ar_bytes / sizeof(float));
+        } else if (local_ar[i]->type == GGML_TYPE_F16) {
+            allreduce_add_f16((ggml_fp16_t *) local_data.data(),
+                    (const ggml_fp16_t *) peer_data.data(), ar_bytes / sizeof(ggml_fp16_t));
+        } else {
+            return false;
+        }
+        ggml_backend_tensor_set_async(local_backend, local_ar[i], local_data.data(), 0, ar_bytes);
+    }
+    ggml_backend_synchronize(local_backend);
+    static int ntime;
+    if (ntime < 6) {
+        ntime++;
+        const long tot_us = (long) std::chrono::duration_cast<std::chrono::microseconds>(clock::now() - t_seq0).count();
+        fprintf(stderr, "[RPC_SEQ] n=%zu n_xchg=%d hip_us=%ld xchg_us=%ld tot_us=%ld\n",
+                n, n_xchg, hip_us, xchg_us, tot_us);
+    }
+    return true;
+}
+
 static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     if (std::strcmp(name, "ggml_backend_comm_init") == 0) {
         return (void *)ggml_backend_rpc_comm_init;
@@ -3222,6 +3416,9 @@ static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const ch
     }
     if (std::strcmp(name, "ggml_backend_comm_finish_ar") == 0) {
         return (void *)ggml_backend_rpc_comm_finish_ar;
+    }
+    if (std::strcmp(name, "ggml_backend_comm_graph_seq") == 0) {
+        return (void *)ggml_backend_rpc_comm_graph_seq;
     }
     if (std::strcmp(name, "ggml_backend_rpc_add_server") == 0) {
         return (void *)ggml_backend_rpc_add_server;

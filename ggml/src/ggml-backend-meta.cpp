@@ -2880,6 +2880,13 @@ struct ggml_backend_meta_context {
     comm_graph_seq_t                     comm_graph_seq = nullptr;
     comm_set_pending_ar_t                comm_set_pending_ar = nullptr;
     comm_finish_ar_t                     comm_finish_ar      = nullptr;
+    bool                                 seq_plan_valid = false;
+    size_t                               seq_j_local    = 0;
+    size_t                               seq_j_rpc      = 0;
+    std::vector<ggml_cgraph *>           seq_local_gs;
+    std::vector<ggml_tensor *>           seq_local_ar;
+    std::vector<uint64_t>                seq_rpc_uids;
+    std::vector<ggml_tensor *>           seq_rpc_ar;
 
     ggml_backend_meta_context(ggml_backend_dev_t meta_dev, const char * params) {
         const size_t n_devs = ggml_backend_meta_dev_n_devs(meta_dev);
@@ -3101,6 +3108,9 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     }
     const bool needs_rebuild = (backend_ctx->n_subgraphs == 0) || (graph_sig != backend_ctx->graph_sig);
     backend_ctx->graph_sig = graph_sig;
+    if (needs_rebuild) {
+        backend_ctx->seq_plan_valid = false;
+    }
     if (!needs_rebuild) {
         static int nreuse;
         if (nreuse < 8) {
@@ -3810,7 +3820,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
 
     if (backend_ctx->comm_graph_seq != nullptr && backend_ctx->comm_ctx != nullptr &&
             backend_ctx->n_subgraphs >= 2 && n_backends >= 2 &&
-            getenv("LLAMA_TP_SEQ") != nullptr &&
+            getenv("LLAMA_TP_NO_SEQ") == nullptr &&
             getenv("LLAMA_TP_SSM_OUT_NSPLIT") == nullptr) {
         size_t j_local = n_backends, j_rpc = n_backends;
         for (size_t j = 0; j < n_backends; j++) {
@@ -3824,52 +3834,65 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         }
         if (j_local < n_backends && j_rpc < n_backends) {
             const size_t ns = backend_ctx->n_subgraphs;
-            std::vector<ggml_cgraph *> local_gs(ns, nullptr);
-            std::vector<ggml_tensor *> local_ar(ns, nullptr);
-            std::vector<uint64_t> rpc_uids(ns, 0);
-            std::vector<ggml_tensor *> rpc_ar(ns, nullptr);
-            bool seq_ok = true;
-            for (size_t i = 0; i < ns; i++) {
-                ggml_cgraph * lg = backend_ctx->backend_configs[j_local].cgraphs[i].cgraph_main;
-                ggml_cgraph * rg = backend_ctx->backend_configs[j_rpc].cgraphs[i].cgraph_main;
-                local_gs[i] = lg;
-                if (rg == nullptr || rg->uid == 0) {
-                    seq_ok = false;
-                    break;
+            if (!backend_ctx->seq_plan_valid || backend_ctx->seq_local_gs.size() != ns ||
+                    backend_ctx->seq_j_local != j_local || backend_ctx->seq_j_rpc != j_rpc) {
+                backend_ctx->seq_local_gs.assign(ns, nullptr);
+                backend_ctx->seq_local_ar.assign(ns, nullptr);
+                backend_ctx->seq_rpc_uids.assign(ns, 0);
+                backend_ctx->seq_rpc_ar.assign(ns, nullptr);
+                bool seq_ok = true;
+                for (size_t i = 0; i < ns; i++) {
+                    ggml_cgraph * lg = backend_ctx->backend_configs[j_local].cgraphs[i].cgraph_main;
+                    ggml_cgraph * rg = backend_ctx->backend_configs[j_rpc].cgraphs[i].cgraph_main;
+                    backend_ctx->seq_local_gs[i] = lg;
+                    if (rg == nullptr || rg->uid == 0) {
+                        seq_ok = false;
+                        break;
+                    }
+                    backend_ctx->seq_rpc_uids[i] = rg->uid;
+                    if (i + 1 >= ns) {
+                        continue;
+                    }
+                    const size_t i_node_stop = backend_ctx->backend_configs[0].cgraphs[i + 1].offset;
+                    if (i_node_stop == 0) {
+                        continue;
+                    }
+                    ggml_tensor * orig_last = cgraph->nodes[i_node_stop - 1];
+                    if (orig_last == nullptr) {
+                        continue;
+                    }
+                    const ggml_backend_meta_split_axis last_axis =
+                        ggml_backend_meta_get_split_state(orig_last, /*assume_sync =*/ false).axis;
+                    const bool last_partial = last_axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL;
+                    const bool last_ffn = strstr(orig_last->name, "ffn_moe") != nullptr;
+                    if (!last_partial && !last_ffn) {
+                        continue;
+                    }
+                    backend_ctx->seq_local_ar[i] = ggml_backend_meta_buffer_simple_tensor(orig_last, j_local);
+                    backend_ctx->seq_rpc_ar[i] = ggml_backend_meta_buffer_simple_tensor(orig_last, j_rpc);
                 }
-                rpc_uids[i] = rg->uid;
-                if (i + 1 >= ns) {
-                    continue;
+                if (seq_ok) {
+                    backend_ctx->seq_plan_valid = true;
+                    backend_ctx->seq_j_local = j_local;
+                    backend_ctx->seq_j_rpc = j_rpc;
+                } else {
+                    backend_ctx->seq_plan_valid = false;
                 }
-                const size_t i_node_stop = backend_ctx->backend_configs[0].cgraphs[i + 1].offset;
-                if (i_node_stop == 0) {
-                    continue;
-                }
-                ggml_tensor * orig_last = cgraph->nodes[i_node_stop - 1];
-                if (orig_last == nullptr) {
-                    continue;
-                }
-                const ggml_backend_meta_split_axis last_axis =
-                    ggml_backend_meta_get_split_state(orig_last, /*assume_sync =*/ false).axis;
-                const bool last_partial = last_axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL;
-                const bool last_ffn = strstr(orig_last->name, "ffn_moe") != nullptr;
-                if (!last_partial && !last_ffn) {
-                    continue;
-                }
-                local_ar[i] = ggml_backend_meta_buffer_simple_tensor(orig_last, j_local);
-                rpc_ar[i] = ggml_backend_meta_buffer_simple_tensor(orig_last, j_rpc);
             }
-            if (seq_ok) {
+            if (backend_ctx->seq_plan_valid) {
                 static int nseq;
                 if (nseq < 4) {
                     nseq++;
-                    fprintf(stderr, "[META_SEQ] n_subgraphs=%zu\n", ns);
+                    fprintf(stderr, "[META_SEQ] n_subgraphs=%zu cached=%d\n",
+                            ns, nseq > 1 ? 1 : 0);
                 }
                 if (backend_ctx->comm_graph_seq(backend_ctx->comm_ctx,
                         backend_ctx->backend_configs[j_local].backend,
-                        local_gs.data(), local_ar.data(), rpc_uids.data(), rpc_ar.data(), ns)) {
+                        backend_ctx->seq_local_gs.data(), backend_ctx->seq_local_ar.data(),
+                        backend_ctx->seq_rpc_uids.data(), backend_ctx->seq_rpc_ar.data(), ns)) {
                     return GGML_STATUS_SUCCESS;
                 }
+                backend_ctx->seq_plan_valid = false;
                 static int nseq_skip;
                 if (nseq_skip < 4) {
                     nseq_skip++;
