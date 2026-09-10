@@ -14,8 +14,8 @@ Scratch benches live under `/tmp/grok-goal-f7d364922603/implementer/` on bosgame
 | Transport | `--stream /dev/tbstream0,/dev/tbstream1` |
 | Memory | both GPUs hold **~41 GiB GTT** (not ~84 GiB full replica) |
 | Quality | prompt `17 times 19` → **`message.content` contains `323`** and English |
-| Speed | Target: `predicted_per_second` **> 19.816** (`B_single`). Best true-TP decode: **13.65 / 13.85 / 14.24 tok/s** (pid 279954, `bench-tp.json` + `bench-tp-2.json` + `bench-tp-3.json`). Earlier same-path pid 264765 hit **17.64 / 17.96 tok/s**. **Neither beats `B_single`.** USB4 AR floor, not a quality miss. |
-| Repeat | same pid, second and third POST still **content 323** |
+| Speed | Target: `predicted_per_second` **> 19.816** (`B_single`). Best true-TP decode: **17.08 / 17.09 tok/s** (pid 283027, HIP graphs + last-node AR piggyback, `bench-tp-2.json` / `bench-tp-3.json`). First POST **16.78** (`bench-tp.json`). **Does not beat `B_single`.** USB4 48× RECOMPUTE+xchg floor (~58.5 ms/token vs 50.5 ms). |
+| Repeat | same pid, POSTs 2–4 still **content 323** at **17.08–17.09 tok/s** |
 | GPUs | both `gpu_busy` non-zero during decode (`both-gpus.txt`) |
 
 Not a pass:
@@ -364,14 +364,18 @@ GGML_CUDA_DISABLE_FUSION=1 GGML_CUDA_DISABLE_GRAPHS=1
 
 | File | pid | content | tok/s | vs `B_single` 19.816 |
 |---|---|---|---|---|
-| `bench-tp.json` | **279954** | **`323`** | **13.649** | below |
-| `bench-tp-2.json` | 279954 | **`323`** | **13.851** | below |
-| `bench-tp-3.json` | 279954 | **`323`** | **14.236** | below |
-| earlier `bench-tp-2.json` (overwritten) | **264765** | **`323`** | **17.961** | below |
+| `bench-tp.json` | **283027** (graphs+piggy, capture) | **`323`** | **16.781** | below |
+| `bench-tp-2.json` | 283027 | **`323`** | **17.080** | below |
+| `bench-tp-3.json` | 283027 | **`323`** | **17.092** | below |
+| pid 281809 piggy only | 281809 | **`323`** | **14.96 / 14.91** | below |
+| pid 279954 next_uid only | 279954 | **`323`** | **13.65–14.24** | below |
+| earlier pid **264765** | 264765 | **`323`** | **17.64 / 17.96** | below |
 
 GTT local **43967000576** (~41.0 GiB), remote **44092813312** (~41.1 GiB). Decode `gpu_busy_percent` bosgame1 **4 then 8**, bosgame2 **5 then 9** (`both-gpus.txt`). Worker stays up (pid 519445). This is true TP, not replica.
 
-Physics: 48 serial USB4 `GRAPH_RECOMPUTE` + AllReduce RTTs plus mirrored GDN (both GPUs do full GDN). 14 tok/s ≈ 71 ms/token vs 50.5 ms needed for 19.816. Do **not** relabel layer-split or replica as TP.
+Physics: 48 serial USB4 `GRAPH_RECOMPUTE` + xchg RTTs plus mirrored GDN (both GPUs do full GDN). 17.09 tok/s ≈ 58.5 ms/token vs 50.5 ms needed for 19.816. Do **not** relabel layer-split or replica as TP.
+
+Last-node AR piggyback (RPC 6.1.2): `rpc_msg_graph_recompute_req.ar_bytes` is 4 extra bytes. After RECOMPUTE ACK the worker `tbs_xchg`s the last F32/F16 node of the cached graph; the client `xchg_raw`s the local shard. No second `ALL_REDUCE` cmd. HIP graphs on both nodes (`UnsetEnvironment=GGML_CUDA_DISABLE_GRAPHS` on llama-rpc; client omits `GGML_CUDA_DISABLE_GRAPHS`). Fusion stays off. `ggml_graph_next_uid()` on rebuild (do not use stable `(n_subgraphs<<16)|i`).
 
 ### Failed speed levers — do not retry
 
