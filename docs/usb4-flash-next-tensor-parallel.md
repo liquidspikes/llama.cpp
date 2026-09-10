@@ -10,12 +10,12 @@ Scratch benches live under `/tmp/grok-goal-f7d364922603/implementer/` on bosgame
 
 | Gate | Pass |
 |---|---|
-| Split | `-sm rpc-tensor` (not `layer`). Speed path: `LLAMA_TP_MIRROR_GDN=1 LLAMA_TP_MIRROR_DENSE=1` (experts split). **Do not set `LLAMA_MIRROR_OUTPUT_WEIGHT`** — `output.weight` stays AXIS_1 (vocab split). |
+| Split | `-sm rpc-tensor` (not `layer`). `LLAMA_TP_MIRROR_GDN=1 LLAMA_TP_MIRROR_DENSE=1` (experts split). **Do not set `LLAMA_MIRROR_OUTPUT_WEIGHT`**. **Do not set `GGML_CUDA_DISABLE_FUSION`** (HIP fusion on). |
 | Transport | `--stream /dev/tbstream0,/dev/tbstream1` |
 | Memory | both GPUs hold **~40.7 GiB GTT** (not ~84 GiB full replica) |
 | Quality | prompt `17 times 19` → **`message.content` contains `323`** and English |
-| Speed | Target: `predicted_per_second` **> 19.816** (`B_single`). **Pass (warmed decode):** pid **314457** `bench-tp.json` **20.058** tok/s, `bench-tp-2.json` **20.108** tok/s, content **`323`** both. First 1–2 POSTs after load are slower (~18 tok/s) until HIP graphs warm up; recapture after a couple of 17×19 completions. |
-| GPUs | both `gpu_busy` non-zero during decode (`both-gpus.txt`) |
+| Speed | Same-session `B_single` **20.929** tok/s (`bench-single.json`, fp `b191-833d4bfe4`, warm POST 3). Dual-node warm: `bench-tp.json` **21.262**, `bench-tp-2.json` **21.287**, content **`323`**, both **> B_single**. First TP POST after load can sit at ~20.85; recapture after one warmup completion. |
+| GPUs | both `gpu_busy` non-zero during decode (`both-gpus.txt`, 57% / 67%) |
 
 Not a pass:
 
@@ -60,7 +60,6 @@ stdbuf -oL -eL env \
   GGML_RPC_SET_TENSOR_CHUNK=2048 \
   LLAMA_TP_MIRROR_GDN=1 \
   LLAMA_TP_MIRROR_DENSE=1 \
-  GGML_CUDA_DISABLE_FUSION=1 \
   TBS_XCHG_WINDOW=4 \
   LD_LIBRARY_PATH=/home/alexzimmerman/llama.cpp/build/bin:/usr/local/lib:/opt/rocm/core-10.0/lib \
   /home/alexzimmerman/llama.cpp/build/bin/llama-server \
@@ -76,7 +75,7 @@ stdbuf -oL -eL env \
 
 HIP rebuild ⇒ matching `libggml-hip` on **both** nodes. Copy `libggml-rpc` / `libggml-base` to bosgame2 `/usr/local/lib` **and** `llama.cpp/build/bin` as **two separate `cp`s**. Never two destinations in one `cp`.
 
-Worker unit (bosgame2): `ExecStart=/usr/local/bin/rpc-server -s /dev/tbstream0,/dev/tbstream1 -d ROCm0 --cache-dir /home/alexzimmerman/models/cache`, `LD_LIBRARY_PATH=/usr/local/lib`, `TBSTRIPE_SIMPLEX=worker`, `TimeoutStopSec=3`. RPC tensor cache is keyed by **payload hash**, so a new packed shard misses and is fine; a same-bytes shard hits and is also fine.
+Worker unit (bosgame2): `ExecStart=/usr/local/bin/rpc-server -s /dev/tbstream0,/dev/tbstream1 -d ROCm0 --cache-dir /home/alexzimmerman/models/cache`, `LD_LIBRARY_PATH=/usr/local/lib`, `TBSTRIPE_SIMPLEX=worker`, `TimeoutStopSec=3`. Drop-ins: `graphs-on.conf` and `fusion-on.conf` `UnsetEnvironment` `GGML_CUDA_DISABLE_GRAPHS` and `GGML_CUDA_DISABLE_FUSION` (HIP graphs + fusion on). RPC tensor cache is keyed by **payload hash**, so a new packed shard misses and is fine; a same-bytes shard hits and is also fine.
 
 DFlash is 27B-only. Flash-Next serving is rpc-tensor. MTP / draft-mtp off. Do not apply `scratch/patch_*.py`.
 
@@ -405,28 +404,26 @@ Pid **291008** (small-burst, GRAPH_SEQ, HIP graphs): content **323**. `bench-tp.
 - **Piggyback AllReduce on `GRAPH_RECOMPUTE`** (larger request + `tbs_xchg` after ACK) — worker `k_set_rows` fault even with `ar_bytes=0` while the enlarged struct was on the wire. Reverted RPC to committed 6.1.1 (`3eefc30e`). Do not enlarge `rpc_msg_graph_recompute_req`.
 - Rebuilding `libggml-hip` (even a 2-line graphs assert) produced md5 `eaee5820…` which also `k_set_rows`-faulted. Restore **`e03fcf630ee87717e278ae297d0d154d`** both nodes. Matching HIP is mandatory.
 
-### Beats `B_single` (2026-09-10, pid 314457)
+### Beats same-session `B_single` (2026-09-10, pid 322824)
 
-Drop `LLAMA_MIRROR_OUTPUT_WEIGHT`. Default `output.weight` split is AXIS_1 (vocab halves). Meta `get_tensor` concatenates the two shards for sampling. Experts stay split, GDN+dense stay mirrored, `n_subgraphs=49`, GTT **~40.70 / ~40.82 GiB**.
+Same binary fingerprint `b191-833d4bfe4`. Recapture single-node (`-dev ROCm0`, no `--stream`, fusion off) then USB4-safe bounce to rpc-tensor. Dual-node: no `LLAMA_MIRROR_OUTPUT_WEIGHT`, **HIP fusion on**, graphs on, `MIRROR_GDN`+`MIRROR_DENSE`. Warmup: two 17×19 POSTs, then two official.
 
-| File | content | `predicted_per_second` | vs `B_single` 19.816 |
-|---|---|---|---|
-| `bench-single.json` | `323` | **19.816** | baseline |
-| `bench-tp.json` (warm) | **`323`** | **20.058** | **above** |
-| `bench-tp-2.json` (warm) | **`323`** | **20.108** | **above** |
+| File | content | `predicted_n` | `predicted_per_second` | vs `B_single` 20.929 |
+|---|---|---|---|---|
+| `bench-single.json` (warm POST 3) | `323` | 37 | **20.929** | baseline |
+| `bench-tp.json` (warm POST 3) | **`323`** | 55 | **21.262** | **above** |
+| `bench-tp-2.json` (warm POST 4) | **`323`** | 55 | **21.287** | **above** |
 
-Cold POSTs on the same pid: 18.014 then 18.566 (HIP graph warmup). Recapture after ≥2 completions. `/completion` on the same pid: 20.062 tok/s, `323` in the think block.
+Fusion-off TP on the same protocol was **18.11 / 17.99** (below). Fusion cut SEQ `hip_us` 34.6→31.7 ms. First TP POST after load **20.847** (just under); recapture after one warmup.
 
-Decode GPU sample (`both-gpus.txt`): bosgame1 `gpu_busy_percent=14` GTT 43720032256; bosgame2 `=29` GTT 43838488576. rpc-server pid **595661**. `-sm rpc-tensor` `--stream /dev/tbstream0,/dev/tbstream1`. HIP `e03fcf630ee87717e278ae297d0d154d`. `libggml-rpc` `06feb0b4970d07433e5666db9ffcc091`, `libggml-base` `9609183fc2119e992a09894b6ded306e`.
-
-SEQ decode: `n=49 n_xchg=48 hip_us≈34.7 ms xchg_us≈1.8 ms tot_us≈38.0 ms`. Wall ~49.7 ms/token. USB4 is not the floor.
+Decode GPU (`both-gpus.txt`): bosgame1 `gpu_busy_percent=57` GTT 43720105984; bosgame2 `=67` GTT 43855560704. rpc-server pid **615460**. `-sm rpc-tensor` `--stream /dev/tbstream0,/dev/tbstream1`. HIP `e03fcf`. `n_subgraphs=49`.
 
 ### Remaining
 
 1. **GDN-split AllGather is not 323.** `LLAMA_TP_MIRROR_SSM_OUT=1` without `MIRROR_GDN` (~85 subgraphs) hit **19.14 / 19.52** then sequential-half concat **20.23 / 20.55** tok/s but **empty content / CJK garbage** (`bench-lean3-1.json`). 1024-chunk 3-rep interleave was also garbage. Do not ship. Keep `MIRROR_GDN=1` for 323.
 2. NSPLIT INNERN (157 subgraphs) ~8 tok/s garbage. Extra GDN-x + INNERN subgraphs eat the GDN save.
 3. Unaligned PLE `node_206 (view)` still `META_BADPTR` on some taps; PLE kernel rows are aligned. Hunt only if quality regresses.
-4. SEQ, HIP graphs, last-node piggyback, and small-burst xchg are **on**. Do not revert to stable subgraph uids. Do not rebuild HIP off `e03fcf`. Do not set `LLAMA_MIRROR_OUTPUT_WEIGHT` on the speed path.
+4. SEQ, HIP graphs, last-node piggyback, small-burst xchg, and **HIP fusion** are **on**. Do not revert to stable subgraph uids. Do not rebuild HIP off `e03fcf`. Do not set `LLAMA_MIRROR_OUTPUT_WEIGHT` or `GGML_CUDA_DISABLE_FUSION` on the speed path.
 
 ## Files that matter
 
