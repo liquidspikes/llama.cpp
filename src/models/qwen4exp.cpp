@@ -995,8 +995,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
     // native 6144 GDN layout with a full-K GEMM ([INNERN]); do not 3-rep pack x.
     // Mirrored ssm_out (MIRROR_GDN without SPLIT_SSM_OUT) also needs sequential
     // 6144 x; 3-rep pack makes x AXIS_0 against a MIRRORED weight and aborts.
-    const bool ssm_out_mirrored = getenv("LLAMA_TP_MIRROR_GDN") != nullptr &&
-            getenv("LLAMA_TP_SPLIT_SSM_OUT") == nullptr;
+    const bool ssm_out_mirrored =
+            (getenv("LLAMA_TP_MIRROR_GDN") != nullptr &&
+             getenv("LLAMA_TP_SPLIT_SSM_OUT") == nullptr) ||
+            getenv("LLAMA_TP_MIRROR_SSM_OUT") != nullptr;
     if (head_ratio_gdn > 1 && final_output->ne[0] == value_dim_gdn &&
             getenv("LLAMA_TP_SSM_OUT_SEQUENTIAL") == nullptr &&
             getenv("LLAMA_TP_SSM_OUT_NSPLIT") == nullptr &&
