@@ -365,7 +365,7 @@ GGML_CUDA_DISABLE_FUSION=1 GGML_CUDA_DISABLE_GRAPHS=1
 
 | File | pid | content | tok/s | vs `B_single` 19.816 |
 |---|---|---|---|---|
-| `bench-tp.json` / `bench-tp-2.json` | **301673** restore MIRROR_GDN SEQ | **`323`** | **18.023 / 18.448** | below |
+| `bench-tp.json` / `bench-tp-2.json` | **306131** MIRROR_GDN SEQ | **`323`** | **18.067 / 18.475** | below |
 | pid **292466** SEQ+small-burst+async | 292466 | **`323`** | **17.697 / 17.845** | below |
 | pid **291008** small-burst SEQ | 291008 | **`323`** | **17.150 / 18.128** | below |
 | pid **284828** GRAPH_SEQ+graphs | 284828 | **`323`** | **17.456 / 17.476** | below |
@@ -408,7 +408,7 @@ Pid **291008** (small-burst, GRAPH_SEQ, HIP graphs): content **323**. `bench-tp.
 
 ### Remaining
 
-1. **GDN-split + NSPLIT AllGather is not 323.** Pid 296917 (`LLAMA_TP_SSM_OUT_NSPLIT=1`, no `MIRROR_GDN`, SEQ concat): 121 subgraphs, GTT ~40.1 GiB, decode ~8 tok/s, empty content, CJK/loop garbage (`bench-nsplit-garbage-1.json`). Layer-0 `linear_attn_out` matched after concat; layer-1 diverged. `final_output` on-device is **3072** not a concatenated 6144, so `ssm_out` GEMMs half-K. Do not ship. Keep `MIRROR_GDN=1` for 323.
+1. **GDN-split AllGather is not 323 and is slower.** Pid **304455** (`NSPLIT`, no `MIRROR_GDN`): 3072 3-rep shard interleave-concat to sequential **6144** `gdn_x_full`, INNERN `xK=6144`, layer-1 `linear_attn_out` **after_set matched** both GPUs. Still empty content / garbage (`bench-gdnx-garbage-1.json`). **157 subgraphs**, decode ~8 tok/s, SEQ `xchg_us≈40 ms` (156 xchgs). Extra GDN-x + INNERN subgraphs eat the GDN compute save. Do not ship. Keep `MIRROR_GDN=1` for 323.
 2. USB4 xchg is ~1.7 ms/token on the mirrored-GDN speed path. Mirrored GDN + dual overhead floors decode at **~17.8 tok/s** (56 ms) vs `B_single` 19.816 (50.5 ms). Do not fake TP with replica or layer-split.
 3. Unaligned PLE `node_206 (view)` still `META_BADPTR` on some taps; PLE kernel rows are aligned. Hunt only if quality regresses.
 4. SEQ, HIP graphs, last-node piggyback, and small-burst xchg are **on** and 323 with `MIRROR_GDN`. Do not revert to stable subgraph uids. Do not rebuild HIP off `e03fcf`.

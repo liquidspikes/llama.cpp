@@ -33,7 +33,7 @@ static const char * RPC_DEBUG = std::getenv("GGML_RPC_DEBUG");
 
 // Per-device ring of deserialized graphs so token 2+ can GRAPH_RECOMPUTE
 // each of the ~97 Flash-Next subgraphs instead of reserializing all of them.
-static constexpr size_t RPC_GRAPH_RING = 128;
+static constexpr size_t RPC_GRAPH_RING = 256;
 
 /* IMP-24: AVX-512 F32 add + F16C F16 add. This CPU has avx512f/f16c, not avx512fp16,
  * so F16 uses cvtph/ps + add_ps (never _mm512_add_ph). */
@@ -108,6 +108,22 @@ static void allgather_concat_f32(float * dest, const float * left, const float *
     for (int64_t t = 0; t < nT; t++) {
         memcpy(dest + t * (2 * wN),           left  + t * wN, (size_t) wN * sizeof(float));
         memcpy(dest + t * (2 * wN) + wN,      right + t * wN, (size_t) wN * sizeof(float));
+    }
+}
+
+/* 3-rep GDN x: each GPU holds [g0,g1,g2] of 1024. Sequential 6144 is
+ * [g0_d0, g0_d1, g1_d0, g1_d1, g2_d0, g2_d1]. */
+static void allgather_interleave_f32(float * dest, const float * left, const float * right,
+                                     int64_t chunk, int64_t n_chunks, int64_t nT) {
+    const int64_t shard = chunk * n_chunks;
+    const int64_t full  = shard * 2;
+    for (int64_t t = 0; t < nT; t++) {
+        for (int64_t g = 0; g < n_chunks; g++) {
+            memcpy(dest + t * full + (2 * g) * chunk,
+                   left + t * shard + g * chunk, (size_t) chunk * sizeof(float));
+            memcpy(dest + t * full + (2 * g + 1) * chunk,
+                   right + t * shard + g * chunk, (size_t) chunk * sizeof(float));
+        }
     }
 }
 
@@ -1595,7 +1611,7 @@ public:
     bool graph_compute_chunk(const std::vector<uint8_t> & input);
     bool graph_recompute(const rpc_msg_graph_recompute_req & request);
     bool allreduce_last(socket_ptr sock, uint32_t device, uint64_t uid, uint32_t ar_bytes);
-    bool allreduce_concat_last(socket_ptr sock, uint32_t device, uint64_t uid, uint32_t ar_bytes);
+    bool allreduce_concat_last(socket_ptr sock, uint32_t device, uint64_t uid, uint32_t ar_bytes, uint32_t kind);
     bool graph_seq(const std::vector<uint8_t> & input, socket_ptr sock);
     bool init_tensor(const rpc_msg_init_tensor_req & request);
     bool get_alloc_size(const rpc_msg_get_alloc_size_req & request, rpc_msg_get_alloc_size_rsp & response);
@@ -2497,7 +2513,7 @@ bool rpc_server::allreduce_last(socket_ptr sock, uint32_t device, uint64_t uid, 
     return true;
 }
 
-bool rpc_server::allreduce_concat_last(socket_ptr sock, uint32_t device, uint64_t uid, uint32_t ar_bytes) {
+bool rpc_server::allreduce_concat_last(socket_ptr sock, uint32_t device, uint64_t uid, uint32_t ar_bytes, uint32_t kind) {
     if (ar_bytes == 0 || device >= stored_graphs.size() || (ar_bytes % sizeof(float)) != 0) {
         return false;
     }
@@ -2559,16 +2575,22 @@ bool rpc_server::allreduce_concat_last(socket_ptr sock, uint32_t device, uint64_
     }
     full.resize((size_t) dest->ne[0] * (size_t) nT);
     // Worker is TP rank 1: peer is the left half.
-    allgather_concat_f32(full.data(),
-            (const float *) peer_data.data(), (const float *) local_data.data(),
-            wN, nT);
+    if (kind == 2 && wN == 3072 && dest->ne[0] == 6144) {
+        allgather_interleave_f32(full.data(),
+                (const float *) peer_data.data(), (const float *) local_data.data(),
+                1024, 3, nT);
+    } else {
+        allgather_concat_f32(full.data(),
+                (const float *) peer_data.data(), (const float *) local_data.data(),
+                wN, nT);
+    }
     ggml_backend_tensor_set_async(backends[device], dest, full.data(), 0, ggml_nbytes(dest));
     static int nlog;
     if (nlog < 4) {
         nlog++;
-        fprintf(stderr, "[RPC_CONCAT] uid=%llu ar=%u dest_nb=%zu wN=%lld nT=%lld\n",
+        fprintf(stderr, "[RPC_CONCAT] uid=%llu ar=%u dest_nb=%zu wN=%lld nT=%lld kind=%u\n",
                 (unsigned long long) uid, ar_bytes, ggml_nbytes(dest),
-                (long long) wN, (long long) nT);
+                (long long) wN, (long long) nT, kind);
     }
     return true;
 }
@@ -2608,8 +2630,8 @@ bool rpc_server::graph_seq(const std::vector<uint8_t> & input, socket_ptr sock) 
         if (it.ar_bytes == 0) {
             continue;
         }
-        if (it.pad == 1) {
-            if (!allreduce_concat_last(sock, device, it.uid, it.ar_bytes)) {
+        if (it.pad == 1 || it.pad == 2) {
+            if (!allreduce_concat_last(sock, device, it.uid, it.ar_bytes, it.pad)) {
                 return false;
             }
         } else if (!allreduce_last(sock, device, it.uid, it.ar_bytes)) {
@@ -3408,10 +3430,13 @@ GGML_BACKEND_API bool ggml_backend_rpc_comm_graph_seq(
     for (size_t i = 0; i < n; i++) {
         seq_item it{};
         it.uid = rpc_uids[i];
-        it.pad = (rpc_ar[i] != nullptr) ? 1 : 0;
+        it.pad = 0;
+        if (rpc_ar[i] != nullptr && local_ar[i] != nullptr) {
+            it.pad = (local_ar[i]->ne[0] == 3072 && rpc_ar[i]->ne[0] == 6144) ? 2 : 1;
+        }
         if (local_ar[i] == nullptr) {
             it.ar_bytes = 0;
-        } else if (it.pad == 1 && rpc_ar[i] != nullptr &&
+        } else if (it.pad != 0 && rpc_ar[i] != nullptr &&
                 ggml_nbytes(local_ar[i]) == ggml_nbytes(rpc_ar[i])) {
             it.ar_bytes = (uint32_t) (ggml_nbytes(rpc_ar[i]) / 2);
         } else {
@@ -3493,9 +3518,15 @@ GGML_BACKEND_API bool ggml_backend_rpc_comm_graph_seq(
                 return false;
             }
             concat_full.resize((size_t) dest->ne[0] * (size_t) nT);
-            allgather_concat_f32(concat_full.data(),
-                    (const float *) local_data.data(), (const float *) peer_data.data(),
-                    wN, nT);
+            if (local_ar[i]->ne[0] == 3072 && dest->ne[0] == 6144) {
+                allgather_interleave_f32(concat_full.data(),
+                        (const float *) local_data.data(), (const float *) peer_data.data(),
+                        1024, 3, nT);
+            } else {
+                allgather_concat_f32(concat_full.data(),
+                        (const float *) local_data.data(), (const float *) peer_data.data(),
+                        wN, nT);
+            }
             ggml_backend_tensor_set_async(local_backend, dest, concat_full.data(), 0, ggml_nbytes(dest));
         } else if (local_ar[i]->type == GGML_TYPE_F32) {
             allreduce_add_f32((float *) local_data.data(),
