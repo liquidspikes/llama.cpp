@@ -816,6 +816,16 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED && src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
             return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
         }
+        static const bool nspl_mm = getenv("LLAMA_TP_SSM_OUT_NSPLIT") != nullptr;
+        if (nspl_mm && tensor->src[0] != nullptr &&
+                strstr(tensor->src[0]->name, "ssm_out") != nullptr &&
+                src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_1 &&
+                (src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED ||
+                 src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL ||
+                 src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_0)) {
+            return {assume_sync ? GGML_BACKEND_SPLIT_AXIS_MIRRORED
+                                : GGML_BACKEND_SPLIT_AXIS_PARTIAL, {0}, {1}, 1};
+        }
         if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_1 && src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
             // Column-parallel ssm_out: full-K GEMM into an N-slice, zero-pad,
             // AllReduce-sum concatenates. Do not treat qkv this way (head split).
@@ -1314,6 +1324,14 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                 src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED && src_ss[3].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED &&
                 src_ss[4].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED && src_ss[5].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
             return src_ss[0];
+        }
+        // N-split AllGather: full-sized dest on each GPU. HIP writes local heads
+        // into the first half; SEQ concat fills the rest. Check before AXIS_1
+        // asserts — split qkv activations are often AXIS_0, not AXIS_1.
+        static const bool nspl = getenv("LLAMA_TP_SSM_OUT_NSPLIT") != nullptr;
+        if (nspl) {
+            return {assume_sync ? GGML_BACKEND_SPLIT_AXIS_MIRRORED
+                                : GGML_BACKEND_SPLIT_AXIS_PARTIAL, {0}, {1}, 1};
         }
         GGML_ASSERT(src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_1);
         GGML_ASSERT(src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_1);
@@ -1844,7 +1862,9 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
             if (t_ij->view_offs > 0 && split_dim >= 0 && split_dim < GGML_MAX_DIMS) {
                 GGML_ASSERT(tensor->ne[split_dim] != 0);
                 const int split_dim_view_src = ggml_backend_meta_get_split_state(tensor->view_src, /*assume_sync =*/ true).axis;
-                GGML_ASSERT(split_dim_view_src >= 0 && split_dim_view_src < GGML_MAX_DIMS);
+                if (split_dim_view_src < 0 || split_dim_view_src >= GGML_MAX_DIMS) {
+                    // PARTIAL/MIRRORED parent is full-sized; keep view_offs.
+                } else {
 
                 // The offset can be internal to the data split, in those cases the view offset should not be scaled.
                 // If however, the offset is larger than the data split then it needs to be scaled proportionally.
@@ -1870,6 +1890,7 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
                                 (long long) t_ij->ne[1], (long long) tensor->ne[1],
                                 t_ij->view_src ? (long long) t_ij->view_src->ne[0] : -1);
                     }
+                }
                 }
             }
         }
@@ -3820,8 +3841,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
 
     if (backend_ctx->comm_graph_seq != nullptr && backend_ctx->comm_ctx != nullptr &&
             backend_ctx->n_subgraphs >= 2 && n_backends >= 2 &&
-            getenv("LLAMA_TP_NO_SEQ") == nullptr &&
-            getenv("LLAMA_TP_SSM_OUT_NSPLIT") == nullptr) {
+            getenv("LLAMA_TP_NO_SEQ") == nullptr) {
         size_t j_local = n_backends, j_rpc = n_backends;
         for (size_t j = 0; j < n_backends; j++) {
             const char * bname = ggml_backend_name(backend_ctx->backend_configs[j].backend);
@@ -3865,11 +3885,23 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                         ggml_backend_meta_get_split_state(orig_last, /*assume_sync =*/ false).axis;
                     const bool last_partial = last_axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL;
                     const bool last_ffn = strstr(orig_last->name, "ffn_moe") != nullptr;
-                    if (!last_partial && !last_ffn) {
-                        continue;
+                    ggml_tensor * loc = ggml_backend_meta_buffer_simple_tensor(orig_last, j_local);
+                    static const bool nspl = getenv("LLAMA_TP_SSM_OUT_NSPLIT") != nullptr;
+                    auto it_g = (loc != nullptr) ? g_innern_gemm.find(loc) : g_innern_gemm.end();
+                    if (it_g != g_innern_gemm.end() && it_g->second != nullptr) {
+                        // INNERN: xchg 1280 gemm, concat into 2560 dest.
+                        backend_ctx->seq_local_ar[i] = it_g->second;
+                        backend_ctx->seq_rpc_ar[i] = loc;
+                    } else if (nspl && last_partial && !last_ffn && loc != nullptr &&
+                            loc->type == GGML_TYPE_F32 && loc->ne[0] > 1) {
+                        // Split GDN: HIP wrote local heads into the first half of a
+                        // full-sized dest. Concat that half with the peer's.
+                        backend_ctx->seq_local_ar[i] = loc;
+                        backend_ctx->seq_rpc_ar[i] = loc;
+                    } else if (last_partial || last_ffn) {
+                        backend_ctx->seq_local_ar[i] = loc;
+                        backend_ctx->seq_rpc_ar[i] = nullptr; // ADD
                     }
-                    backend_ctx->seq_local_ar[i] = ggml_backend_meta_buffer_simple_tensor(orig_last, j_local);
-                    backend_ctx->seq_rpc_ar[i] = ggml_backend_meta_buffer_simple_tensor(orig_last, j_rpc);
                 }
                 if (seq_ok) {
                     backend_ctx->seq_plan_valid = true;
@@ -4138,6 +4170,39 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             }
             const bool last_partial = last_axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL;
             const bool last_ffn = orig_last != nullptr && strstr(orig_last->name, "ffn_moe") != nullptr;
+            static const bool nspl_fb = getenv("LLAMA_TP_SSM_OUT_NSPLIT") != nullptr;
+            if (nspl_fb && last_partial && !last_ffn && orig_last != nullptr &&
+                    orig_last->type == GGML_TYPE_F32) {
+                ggml_tensor * d0 = ggml_backend_meta_buffer_simple_tensor(orig_last, 0);
+                ggml_tensor * d1 = ggml_backend_meta_buffer_simple_tensor(orig_last, 1);
+                if (d0 != nullptr && d1 != nullptr && ggml_nbytes(d0) == ggml_nbytes(d1) &&
+                        d0->ne[0] > 1 && (d0->ne[0] % 2) == 0) {
+                    const size_t full_nb = ggml_nbytes(d0);
+                    const size_t half_nb = full_nb / 2;
+                    const int64_t nT = std::max((int64_t) 1, ggml_nrows(d0));
+                    const int64_t wN = d0->ne[0] / 2;
+                    if ((size_t) wN * (size_t) nT * sizeof(float) == half_nb) {
+                        std::vector<float> left(half_nb / sizeof(float));
+                        std::vector<float> right(half_nb / sizeof(float));
+                        std::vector<float> full(full_nb / sizeof(float));
+                        ggml_backend_tensor_get(d0, left.data(), 0, half_nb);
+                        ggml_backend_tensor_get(d1, right.data(), 0, half_nb);
+                        for (int64_t t = 0; t < nT; t++) {
+                            memcpy(full.data() + t * (2 * wN), left.data() + t * wN, (size_t) wN * sizeof(float));
+                            memcpy(full.data() + t * (2 * wN) + wN, right.data() + t * wN, (size_t) wN * sizeof(float));
+                        }
+                        ggml_backend_tensor_set(d0, full.data(), 0, full_nb);
+                        ggml_backend_tensor_set(d1, full.data(), 0, full_nb);
+                        static int nag_gdn;
+                        if (nag_gdn < 4) {
+                            nag_gdn++;
+                            fprintf(stderr, "[GDN_AG] fallback concat last=%s half=%zu wN=%lld nT=%lld\n",
+                                    orig_last->name, half_nb, (long long) wN, (long long) nT);
+                        }
+                        continue;
+                    }
+                }
+            }
             if (orig_last == nullptr || (!last_partial && !last_ffn)) {
                 static int nskipar;
                 if (nskipar < 8) {

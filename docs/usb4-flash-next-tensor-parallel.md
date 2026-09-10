@@ -365,7 +365,8 @@ GGML_CUDA_DISABLE_FUSION=1 GGML_CUDA_DISABLE_GRAPHS=1
 
 | File | pid | content | tok/s | vs `B_single` 19.816 |
 |---|---|---|---|---|
-| `bench-tp.json` / `bench-tp-2.json` | **292466** SEQ+small-burst+async | **`323`** | **17.697 / 17.845** | below |
+| `bench-tp.json` / `bench-tp-2.json` | **301673** restore MIRROR_GDN SEQ | **`323`** | **18.023 / 18.448** | below |
+| pid **292466** SEQ+small-burst+async | 292466 | **`323`** | **17.697 / 17.845** | below |
 | pid **291008** small-burst SEQ | 291008 | **`323`** | **17.150 / 18.128** | below |
 | pid **284828** GRAPH_SEQ+graphs | 284828 | **`323`** | **17.456 / 17.476** | below |
 | pid 283027 graphs+piggy | 283027 | **`323`** | **16.78 / 17.08 / 17.09** | below |
@@ -407,10 +408,10 @@ Pid **291008** (small-burst, GRAPH_SEQ, HIP graphs): content **323**. `bench-tp.
 
 ### Remaining
 
-1. Drop `MIRROR_GDN` once split GDN activations AllGather to 3-rep `x` matching 3-rep `W` (not required for 323 on the quality or speed path). Extra GDN subgraphs without folding AllGather into the FFN xchg add RTTs; NSPLIT INNERN quality is ~8 tok/s.
-2. USB4 AR count + mirrored GDN floors decode at **~17.5 tok/s** (57.2 ms/token) vs `B_single` 19.816 (50.5 ms). Concurrent windowed `tbs_xchg` is the attempt to cut the 3-frame ping-pong. Report, do not fake TP with replica or layer-split.
+1. **GDN-split + NSPLIT AllGather is not 323.** Pid 296917 (`LLAMA_TP_SSM_OUT_NSPLIT=1`, no `MIRROR_GDN`, SEQ concat): 121 subgraphs, GTT ~40.1 GiB, decode ~8 tok/s, empty content, CJK/loop garbage (`bench-nsplit-garbage-1.json`). Layer-0 `linear_attn_out` matched after concat; layer-1 diverged. `final_output` on-device is **3072** not a concatenated 6144, so `ssm_out` GEMMs half-K. Do not ship. Keep `MIRROR_GDN=1` for 323.
+2. USB4 xchg is ~1.7 ms/token on the mirrored-GDN speed path. Mirrored GDN + dual overhead floors decode at **~17.8 tok/s** (56 ms) vs `B_single` 19.816 (50.5 ms). Do not fake TP with replica or layer-split.
 3. Unaligned PLE `node_206 (view)` still `META_BADPTR` on some taps; PLE kernel rows are aligned. Hunt only if quality regresses.
-4. SEQ, HIP graphs, and last-node piggyback are **on** and 323. Do not revert to stable subgraph uids. Do not enlarge `rpc_msg_graph_recompute_req` beyond `ar_bytes`. Do not rebuild HIP off `e03fcf`.
+4. SEQ, HIP graphs, last-node piggyback, and small-burst xchg are **on** and 323 with `MIRROR_GDN`. Do not revert to stable subgraph uids. Do not rebuild HIP off `e03fcf`.
 
 ## Files that matter
 
