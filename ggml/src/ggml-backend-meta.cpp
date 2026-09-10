@@ -27,6 +27,9 @@
 // is not (English loop). Own 1280 buffer + host allgather into the 2560 PARTIAL.
 static std::unordered_map<ggml_tensor *, ggml_tensor *> g_innern_gemm;
 static std::vector<ggml_backend_buffer_ptr> g_innern_bufs;
+// Split-GDN activation AllGather: 3072 3-rep shard → sequential 6144 dest for ssm_out.
+static std::unordered_map<ggml_tensor *, ggml_tensor *> g_gdn_x_full;
+static std::vector<ggml_backend_buffer_ptr> g_gdn_x_bufs;
 
 // Unallocated / poisoned shard pointers (qwen4exp Flash Next TP SIGSEGV:
 // dest 0x555500000032, memset ~29GB). Odd or near-null addresses are never
@@ -2060,6 +2063,13 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
                  (tensor->src[0]->name[0] && strstr(tensor->src[0]->name, "ssm_out") != nullptr))) {
             ggml_tensor * w = t_ij->src[0];
             ggml_tensor * x = t_ij->src[1];
+            {
+                auto itx = g_gdn_x_full.find(x);
+                if (itx != g_gdn_x_full.end() && itx->second != nullptr) {
+                    x = itx->second;
+                    t_ij->src[1] = x;
+                }
+            }
             const ggml_backend_meta_split_state wss =
                 ggml_backend_meta_get_split_state(stc, tensor->src[0], /*assume_sync =*/ true);
             if (wss.axis == GGML_BACKEND_SPLIT_AXIS_1 && wss.n_segments == 1 && wss.nr[0] == 1 &&
@@ -2113,6 +2123,43 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
                             (long long) t_ij->ne[0], (long long) w->ne[0],
                             (long long) x->ne[0], gbytes);
                 }
+            }
+        }
+
+        if (simple_buf != nullptr && t_ij != nullptr && t_ij->type == GGML_TYPE_F32 &&
+                getenv("LLAMA_TP_SSM_OUT_NSPLIT") != nullptr &&
+                tensor->name[0] && strstr(tensor->name, "final_output") != nullptr &&
+                strstr(tensor->name, "3rep") == nullptr && strstr(tensor->name, "khalf") == nullptr &&
+                tensor->ne[0] == 6144 && t_ij->ne[0] == 3072) {
+            if (j == 0 && strstr(tensor->name, "final_output-0") != nullptr) {
+                g_gdn_x_full.clear();
+                g_gdn_x_bufs.clear();
+            }
+            int64_t dne[GGML_MAX_DIMS];
+            for (int d = 0; d < GGML_MAX_DIMS; d++) {
+                dne[d] = tensor->ne[d];
+            }
+            ggml_tensor * dest = ggml_new_tensor(simple_ctx, GGML_TYPE_F32, GGML_MAX_DIMS, dne);
+            dest->op = GGML_OP_NONE;
+            dest->nb[0] = sizeof(float);
+            dest->nb[1] = dest->nb[0] * (size_t) dest->ne[0];
+            dest->nb[2] = dest->nb[1] * (size_t) dest->ne[1];
+            dest->nb[3] = dest->nb[2] * (size_t) dest->ne[2];
+            ggml_set_name(dest, "gdn_x_full");
+            const size_t dbytes = ggml_nbytes(dest);
+            ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(simple_buf);
+            g_gdn_x_bufs.emplace_back(ggml_backend_buft_alloc_buffer(buft, dbytes));
+            ggml_backend_buffer_t db = g_gdn_x_bufs.back().get();
+            GGML_ASSERT(db != nullptr);
+            dest->buffer = db;
+            dest->data = ggml_backend_buffer_get_base(db);
+            ggml_backend_buffer_init_tensor(db, dest);
+            g_gdn_x_full[t_ij] = dest;
+            static int ngdnx;
+            if (ngdnx < 8) {
+                ngdnx++;
+                fprintf(stderr, "[GDN_X] %s j=%zu shardN=%lld destN=%lld dbytes=%zu\n",
+                        tensor->name, j, (long long) t_ij->ne[0], (long long) dest->ne[0], dbytes);
             }
         }
 
@@ -3422,7 +3469,13 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                         max_tmp_size = std::max(max_tmp_size, nb);
                     }
                 }
-                const bool new_subgraph = i + 1 == cgraph->n_nodes || split_state.axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL;
+                static const bool nspl_split = getenv("LLAMA_TP_SSM_OUT_NSPLIT") != nullptr;
+                const bool gdn_x_ag = nspl_split && node->name[0] &&
+                        strstr(node->name, "final_output") != nullptr &&
+                        strstr(node->name, "3rep") == nullptr &&
+                        strstr(node->name, "khalf") == nullptr;
+                const bool new_subgraph = i + 1 == cgraph->n_nodes ||
+                        split_state.axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL || gdn_x_ag;
                 if (!new_subgraph) {
                     continue;
                 }
@@ -3430,8 +3483,9 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 // LLAMA_TP_NO_DELAY_AR=1: AllReduce at every PARTIAL (no MoE delay).
                 // QWEN4EXP HC combine is residual + block; delaying AR through that ADD
                 // would AllReduce(mirrored_res + partial) = 2*res + full_block.
+                // Do not delay GDN-x concat through ssm_out (that GEMMs 3072 K).
                 const bool no_delay_ar = getenv("LLAMA_TP_NO_DELAY_AR") != nullptr;
-                const int i_delayed = no_delay_ar ? i : get_i_delayed(i);
+                const int i_delayed = (no_delay_ar || gdn_x_ag) ? i : get_i_delayed(i);
                 static const bool log_ar = getenv("GGML_META_LOG_AR") != nullptr;
                 if (log_ar && split_state.axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL) {
                     fprintf(stderr, "[META_AR] i=%d delay=%d name=%s op=%s nbytes=%zu axis=%s",
@@ -3612,6 +3666,15 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                             ggml_backend_meta_data_ptr_ok(it_g->second->data)) {
                         cgraph_ij->nodes[n_kept] = it_g->second;
                         ggml_hash_insert(&cgraph_ij->visited_hash_set, it_g->second);
+                        n_kept++;
+                    }
+                    auto it_x = g_gdn_x_full.find(node_ij);
+                    if (it_x != g_gdn_x_full.end() && it_x->second != nullptr &&
+                            n_kept < cgraph_ij->size &&
+                            it_x->second->data != nullptr &&
+                            ggml_backend_meta_data_ptr_ok(it_x->second->data)) {
+                        cgraph_ij->nodes[n_kept] = it_x->second;
+                        ggml_hash_insert(&cgraph_ij->visited_hash_set, it_x->second);
                         n_kept++;
                     }
                 }
@@ -3887,8 +3950,13 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     const bool last_ffn = strstr(orig_last->name, "ffn_moe") != nullptr;
                     ggml_tensor * loc = ggml_backend_meta_buffer_simple_tensor(orig_last, j_local);
                     static const bool nspl = getenv("LLAMA_TP_SSM_OUT_NSPLIT") != nullptr;
+                    auto it_x = (loc != nullptr) ? g_gdn_x_full.find(loc) : g_gdn_x_full.end();
                     auto it_g = (loc != nullptr) ? g_innern_gemm.find(loc) : g_innern_gemm.end();
-                    if (it_g != g_innern_gemm.end() && it_g->second != nullptr) {
+                    if (it_x != g_gdn_x_full.end() && it_x->second != nullptr) {
+                        // 3072 3-rep shard → sequential 6144 (interleave 1024).
+                        backend_ctx->seq_local_ar[i] = loc;
+                        backend_ctx->seq_rpc_ar[i] = it_x->second;
+                    } else if (it_g != g_innern_gemm.end() && it_g->second != nullptr) {
                         // INNERN: xchg 1280 gemm, concat into 2560 dest.
                         backend_ctx->seq_local_ar[i] = it_g->second;
                         backend_ctx->seq_rpc_ar[i] = loc;
@@ -4171,6 +4239,47 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             const bool last_partial = last_axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL;
             const bool last_ffn = orig_last != nullptr && strstr(orig_last->name, "ffn_moe") != nullptr;
             static const bool nspl_fb = getenv("LLAMA_TP_SSM_OUT_NSPLIT") != nullptr;
+            if (nspl_fb && orig_last != nullptr && orig_last->name[0] &&
+                    strstr(orig_last->name, "final_output") != nullptr) {
+                ggml_tensor * s0 = ggml_backend_meta_buffer_simple_tensor(orig_last, 0);
+                ggml_tensor * s1 = ggml_backend_meta_buffer_simple_tensor(orig_last, 1);
+                auto ix0 = (s0 != nullptr) ? g_gdn_x_full.find(s0) : g_gdn_x_full.end();
+                auto ix1 = (s1 != nullptr) ? g_gdn_x_full.find(s1) : g_gdn_x_full.end();
+                if (ix0 != g_gdn_x_full.end() && ix1 != g_gdn_x_full.end() &&
+                        ix0->second != nullptr && ix1->second != nullptr) {
+                    const size_t shard_nb = ggml_nbytes(s0);
+                    const size_t full_nb = ggml_nbytes(ix0->second);
+                    const int64_t nT = std::max((int64_t) 1, ggml_nrows(ix0->second));
+                    if (s0->ne[0] == 3072 && ix0->second->ne[0] == 6144 &&
+                            shard_nb * 2 == full_nb) {
+                        std::vector<float> left(shard_nb / sizeof(float));
+                        std::vector<float> right(shard_nb / sizeof(float));
+                        std::vector<float> full(full_nb / sizeof(float));
+                        ggml_backend_tensor_get(s0, left.data(), 0, shard_nb);
+                        ggml_backend_tensor_get(s1, right.data(), 0, shard_nb);
+                        const int64_t chunk = 1024;
+                        const int64_t n_chunks = 3;
+                        const int64_t shard = chunk * n_chunks;
+                        for (int64_t t = 0; t < nT; t++) {
+                            for (int64_t g = 0; g < n_chunks; g++) {
+                                memcpy(full.data() + t * 2 * shard + (2 * g) * chunk,
+                                       left.data() + t * shard + g * chunk, (size_t) chunk * sizeof(float));
+                                memcpy(full.data() + t * 2 * shard + (2 * g + 1) * chunk,
+                                       right.data() + t * shard + g * chunk, (size_t) chunk * sizeof(float));
+                            }
+                        }
+                        ggml_backend_tensor_set(ix0->second, full.data(), 0, full_nb);
+                        ggml_backend_tensor_set(ix1->second, full.data(), 0, full_nb);
+                        static int nxag;
+                        if (nxag < 4) {
+                            nxag++;
+                            fprintf(stderr, "[GDN_X_AG] fallback interleave last=%s shard=%zu full=%zu nT=%lld\n",
+                                    orig_last->name, shard_nb, full_nb, (long long) nT);
+                        }
+                        continue;
+                    }
+                }
+            }
             if (nspl_fb && last_partial && !last_ffn && orig_last != nullptr &&
                     orig_last->type == GGML_TYPE_F32) {
                 ggml_tensor * d0 = ggml_backend_meta_buffer_simple_tensor(orig_last, 0);
