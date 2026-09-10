@@ -36,6 +36,38 @@ static bool ggml_backend_meta_data_ptr_ok(const void * p) {
     return p != nullptr && u >= 0x10000ull && (u & 0xf) == 0;
 }
 
+static bool ggml_backend_meta_resid_name(const char * name) {
+    if (name == nullptr || name[0] == '\0') {
+        return false;
+    }
+    return strstr(name, "hc_combine") != nullptr ||
+           strstr(name, "hc_mixed") != nullptr ||
+           strstr(name, "ffn_moe_out") != nullptr ||
+           strstr(name, "l_last") != nullptr ||
+           strstr(name, "ple_conv") != nullptr ||
+           strstr(name, "linear_attn_out") != nullptr ||
+           strstr(name, "innern_gemm") != nullptr;
+}
+
+static void ggml_backend_meta_dump_resid(const char * tag, size_t j, ggml_tensor * t) {
+    if (t == nullptr) {
+        fprintf(stderr, "[RESID] %s j=%zu name=(null)\n", tag, j);
+        return;
+    }
+    if (t->data == nullptr || !ggml_backend_meta_data_ptr_ok(t->data) || t->type != GGML_TYPE_F32) {
+        fprintf(stderr, "[RESID] %s j=%zu name=%s op=%s type=%s ne=[%lld,%lld,%lld] data=%p\n",
+                tag, j, t->name, ggml_op_name(t->op), ggml_type_name(t->type),
+                (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], t->data);
+        return;
+    }
+    float x[2] = {0, 0};
+    const size_t n = std::min(sizeof(x), ggml_nbytes(t));
+    ggml_backend_tensor_get(t, x, 0, n);
+    fprintf(stderr, "[RESID] %s j=%zu name=%s op=%s ne=[%lld,%lld,%lld] x0=%.5f,%.5f\n",
+            tag, j, t->name, ggml_op_name(t->op),
+            (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], x[0], x[1]);
+}
+
 // QWEN4EXP HC mix: [n_embd, T] strided view of one hc stream of [n_embd, hc, T].
 // src->nb[1] == n_embd * esz (one contiguous stream). hc is small (Flash-Next=4).
 // Rejects QSA/GDN views such as [64,4] of [64,64,4].
@@ -3734,6 +3766,18 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                             ? cg->nodes[cg->n_nodes - 1]->name : "";
                     fprintf(stderr, "[META_GC] g=%d sub=%zu j=%zu n=%d last=%s\n",
                             nlogg, i, j, cg ? cg->n_nodes : -1, last);
+                    if (j == 0 && cg != nullptr) {
+                        const int nprint = std::min(cg->n_nodes, 12);
+                        for (int ni = 0; ni < nprint; ni++) {
+                            ggml_tensor * nd = cg->nodes[ni];
+                            if (nd == nullptr) {
+                                continue;
+                            }
+                            fprintf(stderr, "[META_GC]   sub=%zu i=%d op=%s name=%s ne=[%lld,%lld,%lld]\n",
+                                    i, ni, ggml_op_name(nd->op), nd->name,
+                                    (long long) nd->ne[0], (long long) nd->ne[1], (long long) nd->ne[2]);
+                        }
+                    }
                 }
             }
         }
@@ -3837,6 +3881,32 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                             got0[0], innern_parts[0][0], gotN[0], innern_parts[1][0]);
                 }
             }
+            {
+                static int nresid_set;
+                if (nresid_set < 4) {
+                    nresid_set++;
+                    for (size_t j = 0; j < n_backends; j++) {
+                        ggml_backend_meta_dump_resid("after_set", j, innern_dev[j]);
+                    }
+                    if (i + 1 < backend_ctx->n_subgraphs) {
+                        for (size_t j = 0; j < n_backends; j++) {
+                            ggml_cgraph * cg = backend_ctx->backend_configs[j].cgraphs[i + 1].cgraph_main;
+                            if (cg == nullptr) {
+                                continue;
+                            }
+                            int ndump = 0;
+                            for (int ni = 0; ni < cg->n_nodes && ndump < 8; ni++) {
+                                ggml_tensor * nd = cg->nodes[ni];
+                                if (nd == nullptr || !ggml_backend_meta_resid_name(nd->name)) {
+                                    continue;
+                                }
+                                ggml_backend_meta_dump_resid("next_pre", j, nd);
+                                ndump++;
+                            }
+                        }
+                    }
+                }
+            }
             continue; // already concatenated; AllReduce would double
         }
 
@@ -3848,8 +3918,25 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 continue;
             }
             ggml_tensor * orig_last = cgraph->nodes[i_node_stop - 1];
-            if (orig_last == nullptr ||
-                    ggml_backend_meta_get_split_state(orig_last, /*assume_sync =*/ false).axis != GGML_BACKEND_SPLIT_AXIS_PARTIAL) {
+            // Delay-AR of ffn_moe_down through ADD/GET_ROWS types ffn_moe_out
+            // MIRRORED (ADD(PARTIAL, MIRRORED) handler) without ever reducing
+            // the expert down-proj. INNERN then skips GDN AR and layer-1 GDN x
+            // diverges. AllReduce ffn_moe_* even when the delayed last is
+            // labelled MIRRORED; the buffers still hold a partial sum.
+            ggml_backend_meta_split_axis last_axis = GGML_BACKEND_SPLIT_AXIS_UNKNOWN;
+            if (orig_last != nullptr) {
+                last_axis = ggml_backend_meta_get_split_state(orig_last, /*assume_sync =*/ false).axis;
+            }
+            const bool last_partial = last_axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL;
+            const bool last_ffn = orig_last != nullptr && strstr(orig_last->name, "ffn_moe") != nullptr;
+            if (orig_last == nullptr || (!last_partial && !last_ffn)) {
+                static int nskipar;
+                if (nskipar < 8) {
+                    nskipar++;
+                    fprintf(stderr, "[RESID] skip_ar sub=%zu last=%s axis=%s\n",
+                            i, orig_last ? orig_last->name : "(null)",
+                            ggml_backend_meta_split_axis_name(last_axis));
+                }
                 continue;
             }
             bool all_ok = true;
@@ -3870,6 +3957,19 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             if (!all_ok) {
                 continue;
             }
+            {
+                static int nresid_ar;
+                if (nresid_ar < 6) {
+                    nresid_ar++;
+                    fprintf(stderr, "[RESID] ar_pre sub=%zu last=%s axis=%s\n",
+                            i, orig_last->name,
+                            ggml_backend_meta_split_axis_name(
+                                ggml_backend_meta_get_split_state(orig_last, /*assume_sync =*/ false).axis));
+                    for (size_t j = 0; j < nodes.size(); j++) {
+                        ggml_backend_meta_dump_resid("ar_pre", j, nodes[j]);
+                    }
+                }
+            }
             bool backend_allreduce_success = false;
             if (backend_ctx->comm_ctx && getenv("LLAMA_TP_AR_FALLBACK") == nullptr) {
                 backend_allreduce_success = backend_ctx->comm_allreduce(backend_ctx->comm_ctx, nodes.data());
@@ -3879,6 +3979,30 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 const ggml_status status = allreduce_fallback(i);
                 if (status != GGML_STATUS_SUCCESS) {
                     return status;
+                }
+            }
+            {
+                static int nresid_ar2;
+                if (nresid_ar2 < 6) {
+                    nresid_ar2++;
+                    for (size_t j = 0; j < nodes.size(); j++) {
+                        ggml_backend_meta_dump_resid("ar_post", j, nodes[j]);
+                    }
+                    for (size_t j = 0; j < n_backends; j++) {
+                        ggml_cgraph * cg = backend_ctx->backend_configs[j].cgraphs[i].cgraph_main;
+                        if (cg == nullptr) {
+                            continue;
+                        }
+                        int ndump = 0;
+                        for (int ni = 0; ni < cg->n_nodes && ndump < 6; ni++) {
+                            ggml_tensor * nd = cg->nodes[ni];
+                            if (nd == nullptr || !ggml_backend_meta_resid_name(nd->name)) {
+                                continue;
+                            }
+                            ggml_backend_meta_dump_resid("sub_post", j, nd);
+                            ndump++;
+                        }
+                    }
                 }
             }
         }

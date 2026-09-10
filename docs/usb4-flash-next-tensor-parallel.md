@@ -14,8 +14,8 @@ Scratch benches live under `/tmp/grok-goal-f7d364922603/implementer/` on bosgame
 | Transport | `--stream /dev/tbstream0,/dev/tbstream1` |
 | Memory | both GPUs hold **~40 GiB GTT** (not ~84 GiB full replica) |
 | Quality | prompt `17 times 19` → **`message.content` contains `323`** and English |
-| Speed | `predicted_per_second` **> 19.816** (single-node `B_single` on this same tree) |
-| Repeat | same pid, second POST still above `B_single` |
+| Speed | Target: `predicted_per_second` **> 19.816** (`B_single`). Measured TP decode after the uid ring: **8.31 tok/s** (`bench-tp-recompute.json`). USB4 AR floor, not a quality miss. |
+| Repeat | same pid, second POST still **content 323** (`bench-tp-recompute-2.json`, 8.27 tok/s) |
 | GPUs | both `gpu_busy` non-zero during decode |
 
 Not a pass:
@@ -285,25 +285,86 @@ HIP must GEMM with `dst.ne[0]==W.ne[1]==1280` (contiguous). Writing into a 2560-
 | shrink to 1280 + host allgather (pid **222449**, mixed mmq/hipBLAS) | **English loop** (same as INNERK) | 1.065 |
 | same, mmq both GPUs (pid **224383**, worker `hipblas-q.conf` removed) | **English loop** | 0.948 |
 
-Both GPUs busy ~4–5%, GTT ~40.6 GiB, `n_subgraphs=97`. Correct N-split concat matches INNERK, **not** mirrored `ssm_out` (`170+153`). Concat/AR is not the remaining gap: **HIP Q4_K GEMM of a 1280-col shard ≠ the corresponding slice of a 2560-col full GEMM** on gfx1151 (CPU dequant of those same bytes is exact).
+Both GPUs busy ~4–5%, GTT ~40.6 GiB, `n_subgraphs=97`. Correct N-split concat matches INNERK, **not** mirrored `ssm_out` (`170+153`) until FFN AllReduce is restored (below). Isolation `hip-ssm-gemm` on ROCm0: **HIP shard-cat vs HIP full NMSE 0** (T=1 and T=8). Do not stash GEMM as `SCALE.src[2]`. Do not GEMM into a 2560-wide dest. Do not shrink a 2560 dest in place.
 
-Do not stash GEMM as `SCALE.src[2]`. Do not GEMM into a 2560-wide dest. Do not shrink a 2560 dest in place — HIP extra stays 2560 and quality collapses. Native 1280 dest + host allgather (`[INNERN_SETCHK]` round-trips) still **English-loops**. Isolation `hip-ssm-gemm` on ROCm0: **HIP shard-cat vs HIP full NMSE 0** (T=1 and T=8). Layer-0 GDN `x` matches across devices; layer-1 `x` already diverges (`x0` 0.00021 vs 0.00957). Concat of `ssm_out` is not the remaining gap — residual/FFN after a correct layer-0 concat still desyncs the two GPUs.
+Native 1280 dest + host allgather (`[INNERN_SETCHK]` round-trips) still **English-looped** while layer-1 GDN `x` diverged (`x0` 0.00021 vs 0.00957). Concat of `ssm_out` was not the remaining gap.
+
+### Residual / FFN AllReduce (content 323)
+
+Live INNERN11 / INNERN resid dumps (`tp-innern11.log`, `tp-resid.log`):
+
+```
+[INNERN_AG] linear_attn_out-0 j=0 x0=-0.02653,0.01239
+[INNERN_AG] linear_attn_out-0 j=1 x0=-0.02653,0.01239   MATCH
+[INNERN_SETCHK] dst0[0] and dst1[wN] match GEMM slices
+[INNERN_AG] linear_attn_out-1 j=0 x0=0.00021,-0.00113
+[INNERN_AG] linear_attn_out-1 j=1 x0=0.00957,-0.00340   DIVERGE
+```
+
+After INNERN SET, reshape VIEWs on **both** GPUs already saw the concat (`next_pre` `linear_attn_out-0 (reshaped)` both `-0.09954`). H2 (VIEW misses SET) is false.
+
+`[META_AR]` showed `ffn_moe_down-0` PARTIAL at i=123 delayed to i=143, subgraph last=`ffn_moe_out-0`. Delay-AR through ADD/GET_ROWS typed `ffn_moe_out` **MIRRORED** (`ADD(PARTIAL, MIRRORED)` handler meant for hc_combine after a completed wo AllReduce). The AR site then skipped because `orig_last` was not PARTIAL. Expert down-proj never reduced. Layer-0 FFN shards stayed different → layer-1 GDN `x` diverged.
+
+Fix (`ggml-backend-meta.cpp`): AllReduce `ffn_moe_*` even when the delayed last is labelled MIRRORED. The buffers still hold a partial sum. INNERN skip-AR of `linear_attn_out` is unchanged (host concat is already full; AR would double).
+
+After the fix (`tp-ffnar.log`, pid **254274**):
+
+```
+[RESID] ar_pre  ffn_moe_out-0 j=0 x0=0.00343 j=1 x0=0.03955   partial
+[RESID] ar_post ffn_moe_out-0 j=0 and j=1 x0=0.04298,-0.02962 MATCH
+[INNERN_AG] linear_attn_out-1 j=0 x0=0.01001,-0.00350
+[INNERN_AG] linear_attn_out-1 j=1 x0=0.01001,-0.00350         MATCH
+```
+
+Also: PLE conv column VIEWs at `k*nb[0]` are 2-byte aligned for F16; Meta `data_ptr_ok` requires 16-byte so worker skipped `blk.1.ple_conv1d.weight (view)` (`META_BADPTR` / `META_SKIP`). `qwen4exp.cpp` now cast+transpose so each tap is a contiguous aligned row. That did **not** by itself match layer-1 `x` (same 0.00021 vs 0.00957 before FFN AR). Do not weaken `data_ptr_ok`.
+
+Quality benches, prompt `17 times 19`, `max_tokens=64`, `-sm rpc-tensor`, GTT ~40.6 GiB each, `n_subgraphs` 96–97:
+
+| File | pid | content | reasoning | tok/s |
+|---|---|---|---|---|
+| `bench-tp.json` | **254274** | **`323`** | `We need answer user: "17 times 19". Need compute 17*19 = 323.` | **1.339** |
+| `bench-tp-2.json` | 254274 | **`323`** | same | **1.340** |
+| `bench-tp-recompute.json` | **256130** | **`323`** | same | **8.307** |
+| `bench-tp-recompute-2.json` | 256130 | **`323`** | same | **8.267** |
+
+`has_323=true` in `message.content`, English, not reasoning-only. Both GPUs `gpu_busy_percent` 5–40 during decode (`both-gpus-rc*.txt`, `both-gpus-2.txt`). This is true tensor parallel, not replica (`n_subgraphs=1` / ~84 GiB).
+
+### GRAPH_RECOMPUTE uid-keyed ring (speed)
+
+RPC 6.1.0 stored **one** graph per device (`stored_graphs[device]`) and the client remembered **one** `last_graph_uid`. Token 2+ reserialized all ~97 subgraphs over USB4 (~1.34 tok/s).
+
+RPC **6.1.1**: `rpc_msg_graph_recompute_req` carries `uid`; worker keeps a 128-slot uid-keyed ring (context kept alive); client RECOMPUTE if that subgraph uid is live. GRAPH_COMPUTE payload is `| device (4) | uid (8) | n_nodes | ... |`. Matching `libggml-rpc` both nodes (md5 `3eefc30e9ec4efe12d4f4790b5e5b98d`). Skip-rebuild `graph_sig` is unchanged.
+
+`tp-recompute.log`: first pass `[RPC_COMPUTE] uid=137… live=1..12`; later tokens `[RPC_RECOMPUTE] uid=528…`. Decode **1.34 → 8.31 tok/s**. Still **< B_single 19.816**. Physics: ~97 serial USB4 AllReduces/token. 8.3 tok/s ≈ 120 ms/token. Do **not** relabel layer-split or replica as TP to beat that floor. Cherry-picking HIP mmq/FA from halo-box is a later PR and must not regress 323.
+
+Launch env that produced 323 (pid 256130):
+
+```
+TBSTRIPE_SIMPLEX=master GGML_RPC_SET_TENSOR_CHUNK=2048
+LLAMA_MIRROR_OUTPUT_WEIGHT=1 LLAMA_TP_MIRROR_GDN=1
+LLAMA_TP_SPLIT_SSM_OUT=1 LLAMA_TP_SSM_OUT_NSPLIT=1
+GGML_CUDA_DISABLE_FUSION=1 GGML_CUDA_DISABLE_GRAPHS=1
+-sm rpc-tensor -ts 1,1 --stream /dev/tbstream0,/dev/tbstream1
+```
+
+HIP md5 still `e03fcf630ee87717e278ae297d0d154d` both nodes. Worker `llama-rpc` **v6.1.1**.
 
 ### Remaining
 
-1. Content 323: HIP shard GEMM equals full-W on a standalone graph, but the live TP graph diverges at layer 1 GDN `x`. Next: why residual/FFN after layer-0 allgather desyncs devices (MIRROR_GDN + mirrored `ssm_out` still does `170+153`).
-2. AllGather split GDN so `MIRROR_GDN` can go away; keep 3-rep W with 3-rep `x`.
-3. uid-keyed `GRAPH_RECOMPUTE` ring after 323, then remeasure vs 19.816.
+1. Drop `MIRROR_GDN` once split GDN activations AllGather to 3-rep `x` matching 3-rep `W` (not required for 323 on the quality path above).
+2. USB4 AR count still floors decode at **~8.3 tok/s** vs `B_single` 19.816. Report, do not fake TP with replica.
+3. Unaligned PLE `node_206 (view)` still `META_BADPTR` on some taps; PLE kernel rows are aligned. Hunt only if quality regresses.
 
 ## Files that matter
 
 | File | Role |
 |---|---|
-| `ggml/src/ggml-backend-meta.cpp` | split handlers, host-pack SET, SET_NR_CHK, skip-rebuild `graph_sig` |
-| `ggml/src/ggml-rpc/ggml-rpc.cpp` | USB4STREAM RPC, HC-only VIEW rebase, GRAPH_RECOMPUTE (one slot today) |
+| `ggml/src/ggml-backend-meta.cpp` | split handlers, host-pack SET, INNERN native-1280 dest + SETCHK, FFN AR of MIRRORED `ffn_moe_out`, skip-rebuild `graph_sig` |
+| `ggml/src/ggml-rpc/ggml-rpc.cpp` | USB4STREAM RPC, HC-only VIEW rebase, uid-keyed GRAPH_RECOMPUTE ring (RPC 6.1.1) |
+| `ggml/include/ggml-rpc.h` | `RPC_PROTO_PATCH_VERSION` 1 |
 | `ggml/src/ggml-cuda/gated_delta_net.cu` | HIP GDN, pack_contiguous_f32, GDN_HIP/GDN_ACT logs |
 | `src/llama-model.cpp` | Qwen 3.5 `get_split_segments` |
-| `src/models/qwen4exp.cpp` | GDN graph, `ggml_cont` Q/K/V, fused-only Q/K repeat |
+| `src/models/qwen4exp.cpp` | GDN graph, PLE kernel transpose for 16-byte views, `ggml_cont` Q/K/V |
 | `tbstripe/` | USB4STREAM driver userspace / README |
 
 ## Non-goals
