@@ -1291,6 +1291,18 @@ ggml_tensor * llama_model_qwen4exp::graph::build_ple(
             ggml_reshape_3d(ctx0, normalized, hc_dim, n_seq_tokens, n_seqs),
             hist, hc_dim, il);
 
+    // Meta drops shards whose data pointer is not 16-byte aligned
+    // (ggml_backend_meta_data_ptr_ok). A VIEW of column k at k*nb[0] is
+    // 2-byte aligned for F16, so the worker skipped PLE conv while local
+    // HIP still ran it — layer-1 GDN x diverged. Cast+transpose so each
+    // tap is a contiguous aligned row.
+    ggml_tensor * w_ple = model.layers[il].ple_conv1d;
+    if (w_ple->type != GGML_TYPE_F32) {
+        w_ple = ggml_cast(ctx0, w_ple, GGML_TYPE_F32);
+    }
+    w_ple = ggml_cont(ctx0, ggml_transpose(ctx0, w_ple));
+    cb(w_ple, "ple_conv1d_t", il);
+
     ggml_tensor * conv_out = nullptr;
     for (int64_t k = 0; k < kern; ++k) {
         // tap k reads (kern-1-k)*dilation positions back
@@ -1302,16 +1314,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_ple(
                                 padded->nb[1], padded->nb[2],
                                 ggml_row_size(padded->type, start))));
 
-        // column k of the [kern, hc_dim] kernel is one weight per channel
-        ggml_tensor * wk = ggml_cont(ctx0,
-                ggml_view_2d(ctx0, model.layers[il].ple_conv1d, 1, hc_dim,
-                        model.layers[il].ple_conv1d->nb[1],
-                        k * model.layers[il].ple_conv1d->nb[0]));
-        // this kernel keeps the file type, so cast it before it multiplies an f32 activation
+        ggml_tensor * wk = ggml_view_1d(ctx0, w_ple, hc_dim, (size_t) k * w_ple->nb[1]);
         wk = ggml_reshape_1d(ctx0, wk, hc_dim);
-        if (wk->type != GGML_TYPE_F32) {
-            wk = ggml_cast(ctx0, wk, GGML_TYPE_F32);
-        }
 
         ggml_tensor * term = ggml_mul(ctx0, shifted, wk);
         conv_out = conv_out ? ggml_add(ctx0, conv_out, term) : term;
