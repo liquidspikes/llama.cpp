@@ -30,6 +30,21 @@
 #define SPEC_VOCAB_MAX_SIZE_DIFFERENCE  128
 #define SPEC_VOCAB_CHECK_START_TOKEN_ID 5
 
+int common_spec_usb4_verify_n_tokens(int n_real, int n_max, bool target_has_meta) {
+    if (!target_has_meta || n_real <= 1 || n_max < 1) {
+        return n_real;
+    }
+    const int want = n_max + 1;
+    return n_real < want ? want : n_real;
+}
+
+bool common_spec_target_has_meta(const llama_context * ctx) {
+    if (ctx == nullptr) {
+        return false;
+    }
+    return llama_model_has_meta_device(llama_get_model(ctx));
+}
+
 const std::map<std::string, common_speculative_type> common_speculative_type_from_name_map = {
     {"none",          COMMON_SPECULATIVE_TYPE_NONE},
     {"draft-simple",  COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE},
@@ -2537,9 +2552,10 @@ common_speculative_init_result::common_speculative_init_result(
     // the draft context holds as many tokens per sequence as the target context
     cparams.n_ctx = llama_n_ctx(ctx_tgt);
 
-    // note: for small models maybe we can set this to the maximum possible draft from all speculative types
-    //       the extra memory for small models is likely negligible?
-    cparams.n_rs_seq  = 0;
+    // Match the target: draft-mtp/eagle3/dflash/dspark need n_rs_seq = n_max so
+    // SEQ_RM_TYPE_RS can roll back rejected drafts without host checkpoints.
+    // Zeroing this forced SEQ_RM_TYPE_FULL + PARTIAL_ONLY host snapshots every round.
+    cparams.n_rs_seq = params.speculative.need_n_rs_seq();
     cparams.ctx_other = ctx_tgt;
 
     std::string model_path;
