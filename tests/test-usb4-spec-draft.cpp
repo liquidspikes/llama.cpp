@@ -1,5 +1,6 @@
 #include "speculative.h"
 #include "../src/llama-ext.h"
+#include "../ggml/src/ggml-backend-meta-seq.h"
 
 #include <cstdio>
 
@@ -32,6 +33,22 @@ int main() {
           "nullptr model is not Meta");
     check(common_spec_target_has_meta(nullptr) == false,
           "nullptr ctx is not Meta");
+
+    const uint64_t fp_t1 = ggml_meta_seq_graph_fp(7287, 2560, 4, 1, 1);
+    const uint64_t fp_t8 = ggml_meta_seq_graph_fp(7287, 2560, 4, 8, 1);
+    check(fp_t1 != fp_t8, "T=1 and T=8 fingerprints differ");
+    check(ggml_meta_seq_sig_reuse(true, 7287, 7287, fp_t1, fp_t1) == true,
+          "SEQ plan + same n_nodes + same T reuses graph_sig");
+    check(ggml_meta_seq_sig_reuse(true, 7287, 7287, fp_t1, fp_t8) == false,
+          "same n_nodes but T=8 vs T=1 forces rehash");
+    check(ggml_meta_seq_sig_reuse(true, 7287, 8000, fp_t1, fp_t1) == false,
+          "n_nodes change forces rehash");
+    check(ggml_meta_seq_sig_reuse(false, 7287, 7287, fp_t1, fp_t1) == false,
+          "no SEQ plan forces rehash");
+    check(ggml_meta_seq_skip_rpc_sync(true) == true,
+          "SEQ success skips dummy RPC sync");
+    check(ggml_meta_seq_skip_rpc_sync(false) == false,
+          "without SEQ still RPC-syncs");
 
     if (fails) {
         fprintf(stderr, "%d check(s) failed\n", fails);
