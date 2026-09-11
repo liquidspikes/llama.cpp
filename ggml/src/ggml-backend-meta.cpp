@@ -2,6 +2,7 @@
 #include "ggml-impl.h"
 #include "ggml-backend.h"
 #include "ggml-backend-impl.h"
+#include "ggml-backend-meta-seq.h"
 #include "ggml-alloc.h"
 #include "ggml-cpp.h"
 
@@ -2972,6 +2973,9 @@ struct ggml_backend_meta_context {
     comm_set_pending_ar_t                comm_set_pending_ar = nullptr;
     comm_finish_ar_t                     comm_finish_ar      = nullptr;
     bool                                 seq_plan_valid = false;
+    bool                                 seq_skip_rpc_sync = false;
+    int                                  seq_cached_n_nodes = -1;
+    uint64_t                             seq_cached_fp = 0;
     size_t                               seq_j_local    = 0;
     size_t                               seq_j_rpc      = 0;
     std::vector<ggml_cgraph *>           seq_local_gs;
@@ -3176,9 +3180,19 @@ static void ggml_backend_meta_get_tensor_async(ggml_backend_t backend, const ggm
 }
 
 static void ggml_backend_meta_synchronize(ggml_backend_t backend) {
+    ggml_backend_meta_context * backend_ctx = (ggml_backend_meta_context *) backend->context;
     const size_t n_backends = ggml_backend_meta_n_backends(backend);
+    const bool skip_rpc = ggml_meta_seq_skip_rpc_sync(backend_ctx->seq_skip_rpc_sync);
+    backend_ctx->seq_skip_rpc_sync = false;
     for (size_t i = 0; i < n_backends; i++) {
-        ggml_backend_synchronize(ggml_backend_meta_simple_backend(backend, i));
+        ggml_backend_t simple = ggml_backend_meta_simple_backend(backend, i);
+        if (skip_rpc) {
+            const char * bname = ggml_backend_name(simple);
+            if (bname != nullptr && strncmp(bname, "RPC", 3) == 0) {
+                continue;
+            }
+        }
+        ggml_backend_synchronize(simple);
     }
 }
 
@@ -3190,17 +3204,32 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     // llama.cpp assigns a new cgraph->uid on every sched pass, which forced a
     // full USB4 GRAPH_COMPUTE serialize (~1s/token at 96 subgraphs). Reuse the
     // per-device subgraphs (and their RPC uids → GRAPH_RECOMPUTE) when the
-    // op/shape signature matches.
-    uint64_t graph_sig = (uint64_t) cgraph->n_nodes * 0x9e3779b97f4a7c15ull;
-    for (int i = 0; i < cgraph->n_nodes; i++) {
-        const ggml_tensor * n = cgraph->nodes[i];
-        graph_sig ^= (uint64_t) n->op + 0x9e3779b97f4a7c15ull + (graph_sig << 6) + (graph_sig >> 2);
-        graph_sig ^= (uint64_t) n->ne[0] + ((uint64_t) n->ne[1] << 20) + ((uint64_t) n->ne[2] << 40);
-    }
-    const bool needs_rebuild = (backend_ctx->n_subgraphs == 0) || (graph_sig != backend_ctx->graph_sig);
-    backend_ctx->graph_sig = graph_sig;
-    if (needs_rebuild) {
-        backend_ctx->seq_plan_valid = false;
+    // op/shape signature matches. After SEQ is planned, skip the 7k-node hash.
+    bool needs_rebuild;
+    const ggml_tensor * n0 = (cgraph->n_nodes > 0) ? cgraph->nodes[0] : nullptr;
+    const uint64_t fp = ggml_meta_seq_graph_fp(
+            cgraph->n_nodes,
+            n0 ? (uint64_t) n0->ne[0] : 0,
+            n0 ? (uint64_t) n0->ne[1] : 0,
+            n0 ? (uint64_t) n0->ne[2] : 0,
+            n0 ? (uint64_t) n0->op : 0);
+    if (ggml_meta_seq_sig_reuse(backend_ctx->seq_plan_valid, backend_ctx->seq_cached_n_nodes, cgraph->n_nodes,
+                backend_ctx->seq_cached_fp, fp)) {
+        needs_rebuild = false;
+    } else {
+        uint64_t graph_sig = (uint64_t) cgraph->n_nodes * 0x9e3779b97f4a7c15ull;
+        for (int i = 0; i < cgraph->n_nodes; i++) {
+            const ggml_tensor * n = cgraph->nodes[i];
+            graph_sig ^= (uint64_t) n->op + 0x9e3779b97f4a7c15ull + (graph_sig << 6) + (graph_sig >> 2);
+            graph_sig ^= (uint64_t) n->ne[0] + ((uint64_t) n->ne[1] << 20) + ((uint64_t) n->ne[2] << 40);
+        }
+        needs_rebuild = (backend_ctx->n_subgraphs == 0) || (graph_sig != backend_ctx->graph_sig);
+        backend_ctx->graph_sig = graph_sig;
+        backend_ctx->seq_cached_n_nodes = cgraph->n_nodes;
+        backend_ctx->seq_cached_fp = fp;
+        if (needs_rebuild) {
+            backend_ctx->seq_plan_valid = false;
+        }
     }
     if (!needs_rebuild) {
         static int nreuse;
@@ -4012,6 +4041,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                         backend_ctx->backend_configs[j_local].backend,
                         backend_ctx->seq_local_gs.data(), backend_ctx->seq_local_ar.data(),
                         backend_ctx->seq_rpc_uids.data(), backend_ctx->seq_rpc_ar.data(), ns)) {
+                    backend_ctx->seq_skip_rpc_sync = true;
                     return GGML_STATUS_SUCCESS;
                 }
                 backend_ctx->seq_plan_valid = false;
