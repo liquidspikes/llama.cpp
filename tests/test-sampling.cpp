@@ -334,8 +334,42 @@ static void test_perf() {
     BENCH(llama_sampler_init_xtc    (1.0f, 0.1f, 1, 1),       data, 32);
 }
 
+static void test_token_data_select_topk() {
+    const int n = 200000;
+    std::vector<float> logits(n, -5.0f);
+    logits[123456] = 9.0f;
+    logits[7]      = 8.5f;
+    logits[999]    = 8.0f;
+    logits[42]     = -20.0f;
+
+    std::vector<llama_token_data> dst(8);
+    const int32_t got = llama_token_data_select_topk(dst.data(), 3, logits.data(), n);
+    GGML_ASSERT(got == 3);
+
+    bool saw_peak = false;
+    bool saw_second = false;
+    bool saw_third = false;
+    bool saw_low = false;
+    for (int i = 0; i < got; i++) {
+        if (dst[i].id == 123456) { saw_peak = true; GGML_ASSERT(dst[i].logit == 9.0f); }
+        if (dst[i].id == 7)      { saw_second = true; }
+        if (dst[i].id == 999)    { saw_third = true; }
+        if (dst[i].id == 42)     { saw_low = true; }
+    }
+    GGML_ASSERT(saw_peak && saw_second && saw_third);
+    GGML_ASSERT(!saw_low);
+
+    std::vector<llama_token_data> dst1(1);
+    GGML_ASSERT(llama_token_data_select_topk(dst1.data(), 1, logits.data(), n) == 1);
+    GGML_ASSERT(dst1[0].id == 123456);
+
+    printf("token_data_select_topk: OK\n");
+}
+
 int main(void) {
     ggml_time_init();
+
+    test_token_data_select_topk();
 
     test_dist_singleton_rng();
 

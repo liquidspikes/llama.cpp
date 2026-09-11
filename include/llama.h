@@ -1540,6 +1540,10 @@ extern "C" {
     // Returns the sampled token
     LLAMA_API llama_token llama_sampler_sample(struct llama_sampler * smpl, struct llama_context * ctx, int32_t idx);
 
+    // Fill dst[0..k) with the k highest logits (unordered). Returns k, or n_vocab if k<=0 or k>=n_vocab
+    // (then dst must hold n_vocab entries). Used when backend sampling is off (tensor-split / rpc-tensor).
+    LLAMA_API int32_t llama_token_data_select_topk(struct llama_token_data * dst, int32_t k, const float * logits, int32_t n_vocab);
+
     // TODO: extend in the future
     //LLAMA_API void llama_decode_with_sampler(struct llama_context * ctx, struct llama_sampler * smpl, struct llama_batch batch, ...);
 
