@@ -1,8 +1,53 @@
 #include "gated_delta_net.cuh"
 #include "ggml-cuda/common.cuh"
 
+// Lane r-index is contiguous (lane*rows + r) so S_v=128 is a float4 per thread.
+template <int rows_per_lane>
+static __device__ __forceinline__ void gdn_load_rows(float * dst, const float * src, const int lane) {
+    const int base = lane * rows_per_lane;
+    if constexpr (rows_per_lane == 4) {
+        const float4 v = *reinterpret_cast<const float4 *>(src + base);
+        dst[0] = v.x;
+        dst[1] = v.y;
+        dst[2] = v.z;
+        dst[3] = v.w;
+    } else if constexpr (rows_per_lane == 2) {
+        const float2 v = *reinterpret_cast<const float2 *>(src + base);
+        dst[0] = v.x;
+        dst[1] = v.y;
+    } else {
+#pragma unroll
+        for (int r = 0; r < rows_per_lane; ++r) {
+            dst[r] = src[base + r];
+        }
+    }
+}
+
+template <int rows_per_lane>
+static __device__ __forceinline__ void gdn_store_rows(float * dst, const float * src, const int lane) {
+    const int base = lane * rows_per_lane;
+    if constexpr (rows_per_lane == 4) {
+        float4 v;
+        v.x = src[0];
+        v.y = src[1];
+        v.z = src[2];
+        v.w = src[3];
+        *reinterpret_cast<float4 *>(dst + base) = v;
+    } else if constexpr (rows_per_lane == 2) {
+        float2 v;
+        v.x = src[0];
+        v.y = src[1];
+        *reinterpret_cast<float2 *>(dst + base) = v;
+    } else {
+#pragma unroll
+        for (int r = 0; r < rows_per_lane; ++r) {
+            dst[base + r] = src[r];
+        }
+    }
+}
+
 template <int S_v, bool KDA, bool keep_rs_t>
-__global__ void __launch_bounds__((ggml_cuda_get_physical_warp_size() < S_v ? ggml_cuda_get_physical_warp_size() : S_v) * 4, 2)
+__global__ void __launch_bounds__((ggml_cuda_get_physical_warp_size() < S_v ? ggml_cuda_get_physical_warp_size() : S_v) * 8, 1)
 gated_delta_net_cuda(const float * q,
                                      const float * k,
                                      const float * v,
@@ -49,16 +94,13 @@ gated_delta_net_cuda(const float * q,
 
     constexpr int warp_size = ggml_cuda_get_physical_warp_size() < S_v ? ggml_cuda_get_physical_warp_size() : S_v;
     static_assert(S_v % warp_size == 0, "S_v must be a multiple of warp_size");
-    constexpr int rows_per_lane = (S_v + warp_size - 1) / warp_size;
+    constexpr int rows_per_lane = S_v / warp_size;
     float         s_shard[rows_per_lane];
     // state is stored transposed: M[col][i] = S[i][col], row col is contiguous
+    __shared__ float qk_s[2 * S_v];
 
     ggml_cuda_pdl_sync();
-#pragma unroll
-    for (int r = 0; r < rows_per_lane; r++) {
-        const int i = r * warp_size + lane;
-        s_shard[r]  = curr_state[i];
-    }
+    gdn_load_rows<rows_per_lane>(s_shard, curr_state, lane);
 
     for (int t = 0; t < n_tokens; t++) {
         const float * q_t = q + iq3 * sq3 + t * sq2 + iq1 * sq1;
@@ -71,18 +113,22 @@ gated_delta_net_cuda(const float * q,
 
         const float beta_val = *beta_t;
 
-        // Cache k and q in registers
+        // One cooperative load of q/k per block; every warp of this head/token
+        // otherwise re-fetched the same 2*S_v floats from global.
+        const int tid = threadIdx.y * warp_size + lane;
+        if (tid < S_v) {
+            qk_s[tid]         = q_t[tid];
+            qk_s[S_v + tid]   = k_t[tid];
+        }
+        __syncthreads();
+
         float k_reg[rows_per_lane];
         float q_reg[rows_per_lane];
-#pragma unroll
-        for (int r = 0; r < rows_per_lane; r++) {
-            const int i = r * warp_size + lane;
-            k_reg[r] = k_t[i];
-            q_reg[r] = q_t[i];
-        }
+        gdn_load_rows<rows_per_lane>(q_reg, qk_s, lane);
+        gdn_load_rows<rows_per_lane>(k_reg, qk_s + S_v, lane);
 
         if constexpr (!KDA) {
-            const float g_val = expf(*g_t);
+            const float g_val = __expf(*g_t);
 
             // kv[col] = (S^T @ k)[col] = sum_i S[i][col] * k[i]
             float kv_shard = 0.0f;
@@ -110,12 +156,18 @@ gated_delta_net_cuda(const float * q,
                 attn_data[col] = attn_col * scale;
             }
         } else {
+            float g_reg[rows_per_lane];
+            gdn_load_rows<rows_per_lane>(g_reg, g_t, lane);
+#pragma unroll
+            for (int r = 0; r < rows_per_lane; r++) {
+                g_reg[r] = __expf(g_reg[r]);
+            }
+
             // kv[col] = sum_i g[i] * S[i][col] * k[i]
             float kv_shard = 0.0f;
 #pragma unroll
             for (int r = 0; r < rows_per_lane; r++) {
-                const int i = r * warp_size + lane;
-                kv_shard += expf(g_t[i]) * s_shard[r] * k_reg[r];
+                kv_shard += g_reg[r] * s_shard[r] * k_reg[r];
             }
 
             float kv_col = warp_reduce_sum<warp_size>(kv_shard);
@@ -128,8 +180,7 @@ gated_delta_net_cuda(const float * q,
             float attn_partial = 0.0f;
 #pragma unroll
             for (int r = 0; r < rows_per_lane; r++) {
-                const int i = r * warp_size + lane;
-                s_shard[r]  = expf(g_t[i]) * s_shard[r] + k_reg[r] * delta_col;
+                s_shard[r]  = g_reg[r] * s_shard[r] + k_reg[r] * delta_col;
                 attn_partial += s_shard[r] * q_reg[r];
             }
 
@@ -147,22 +198,16 @@ gated_delta_net_cuda(const float * q,
             // When n_tokens < K only slots 0..n_tokens-1 are written; older slots are caller-owned.
             const int target_slot = (int) n_tokens - 1 - t;
             if (target_slot >= 0 && target_slot < K) {
-                float * curr_state = state + target_slot * state_slot_stride;
-#pragma unroll
-                for (int r = 0; r < rows_per_lane; r++) {
-                    const int i = r * warp_size + lane;
-                    curr_state[col * S_v + i] = s_shard[r];
-                }
+                float * slot = state + target_slot * state_slot_stride + col * S_v;
+                gdn_store_rows<rows_per_lane>(slot, s_shard, lane);
             }
         }
+        // Next token overwrites qk_s; keep warps together before the next load.
+        __syncthreads();
     }
 
     if constexpr (!keep_rs_t) {
-#pragma unroll
-        for (int r = 0; r < rows_per_lane; r++) {
-            const int i          = r * warp_size + lane;
-            state[col * S_v + i] = s_shard[r];
-        }
+        gdn_store_rows<rows_per_lane>(state + col * S_v, s_shard, lane);
     }
 }
 
@@ -179,7 +224,9 @@ static void launch_gated_delta_net(
         float scale, int64_t state_slot_stride, int K, cudaStream_t stream) {
     //TODO: Add chunked kernel for even faster pre-fill
     const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
-    const int num_warps = 4;
+    // S_v=128 decode (Flash-Next): 8 warps/block covers 8 columns so k/q smem
+    // is amortized over twice as many columns as the old 4-warp launch.
+    const int num_warps = (S_v >= 128) ? 8 : 4;
     dim3      grid_dims(H, n_seqs, (S_v + num_warps - 1) / num_warps);
     dim3      block_dims(warp_size <= S_v ? warp_size : S_v, num_warps, 1);
 
@@ -323,40 +370,6 @@ static void ggml_cuda_op_gated_delta_net_impl(
         sb2 = nbb2 / sizeof(float);
         sb3 = nbb3 / sizeof(float);
     }
-    {
-        static int nlog;
-        static int nlog1;
-        const bool log = (nlog < 4) || (n_tokens == 1 && nlog1 < 3);
-        if (log) {
-            if (n_tokens == 1) {
-                nlog1++;
-            } else {
-                nlog++;
-            }
-            fprintf(stderr, "[GDN_HIP] H=%lld T=%lld q1=%lld packed_g=%d packed_b=%d sb=%lld,%lld,%lld gne=[%lld,%lld,%lld] gnb=[%zu,%zu,%zu] qnb=[%zu,%zu,%zu] vnb=[%zu,%zu,%zu] qcont=%d vcont=%d\n",
-                    (long long) H, (long long) n_tokens, (long long) neq1,
-                    (int) packed_g, (int) packed_b,
-                    (long long) sb1, (long long) sb2, (long long) sb3,
-                    (long long) src_g->ne[0], (long long) src_g->ne[1], (long long) src_g->ne[2],
-                    src_g->nb[1], src_g->nb[2], src_g->nb[3],
-                    src_q->nb[1], src_q->nb[2], src_q->nb[3],
-                    src_v->nb[1], src_v->nb[2], src_v->nb[3],
-                    (int) ggml_is_contiguous(src_q), (int) ggml_is_contiguous(src_v));
-            float hq=0, hk=0, hv0=0, hv8=0, hv16=0;
-            CUDA_CHECK(cudaMemcpy(&hq, q_d, sizeof(float), cudaMemcpyDeviceToHost));
-            CUDA_CHECK(cudaMemcpy(&hk, k_d, sizeof(float), cudaMemcpyDeviceToHost));
-            CUDA_CHECK(cudaMemcpy(&hv0, v_d, sizeof(float), cudaMemcpyDeviceToHost));
-            if (H > 8) {
-                CUDA_CHECK(cudaMemcpy(&hv8, v_d + 8 * sv1, sizeof(float), cudaMemcpyDeviceToHost));
-            }
-            if (H > 16) {
-                CUDA_CHECK(cudaMemcpy(&hv16, v_d + 16 * sv1, sizeof(float), cudaMemcpyDeviceToHost));
-            }
-            fprintf(stderr, "[GDN_ACT] q0=%g k0=%g v0=%g v8=%g v16=%g sv1=%lld\n",
-                    hq, hk, hv0, hv8, hv16, (long long) sv1);
-        }
-    }
-
     const float scale = 1.0f / sqrtf((float) S_v);
 
     cudaStream_t stream = ctx.stream();

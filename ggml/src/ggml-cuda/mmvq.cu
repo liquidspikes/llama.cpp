@@ -21,9 +21,9 @@ static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type) 
         case GGML_TYPE_NVFP4:   return vec_dot_nvfp4_q8_1;
         case GGML_TYPE_Q2_K:    return vec_dot_q2_K_q8_1;
         case GGML_TYPE_Q3_K:    return vec_dot_q3_K_q8_1;
-        case GGML_TYPE_Q4_K:    return vec_dot_q4_K_q8_1;
-        case GGML_TYPE_Q5_K:    return vec_dot_q5_K_q8_1;
-        case GGML_TYPE_Q6_K:    return vec_dot_q6_K_q8_1;
+        case GGML_TYPE_Q4_K:    return vec_dot_q4_K_q8_1_vdr4;
+        case GGML_TYPE_Q5_K:    return vec_dot_q5_K_q8_1_vdr4;
+        case GGML_TYPE_Q6_K:    return vec_dot_q6_K_q8_1_vdr2;
         case GGML_TYPE_IQ2_XXS: return vec_dot_iq2_xxs_q8_1;
         case GGML_TYPE_IQ2_XS:  return vec_dot_iq2_xs_q8_1;
         case GGML_TYPE_IQ2_S:   return vec_dot_iq2_s_q8_1;
@@ -70,6 +70,7 @@ enum mmvq_parameter_table_id {
     MMVQ_PARAMETERS_GCN,
     MMVQ_PARAMETERS_RDNA2,
     MMVQ_PARAMETERS_RDNA3_0,
+    MMVQ_PARAMETERS_RDNA3_5,
     MMVQ_PARAMETERS_RDNA4,
     MMVQ_PARAMETERS_GB10
 };
@@ -79,7 +80,9 @@ static constexpr __device__ mmvq_parameter_table_id get_device_table_id() {
     return MMVQ_PARAMETERS_RDNA4;
 #elif defined(RDNA3_0)
     return MMVQ_PARAMETERS_RDNA3_0;
-#elif defined(RDNA2) || defined(RDNA3_5)
+#elif defined(RDNA3_5)
+    return MMVQ_PARAMETERS_RDNA3_5;
+#elif defined(RDNA2)
     return MMVQ_PARAMETERS_RDNA2;
 #elif defined(GCN) || defined(CDNA)
     return MMVQ_PARAMETERS_GCN;
@@ -99,7 +102,10 @@ static __host__ mmvq_parameter_table_id get_device_table_id(int cc) {
     if (GGML_CUDA_CC_IS_RDNA3_0(cc)) {
         return MMVQ_PARAMETERS_RDNA3_0;
     }
-    if (GGML_CUDA_CC_IS_RDNA2(cc) || GGML_CUDA_CC_IS_RDNA3_5(cc)) {
+    if (GGML_CUDA_CC_IS_RDNA3_5(cc)) {
+        return MMVQ_PARAMETERS_RDNA3_5;
+    }
+    if (GGML_CUDA_CC_IS_RDNA2(cc)) {
         return MMVQ_PARAMETERS_RDNA2;
     }
     if (GGML_CUDA_CC_IS_GCN(cc) || GGML_CUDA_CC_IS_CDNA(cc)) {
@@ -476,6 +482,21 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
                     return 2;
                 case GGML_TYPE_IQ4_NL:
                     return 8;
+                default:
+                    return 1;
+            }
+        }
+        return 1;
+    }
+    if (table_id == MMVQ_PARAMETERS_RDNA3_5) {
+        // gfx1151: nwarps=1 (RDNA2 table) underutilizes wave32 on large-K
+        // decode; nwarps=8 over-parallelizes the small ones. Swept nwarps=2
+        // for Q8_0 (~+0.6% decode); nwarps=4 regresses. Apply to ncols 1..8
+        // so a speculative verify batch matches decode accumulation.
+        if (ncols_dst <= MMVQ_MAX_BATCH_SIZE) {
+            switch (type) {
+                case GGML_TYPE_Q8_0:
+                    return 2;
                 default:
                     return 1;
             }

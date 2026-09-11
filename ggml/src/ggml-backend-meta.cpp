@@ -3213,6 +3213,25 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             n0 ? (uint64_t) n0->ne[1] : 0,
             n0 ? (uint64_t) n0->ne[2] : 0,
             n0 ? (uint64_t) n0->op : 0);
+    static const bool no_seq = getenv("LLAMA_TP_NO_SEQ") != nullptr;
+    if (ggml_meta_seq_can_fast(backend_ctx->seq_plan_valid, backend_ctx->seq_cached_n_nodes, cgraph->n_nodes,
+                backend_ctx->seq_cached_fp, fp, backend_ctx->n_subgraphs, backend_ctx->seq_local_gs.size())
+            && backend_ctx->comm_graph_seq != nullptr && backend_ctx->comm_ctx != nullptr
+            && !no_seq) {
+        const size_t j_local = backend_ctx->seq_j_local;
+        const size_t j_rpc   = backend_ctx->seq_j_rpc;
+        if (j_local < n_backends && j_rpc < n_backends) {
+            if (backend_ctx->comm_graph_seq(backend_ctx->comm_ctx,
+                    backend_ctx->backend_configs[j_local].backend,
+                    backend_ctx->seq_local_gs.data(), backend_ctx->seq_local_ar.data(),
+                    backend_ctx->seq_rpc_uids.data(), backend_ctx->seq_rpc_ar.data(),
+                    backend_ctx->n_subgraphs)) {
+                backend_ctx->seq_skip_rpc_sync = true;
+                return GGML_STATUS_SUCCESS;
+            }
+            backend_ctx->seq_plan_valid = false;
+        }
+    }
     if (ggml_meta_seq_sig_reuse(backend_ctx->seq_plan_valid, backend_ctx->seq_cached_n_nodes, cgraph->n_nodes,
                 backend_ctx->seq_cached_fp, fp)) {
         needs_rebuild = false;
