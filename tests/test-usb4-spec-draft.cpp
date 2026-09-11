@@ -49,6 +49,14 @@ int main() {
           "SEQ success skips dummy RPC sync");
     check(ggml_meta_seq_skip_rpc_sync(false) == false,
           "without SEQ still RPC-syncs");
+    check(ggml_meta_seq_can_fast(true, 7287, 7287, fp_t1, fp_t1, 49, 49) == true,
+          "warm T=1 SEQ skips host rebuild");
+    check(ggml_meta_seq_can_fast(true, 7287, 7287, fp_t1, fp_t8, 49, 49) == false,
+          "T change does not take SEQ fast path");
+    check(ggml_meta_seq_can_fast(true, 7287, 7287, fp_t1, fp_t1, 49, 0) == false,
+          "empty SEQ plan vectors do not fast-path");
+    check(ggml_meta_seq_can_fast(false, 7287, 7287, fp_t1, fp_t1, 49, 49) == false,
+          "unplanned SEQ does not fast-path");
 
     if (fails) {
         fprintf(stderr, "%d check(s) failed\n", fails);
