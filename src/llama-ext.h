@@ -88,6 +88,9 @@ LLAMA_API int32_t llama_model_n_devices(const struct llama_model * model);
 
 LLAMA_API ggml_backend_dev_t llama_model_get_device(const struct llama_model * model, int i);
 
+// True when the model is wrapped in a Meta device (rpc-tensor / USB4STREAM TP).
+LLAMA_API bool llama_model_has_meta_device(const struct llama_model * model);
+
 LLAMA_API llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * ctx);
 
 // Set whether the context outputs nextn embeddings or not

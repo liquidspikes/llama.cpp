@@ -483,6 +483,24 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         auto qwen4exp_mirror = [&]() -> tensor_config {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
         };
+        // NextN / MTP lives at blk.{n_layer}.* — keep it fully local so the draft
+        // graph does not add USB4 AllReduces on every speculative verify.
+        if (ud->model->arch == LLM_ARCH_QWEN4EXP) {
+            int blk = -1;
+            if (tensor_name.size() > 4 && tensor_name.compare(0, 4, "blk.") == 0) {
+                blk = 0;
+                size_t i = 4;
+                for (; i < tensor_name.size() && tensor_name[i] >= '0' && tensor_name[i] <= '9'; ++i) {
+                    blk = blk * 10 + (tensor_name[i] - '0');
+                }
+                if (i == 4 || i >= tensor_name.size() || tensor_name[i] != '.') {
+                    blk = -1;
+                }
+            }
+            if (blk >= (int) ud->model->hparams.n_layer()) {
+                return qwen4exp_mirror();
+            }
+        }
         if (ud->model->arch == LLM_ARCH_QWEN4EXP && (mirror_gdn_env || mirror_dense_env)) {
             const bool gdn_tensor =
                 std::regex_match(tensor_name, pattern_qkv_weight) ||
@@ -2586,6 +2604,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                 const bool mtp_on_hybrid_qwen =
                     params.ctx_type == LLAMA_CONTEXT_TYPE_MTP &&
                     (arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE ||
+                     arch == LLM_ARCH_QWEN4EXP ||
                      arch == LLM_ARCH_BAILINGMOE3);
 
                 const bool mtp_on_hybrid_nemotron =
@@ -3276,6 +3295,18 @@ ggml_backend_dev_t llama_model_get_device(const struct llama_model * model, int 
         return nullptr;
     }
     return model->devices[i].dev;
+}
+
+bool llama_model_has_meta_device(const struct llama_model * model) {
+    if (model == nullptr) {
+        return false;
+    }
+    for (const auto & d : model->devices) {
+        if (d.is_meta) {
+            return true;
+        }
+    }
+    return false;
 }
 
 //

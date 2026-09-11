@@ -23,6 +23,12 @@ enum common_speculative_type common_speculative_type_from_name(const std::string
 // convert type to string
 std::string common_speculative_type_to_str(enum common_speculative_type type);
 
+// USB4 rpc-tensor: pad the target verify ubatch to n_max+1 so graph_sig is
+// stable and GRAPH_RECOMPUTE hits. n_real is sampled+draft count (T=1 skip).
+int common_spec_usb4_verify_n_tokens(int n_real, int n_max, bool target_has_meta);
+
+bool common_spec_target_has_meta(const struct llama_context * ctx);
+
 // return the max number of draft tokens based on the speculative parameters
 int32_t common_speculative_n_max(const common_params_speculative * spec);
 
