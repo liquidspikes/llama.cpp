@@ -892,6 +892,45 @@ uint32_t llama_sampler_backend_n_nodes(const llama_sampler * sampler) {
     return chain->n_nodes;
 }
 
+int32_t llama_token_data_select_topk(struct llama_token_data * dst, int32_t k, const float * logits, int32_t n_vocab) {
+    GGML_ASSERT(dst != nullptr);
+    GGML_ASSERT(logits != nullptr);
+    GGML_ASSERT(n_vocab > 0);
+
+    if (k <= 0 || k >= n_vocab) {
+        for (int32_t i = 0; i < n_vocab; ++i) {
+            dst[i] = llama_token_data{ i, logits[i], 0.0f };
+        }
+        return n_vocab;
+    }
+
+    // min-heap of size k holding the current top-k (front = smallest of them)
+    using P = std::pair<float, llama_token>;
+    std::vector<P> heap;
+    heap.reserve((size_t) k);
+    auto cmp = [](const P & a, const P & b) { return a.first > b.first; };
+
+    for (int32_t i = 0; i < n_vocab; ++i) {
+        const float l = logits[i];
+        if ((int32_t) heap.size() < k) {
+            heap.emplace_back(l, (llama_token) i);
+            if ((int32_t) heap.size() == k) {
+                std::make_heap(heap.begin(), heap.end(), cmp);
+            }
+        } else if (l > heap.front().first) {
+            std::pop_heap(heap.begin(), heap.end(), cmp);
+            heap.back() = { l, (llama_token) i };
+            std::push_heap(heap.begin(), heap.end(), cmp);
+        }
+    }
+
+    const int32_t n = (int32_t) heap.size();
+    for (int32_t i = 0; i < n; ++i) {
+        dst[i] = llama_token_data{ heap[i].second, heap[i].first, 0.0f };
+    }
+    return n;
+}
+
 llama_token llama_sampler_sample(struct llama_sampler * smpl, struct llama_context * ctx, int32_t idx) {
     const llama_token   sampled_token  = llama_get_sampled_token_ith     (ctx, idx);
     const float *       sampled_probs  = llama_get_sampled_probs_ith     (ctx, idx);
@@ -938,10 +977,36 @@ llama_token llama_sampler_sample(struct llama_sampler * smpl, struct llama_conte
     } else {
         const auto * logits = llama_get_logits_ith(ctx, idx);
         GGML_ASSERT(logits != nullptr);
-        cur.resize(n_vocab);
-        for (llama_token token_id = 0; token_id < n_vocab; token_id++) {
-            cur[token_id] = llama_token_data{token_id, logits[token_id], 0.0f};
+        // rpc-tensor disables backend sampling, so this ran O(n_vocab) token_data
+        // fills (~248k, ~12 ms/token on Flash-Next). Pre-select top-k when the
+        // chain has a top-k (or greedy) so later apply() sees a tiny set.
+        int32_t n_keep = n_vocab;
+        if (smpl->iface == &llama_sampler_chain_i && n_vocab > 2048) {
+            const auto * chain = (const llama_sampler_chain *) smpl->ctx;
+            int32_t top_k = 0;
+            bool greedy = false;
+            for (const auto & s : chain->samplers) {
+                const char * nm = llama_sampler_name(s.ptr);
+                if (nm == nullptr) {
+                    continue;
+                }
+                if (strstr(nm, "greedy") != nullptr) {
+                    greedy = true;
+                }
+                if (strstr(nm, "top-k") != nullptr) {
+                    // cover server --top-k 20 without reading sampler-private k
+                    top_k = std::max(top_k, 64);
+                }
+            }
+            if (greedy && top_k <= 0) {
+                n_keep = 1;
+            } else if (top_k > 0) {
+                n_keep = top_k;
+            }
         }
+        cur.resize((size_t) n_keep);
+        const int32_t n_got = llama_token_data_select_topk(cur.data(), n_keep == n_vocab ? 0 : n_keep, logits, n_vocab);
+        cur.resize((size_t) n_got);
     }
 
     llama_token_data_array cur_p = {

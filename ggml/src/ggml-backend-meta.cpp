@@ -3182,8 +3182,10 @@ static void ggml_backend_meta_get_tensor_async(ggml_backend_t backend, const ggm
 static void ggml_backend_meta_synchronize(ggml_backend_t backend) {
     ggml_backend_meta_context * backend_ctx = (ggml_backend_meta_context *) backend->context;
     const size_t n_backends = ggml_backend_meta_n_backends(backend);
+    // Keep the skip bit until the next graph_compute. llama_decode + sampler
+    // each call synchronize(); clearing it here made the second call a dummy
+    // USB4 RPC round-trip (~ms) after SEQ already drained the worker.
     const bool skip_rpc = ggml_meta_seq_skip_rpc_sync(backend_ctx->seq_skip_rpc_sync);
-    backend_ctx->seq_skip_rpc_sync = false;
     for (size_t i = 0; i < n_backends; i++) {
         ggml_backend_t simple = ggml_backend_meta_simple_backend(backend, i);
         if (skip_rpc) {
@@ -3200,6 +3202,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     GGML_ASSERT(cgraph->grads == nullptr);
     const size_t n_backends = ggml_backend_meta_n_backends(backend);
     ggml_backend_meta_context * backend_ctx = (ggml_backend_meta_context *) backend->context;
+    backend_ctx->seq_skip_rpc_sync = false;
 
     // llama.cpp assigns a new cgraph->uid on every sched pass, which forced a
     // full USB4 GRAPH_COMPUTE serialize (~1s/token at 96 subgraphs). Reuse the

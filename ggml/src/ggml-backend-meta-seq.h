@@ -21,6 +21,9 @@ static inline bool ggml_meta_seq_skip_rpc_sync(bool seq_just_completed) {
     return seq_just_completed;
 }
 
+// Skip bit stays set across llama_decode/sampler synchronizes until the next
+// graph_compute. Tests: a completed SEQ skips; a fresh compute does not.
+
 // Warm T=1 decode: SEQ plan is already filled. Skip lambda/aux/rebuild setup.
 static inline bool ggml_meta_seq_can_fast(bool plan_valid, int cached_n_nodes, int n_nodes,
         uint64_t cached_fp, uint64_t fp, size_t n_subgraphs, size_t seq_gs_len) {
