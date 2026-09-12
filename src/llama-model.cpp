@@ -882,7 +882,30 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                 std::regex_match(tensor_name, pattern_ffn_down_shexp_weight)) {
             const int64_t blck_size_perf = std::lcm(blck_size, 128);
             GGML_ASSERT(segments.size() == 1);
-            return {blck_size_perf};
+            // Q4_K lcm(.,128)=256. n_ff_exp=640 then 50/50 rounds to 256/384, and
+            // SEQ waits on the 384-row rank every layer. Gate/up split axis 1
+            // (rows) has no Q4_K block constraint; down Q8_0 axis 0 only needs 32.
+            // 320/320 is valid and removes that bubble.
+            int64_t g = blck_size_perf;
+            const int64_t even = segments[0].first / (int64_t) ud->n_devices;
+            if (ud->model->arch == LLM_ARCH_QWEN4EXP && even > 0) {
+                const int64_t min_align = blck_size <= 32 ? blck_size : (int64_t) 1;
+                int64_t cand = 128;
+                while (cand > min_align && (even % cand) != 0) {
+                    cand /= 2;
+                }
+                if ((even % cand) == 0 && cand >= min_align) {
+                    g = cand;
+                }
+                static int nlog_ffn_g;
+                if (nlog_ffn_g < 6) {
+                    nlog_ffn_g++;
+                    fprintf(stderr, "[QWEN4EXP_FFN_G] %s ne=%ld even=%ld blck=%ld lcm128=%ld g=%ld\n",
+                            tensor_name.c_str(), (long) segments[0].first, (long) even,
+                            (long) blck_size, (long) blck_size_perf, (long) g);
+                }
+            }
+            return {g};
         }
 
         // everything else

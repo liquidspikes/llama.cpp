@@ -150,11 +150,14 @@ struct common_sampler {
                 cur[i] = llama_token_data{sampled_ids[i], sampled_logits[i], 0.0f};
             }
         } else {
+            const int64_t t_get = ggml_time_us();
             const auto * logits = llama_get_logits_ith(ctx, idx);
+            const int64_t get_us = ggml_time_us() - t_get;
             GGML_ASSERT(logits != nullptr);
             // rpc-tensor cannot offload sampling, so this used to fill n_vocab
-            // token_data (~248k, ~12 ms/token). When top_k is set, only keep those.
+            // token_data (~248k). When top_k is set, only keep those.
             const int32_t k = params.top_k;
+            const int64_t t_fill = ggml_time_us();
             if (k > 0 && k < n_vocab && n_vocab > 2048) {
                 cur.resize((size_t) k);
                 const int32_t got = llama_token_data_select_topk(cur.data(), k, logits, n_vocab);
@@ -162,6 +165,13 @@ struct common_sampler {
             } else {
                 cur.resize((size_t) n_vocab);
                 llama_token_data_select_topk(cur.data(), 0, logits, n_vocab);
+            }
+            static int nlog;
+            if (nlog < 6) {
+                nlog++;
+                fprintf(stderr, "[TOK] logits_get us=%lld fill us=%lld n_vocab=%d k=%d n_keep=%zu\n",
+                        (long long) get_us, (long long) (ggml_time_us() - t_fill),
+                        n_vocab, k, cur.size());
             }
         }
 
@@ -599,7 +609,13 @@ struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl) {
 }
 
 llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first) {
+    const int64_t t_ssync = ggml_time_us();
     llama_synchronize(ctx);
+    static int nlog_ssync;
+    if (nlog_ssync < 24) {
+        nlog_ssync++;
+        fprintf(stderr, "[TOK] sample_sync us=%lld\n", (long long) (ggml_time_us() - t_ssync));
+    }
 
     // start measuring sampling time after the llama_context synchronization in order to not measure any ongoing async operations
     const auto tm = gsmpl->tm();

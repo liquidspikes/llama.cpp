@@ -25,6 +25,10 @@
 #include <chrono>
 #include <cstdlib>
 #include <thread>
+#include <dlfcn.h>
+#include <cstdint>
+#include <unistd.h>
+#include <sys/mman.h>
 #if defined(__x86_64__) || defined(_M_X64)
 #  include <immintrin.h>
 #endif
@@ -101,6 +105,8 @@ static void allreduce_add_f16(ggml_fp16_t * dst, const ggml_fp16_t * src, size_t
                                            ggml_compute_fp16_to_fp32(src[i]));
     }
 }
+
+static bool rpc_use_uma(const ggml_tensor * t, size_t n);
 
 /* N-split AllGather: dest is [2*wN, nT], left/right are [wN, nT]. */
 static void allgather_concat_f32(float * dest, const float * left, const float * right,
@@ -674,6 +680,9 @@ public:
     void send_xchg(enum rpc_cmd cmd, std::shared_ptr<const void> input, size_t input_size,
                    const void * xchg_out, void * xchg_in, size_t xchg_n);
     bool xchg_raw(const void * out, void * in, size_t n);
+    // SEQ hot path: tbs_xchg on this thread. Dispatcher must be idle (no
+    // in-flight cmd). Avoids 48 queue hops + shared_ptr allocs per token.
+    bool xchg_direct(const void * out, void * in, size_t n);
 
     ggml_backend_event_t event_new(ggml_backend_dev_t dev);
     void event_free(ggml_backend_event_t event);
@@ -848,6 +857,16 @@ bool rpc_dispatcher::xchg_raw(const void * out, void * in, size_t n) {
     GGML_ASSERT(queue.push(msg));
     msg->completion.get_future().wait();
     return true;
+}
+
+bool rpc_dispatcher::xchg_direct(const void * out, void * in, size_t n) {
+    if (n == 0) {
+        return true;
+    }
+    if (sock == nullptr || out == nullptr || in == nullptr) {
+        return false;
+    }
+    return sock->xchg(out, in, n);
 }
 
 void rpc_dispatcher::work() {
@@ -1073,7 +1092,14 @@ static void ggml_backend_rpc_buffer_get_tensor(ggml_backend_buffer_t buffer, con
             fprintf(stderr, "  [RPC_BUF_GET_TENSOR chunk] transferred=%zu/%zu chunk=%zu\n",
                     transferred, size, chunk);
         }
-        ctx->dispatcher->send(RPC_CMD_GET_TENSOR, request, sizeof(*request), out + transferred, chunk);
+        if (chunk >= 4096) {
+            thread_local std::vector<uint8_t> dummy;
+            dummy.resize(chunk);
+            ctx->dispatcher->send_xchg(RPC_CMD_GET_TENSOR, request, sizeof(*request),
+                    dummy.data(), out + transferred, chunk);
+        } else {
+            ctx->dispatcher->send(RPC_CMD_GET_TENSOR, request, sizeof(*request), out + transferred, chunk);
+        }
         transferred += chunk;
     }
     if (tb_debug_enabled()) {
@@ -1281,9 +1307,98 @@ static void ggml_backend_rpc_free(ggml_backend_t backend) {
     delete backend;
 }
 
+static constexpr uint32_t RPC_SEQ_SET_MAGIC = 0x31544553u; // 'SET1'
+static constexpr size_t   RPC_DEFER_SET_MAX = 16384ull;
+
+struct rpc_pending_set {
+    rpc_tensor tensor;
+    uint64_t   offset;
+    std::vector<uint8_t> data;
+};
+
+static std::mutex g_pending_set_mu;
+static std::vector<rpc_pending_set> g_pending_sets;
+
+static void rpc_queue_set_tensor(const rpc_tensor & tensor, uint64_t offset, const void * data, size_t size) {
+    rpc_pending_set p;
+    p.tensor = tensor;
+    p.offset = offset;
+    p.data.assign(static_cast<const uint8_t *>(data), static_cast<const uint8_t *>(data) + size);
+    std::lock_guard<std::mutex> lock(g_pending_set_mu);
+    g_pending_sets.push_back(std::move(p));
+}
+
+static void rpc_append_pending_sets(std::vector<uint8_t> & payload) {
+    std::vector<rpc_pending_set> local;
+    {
+        std::lock_guard<std::mutex> lock(g_pending_set_mu);
+        local.swap(g_pending_sets);
+    }
+    if (local.empty()) {
+        return;
+    }
+    const uint32_t nset = (uint32_t) local.size();
+    payload.reserve(payload.size() + 8 + (size_t) nset * (sizeof(rpc_tensor) + 32));
+    const uint32_t magic = RPC_SEQ_SET_MAGIC;
+    const size_t mag_off = payload.size();
+    payload.resize(mag_off + 8);
+    memcpy(payload.data() + mag_off, &magic, 4);
+    memcpy(payload.data() + mag_off + 4, &nset, 4);
+    size_t nbytes = 0;
+    for (const rpc_pending_set & p : local) {
+        const uint32_t size = (uint32_t) p.data.size();
+        const uint32_t pad  = (8u - (size & 7u)) & 7u;
+        const size_t rec_off = payload.size();
+        payload.resize(rec_off + sizeof(rpc_tensor) + 16 + size + pad);
+        memcpy(payload.data() + rec_off, &p.tensor, sizeof(rpc_tensor));
+        memcpy(payload.data() + rec_off + sizeof(rpc_tensor), &p.offset, 8);
+        memcpy(payload.data() + rec_off + sizeof(rpc_tensor) + 8, &size, 4);
+        memcpy(payload.data() + rec_off + sizeof(rpc_tensor) + 12, &pad, 4);
+        if (size) {
+            memcpy(payload.data() + rec_off + sizeof(rpc_tensor) + 16, p.data.data(), size);
+        }
+        if (pad) {
+            memset(payload.data() + rec_off + sizeof(rpc_tensor) + 16 + size, 0, pad);
+        }
+        nbytes += size;
+    }
+    static int nlog_inp;
+    if (nlog_inp < 8) {
+        nlog_inp++;
+        fprintf(stderr, "[RPC_INP] nset=%u bytes=%zu packed=%zu\n",
+                nset, nbytes, payload.size());
+    }
+}
+
+static void rpc_flush_pending_sets_standalone(ggml_backend_rpc_context * ctx) {
+    std::vector<rpc_pending_set> local;
+    {
+        std::lock_guard<std::mutex> lock(g_pending_set_mu);
+        local.swap(g_pending_sets);
+    }
+    for (const rpc_pending_set & p : local) {
+        const size_t size = p.data.size();
+        const size_t input_size = sizeof(rpc_tensor) + sizeof(uint64_t) + size;
+        uint8_t * input = new uint8_t[input_size]();
+        memcpy(input, &p.tensor, sizeof(rpc_tensor));
+        memcpy(input + sizeof(rpc_tensor), &p.offset, sizeof(p.offset));
+        if (size) {
+            memcpy(input + sizeof(rpc_tensor) + sizeof(p.offset), p.data.data(), size);
+        }
+        std::shared_ptr<uint8_t> input_ptr(input, std::default_delete<uint8_t[]>());
+        uint8_t ack = 0;
+        ctx->dispatcher->send(RPC_CMD_SET_TENSOR, input_ptr, input_size, &ack, sizeof(ack));
+    }
+}
+
 static void ggml_backend_rpc_set_tensor_async(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     ggml_backend_rpc_context * ctx = (ggml_backend_rpc_context *)backend->context;
     rpc_tensor rpc_tensor = serialize_tensor(tensor);
+    if (size > 0 && size <= RPC_DEFER_SET_MAX) {
+        rpc_queue_set_tensor(rpc_tensor, offset, data, size);
+        return;
+    }
+    rpc_flush_pending_sets_standalone(ctx);
     if (size > rpc_hash_threshold()) {
         auto request = std::make_shared<rpc_msg_set_tensor_hash_req>();
         request->tensor = rpc_tensor;
@@ -1321,7 +1436,16 @@ static void ggml_backend_rpc_get_tensor_async(ggml_backend_t backend, const ggml
     request->tensor = serialize_tensor(tensor);
     request->offset = offset;
     request->size = size;
-    ctx->dispatcher->send(RPC_CMD_GET_TENSOR, request, sizeof(*request), data, size);
+    // Large gets (lm_head logits ~0.5 MiB/shard) used the cmd-channel
+    // send_data path (~12 ms/token). SEQ AllReduce already uses tbs_xchg;
+    // use the same DMA for GET payloads >= 4 KiB.
+    if (size >= 4096) {
+        thread_local std::vector<uint8_t> dummy;
+        dummy.resize(size);
+        ctx->dispatcher->send_xchg(RPC_CMD_GET_TENSOR, request, sizeof(*request), dummy.data(), data, size);
+    } else {
+        ctx->dispatcher->send(RPC_CMD_GET_TENSOR, request, sizeof(*request), data, size);
+    }
 }
 
 static void ggml_backend_rpc_synchronize(ggml_backend_t backend) {
@@ -1388,6 +1512,7 @@ static uint8_t * serialize_graph(uint32_t device, const ggml_cgraph * cgraph, co
 static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     int64_t t0 = rpc_perf_enabled() ? ggml_time_us() : 0;
     ggml_backend_rpc_context * rpc_ctx = (ggml_backend_rpc_context *)backend->context;
+    rpc_flush_pending_sets_standalone(rpc_ctx);
     ggml_backend_dev_t rpc_dev = ggml_backend_get_device(backend);
     ggml_backend_rpc_device_context * rpc_dev_ctx = (ggml_backend_rpc_device_context *)rpc_dev->context;
 
@@ -1613,6 +1738,7 @@ public:
     bool allreduce_last(socket_ptr sock, uint32_t device, uint64_t uid, uint32_t ar_bytes);
     bool allreduce_concat_last(socket_ptr sock, uint32_t device, uint64_t uid, uint32_t ar_bytes, uint32_t kind);
     bool graph_seq(const std::vector<uint8_t> & input, socket_ptr sock);
+    bool apply_seq_input_sets(const uint8_t * p, size_t n);
     bool init_tensor(const rpc_msg_init_tensor_req & request);
     bool get_alloc_size(const rpc_msg_get_alloc_size_req & request, rpc_msg_get_alloc_size_rsp & response);
     bool get_device_memory(const rpc_msg_get_device_memory_req & request, rpc_msg_get_device_memory_rsp & response);
@@ -2496,8 +2622,12 @@ bool rpc_server::allreduce_last(socket_ptr sock, uint32_t device, uint64_t uid, 
     if (peer_data.size() < ar_bytes) {
         peer_data.resize(ar_bytes);
     }
-    ggml_backend_tensor_get_async(backends[device], ar, local_data.data(), 0, ar_bytes);
-    ggml_backend_synchronize(backends[device]);
+    if (rpc_use_uma(ar, ar_bytes)) {
+        memcpy(local_data.data(), ar->data, ar_bytes);
+    } else {
+        ggml_backend_tensor_get_async(backends[device], ar, local_data.data(), 0, ar_bytes);
+        ggml_backend_synchronize(backends[device]);
+    }
     if (!sock->xchg(local_data.data(), peer_data.data(), ar_bytes)) {
         GGML_LOG_ERROR("RECOMPUTE AR tbs_xchg failed bytes=%u\n", ar_bytes);
         return false;
@@ -2509,7 +2639,11 @@ bool rpc_server::allreduce_last(socket_ptr sock, uint32_t device, uint64_t uid, 
         allreduce_add_f16((ggml_fp16_t *) local_data.data(),
                 (const ggml_fp16_t *) peer_data.data(), ar_bytes / sizeof(ggml_fp16_t));
     }
-    ggml_backend_tensor_set_async(backends[device], ar, local_data.data(), 0, ar_bytes);
+    if (rpc_use_uma(ar, ar_bytes)) {
+        memcpy(ar->data, local_data.data(), ar_bytes);
+    } else {
+        ggml_backend_tensor_set_async(backends[device], ar, local_data.data(), 0, ar_bytes);
+    }
     return true;
 }
 
@@ -2560,8 +2694,12 @@ bool rpc_server::allreduce_concat_last(socket_ptr sock, uint32_t device, uint64_
     if (peer_data.size() < ar_bytes) {
         peer_data.resize(ar_bytes);
     }
-    ggml_backend_tensor_get_async(backends[device], shard, local_data.data(), 0, ar_bytes);
-    ggml_backend_synchronize(backends[device]);
+    if (rpc_use_uma(shard, ar_bytes)) {
+        memcpy(local_data.data(), shard->data, ar_bytes);
+    } else {
+        ggml_backend_tensor_get_async(backends[device], shard, local_data.data(), 0, ar_bytes);
+        ggml_backend_synchronize(backends[device]);
+    }
     if (!sock->xchg(local_data.data(), peer_data.data(), ar_bytes)) {
         GGML_LOG_ERROR("SEQ CONCAT tbs_xchg failed bytes=%u\n", ar_bytes);
         return false;
@@ -2586,13 +2724,56 @@ bool rpc_server::allreduce_concat_last(socket_ptr sock, uint32_t device, uint64_
                 (const float *) peer_data.data(), (const float *) local_data.data(),
                 wN, nT);
     }
-    ggml_backend_tensor_set_async(backends[device], dest, full.data(), 0, ggml_nbytes(dest));
+    if (rpc_use_uma(dest, ggml_nbytes(dest))) {
+        memcpy(dest->data, full.data(), ggml_nbytes(dest));
+    } else {
+        ggml_backend_tensor_set_async(backends[device], dest, full.data(), 0, ggml_nbytes(dest));
+    }
     static int nlog;
     if (nlog < 4) {
         nlog++;
         fprintf(stderr, "[RPC_CONCAT] uid=%llu ar=%u dest_nb=%zu wN=%lld nT=%lld kind=%u\n",
                 (unsigned long long) uid, ar_bytes, ggml_nbytes(dest),
                 (long long) wN, (long long) nT, kind);
+    }
+    return true;
+}
+
+bool rpc_server::apply_seq_input_sets(const uint8_t * p, size_t n) {
+    if (n < 8) {
+        return false;
+    }
+    uint32_t magic = 0, nset = 0;
+    memcpy(&magic, p, 4);
+    memcpy(&nset, p + 4, 4);
+    if (magic != RPC_SEQ_SET_MAGIC) {
+        return false;
+    }
+    size_t off = 8;
+    for (uint32_t i = 0; i < nset; i++) {
+        if (off + sizeof(rpc_tensor) + 16 > n) {
+            return false;
+        }
+        uint64_t offset = 0;
+        uint32_t size = 0, pad = 0;
+        memcpy(&offset, p + off + sizeof(rpc_tensor), 8);
+        memcpy(&size, p + off + sizeof(rpc_tensor) + 8, 4);
+        memcpy(&pad, p + off + sizeof(rpc_tensor) + 12, 4);
+        const size_t rec = sizeof(rpc_tensor) + 16 + (size_t) size + (size_t) pad;
+        if (off + rec > n) {
+            return false;
+        }
+        std::vector<uint8_t> one(sizeof(rpc_tensor) + sizeof(uint64_t) + (size_t) size);
+        memcpy(one.data(), p + off, sizeof(rpc_tensor));
+        memcpy(one.data() + sizeof(rpc_tensor), &offset, sizeof(offset));
+        if (size) {
+            memcpy(one.data() + sizeof(rpc_tensor) + sizeof(offset),
+                   p + off + sizeof(rpc_tensor) + 16, size);
+        }
+        if (!set_tensor(one)) {
+            return false;
+        }
+        off += rec;
     }
     return true;
 }
@@ -2614,6 +2795,12 @@ bool rpc_server::graph_seq(const std::vector<uint8_t> & input, socket_ptr sock) 
     };
     if (input.size() < 8 + n * sizeof(seq_item)) {
         return false;
+    }
+    const size_t seq_bytes = 8 + n * sizeof(seq_item);
+    if (input.size() > seq_bytes) {
+        if (!apply_seq_input_sets(input.data() + seq_bytes, input.size() - seq_bytes)) {
+            return false;
+        }
     }
     const uint8_t ack1 = 1;
     if (!send_msg(sock, &ack1, 1, RPC_CHANNEL_CONTROL)) {
@@ -2901,7 +3088,13 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                 if (tb_debug_enabled()) {
                     fprintf(stderr, "[RPC_SRV] GET_TENSOR sending resp size=%zu\n", response.size());
                 }
-                if (!sock->send_data_channel(cmd_channel, response.data(), response.size())) {
+                if (request.size >= 4096) {
+                    std::vector<uint8_t> dummy(response.size());
+                    if (!sock->xchg(response.data(), dummy.data(), response.size())) {
+                        if (tb_debug_enabled()) fprintf(stderr, "[RPC_SRV] GET_TENSOR xchg failed!\n");
+                        return;
+                    }
+                } else if (!sock->send_data_channel(cmd_channel, response.data(), response.size())) {
                     if (tb_debug_enabled()) fprintf(stderr, "[RPC_SRV] GET_TENSOR send_data_channel failed!\n");
                     return;
                 }
@@ -3387,6 +3580,230 @@ GGML_BACKEND_API bool ggml_backend_rpc_comm_finish_ar(void * comm_ctx, struct gg
     return true;
 }
 
+// gfx1151 UMA: hipMalloc GTT is CPU-mapped. After stream sync, memcpy to/from
+// tensor->data matches hipMemcpy and GPU kernels see CPU stores (probed).
+static bool rpc_uma_mapped(const void * p, size_t n) {
+    if (p == nullptr || n == 0) {
+        return false;
+    }
+    const long page = sysconf(_SC_PAGESIZE);
+    if (page <= 0) {
+        return false;
+    }
+    const uintptr_t start = (uintptr_t) p & ~(uintptr_t) (page - 1);
+    const size_t len = ((uintptr_t) p + n + (size_t) page - 1 - start);
+    std::vector<unsigned char> vec((len + (size_t) page - 1) / (size_t) page + 1);
+    return mincore((void *) start, len, vec.data()) == 0;
+}
+
+static int g_rpc_uma = -1;
+
+static bool rpc_use_uma(const ggml_tensor * t, size_t n) {
+    if (t == nullptr || t->data == nullptr || n == 0) {
+        return false;
+    }
+    if (g_rpc_uma == 0) {
+        return false;
+    }
+    if (!rpc_uma_mapped(t->data, n)) {
+        g_rpc_uma = 0;
+        return false;
+    }
+    if (g_rpc_uma < 0) {
+        g_rpc_uma = 1;
+        fprintf(stderr, "[RPC_SEQ] uma_memcpy=1 ptr=%p n=%zu\n", t->data, n);
+    }
+    return true;
+}
+
+// Client SEQ AR bounce buffers. hipHostRegister is client-only (this function
+// is not the worker GRAPH_SEQ path). Speeds HIP D2H of the 48 AllReduce shards.
+static void * rpc_pinned_host(size_t n, bool peer) {
+    struct slot {
+        void * p = nullptr;
+        size_t cap = 0;
+        bool pinned = false;
+        bool hip_malloc = false;
+    };
+    static thread_local slot local;
+    static thread_local slot remote;
+    slot & s = peer ? remote : local;
+    if (s.cap < n) {
+        if (s.p) {
+            if (s.hip_malloc) {
+                using free_fn = int (*)(void *);
+                static free_fn hfree = (free_fn) dlsym(RTLD_DEFAULT, "hipHostFree");
+                if (hfree) {
+                    hfree(s.p);
+                }
+            } else {
+                if (s.pinned) {
+                    using unreg_fn = int (*)(void *);
+                    static unreg_fn unreg = (unreg_fn) dlsym(RTLD_DEFAULT, "hipHostUnregister");
+                    if (unreg) {
+                        unreg(s.p);
+                    }
+                }
+                free(s.p);
+            }
+            s.p = nullptr;
+            s.pinned = false;
+            s.hip_malloc = false;
+        }
+        const size_t cap = (n + 4095ull) & ~4095ull;
+        using malloc_fn = int (*)(void **, size_t, unsigned int);
+        static malloc_fn hmalloc = (malloc_fn) dlsym(RTLD_DEFAULT, "hipHostMalloc");
+        if (hmalloc && hmalloc(&s.p, cap, 0) == 0) {
+            s.cap = cap;
+            s.pinned = true;
+            s.hip_malloc = true;
+            static int nlog;
+            if (nlog < 1) {
+                nlog++;
+                fprintf(stderr, "[RPC_SEQ] hipHostMalloc cap=%zu\n", cap);
+            }
+        } else {
+            if (posix_memalign(&s.p, 4096, cap) != 0) {
+                s.p = malloc(cap);
+            }
+            s.cap = cap;
+            using reg_fn = int (*)(void *, size_t, unsigned int);
+            static reg_fn reg = (reg_fn) dlsym(RTLD_DEFAULT, "hipHostRegister");
+            if (reg && s.p && reg(s.p, cap, 0) == 0) {
+                s.pinned = true;
+            }
+        }
+    }
+    return s.p;
+}
+
+struct seq_ar_job {
+    uint8_t * local = nullptr;
+    uint8_t * peer = nullptr;
+    uint8_t * full = nullptr;
+    uint32_t nbytes = 0;
+    uint32_t dest_nbytes = 0;
+    ggml_tensor * src = nullptr;
+    ggml_tensor * dest = nullptr;
+    int kind = 0; // 0 f32 add, 1 f16 add, 2 concat
+    int64_t wN = 0;
+    int64_t nT = 0;
+    rpc_dispatcher * disp = nullptr;
+    volatile int ok = 1;
+};
+
+static seq_ar_job g_seq_jobs[RPC_GRAPH_RING];
+
+static void * rpc_seq_pin_idx(size_t n, int idx, bool peer) {
+    struct slot {
+        void * p = nullptr;
+        size_t cap = 0;
+    };
+    static slot local[RPC_GRAPH_RING];
+    static slot remote[RPC_GRAPH_RING];
+    slot & s = peer ? remote[idx] : local[idx];
+    if (s.cap < n) {
+        if (s.p) {
+            using free_fn = int (*)(void *);
+            static free_fn hfree = (free_fn) dlsym(RTLD_DEFAULT, "hipHostFree");
+            if (hfree) {
+                hfree(s.p);
+            } else {
+                free(s.p);
+            }
+        }
+        const size_t cap = (n + 4095ull) & ~4095ull;
+        using malloc_fn = int (*)(void **, size_t, unsigned int);
+        static malloc_fn hmalloc = (malloc_fn) dlsym(RTLD_DEFAULT, "hipHostMalloc");
+        if (hmalloc && hmalloc(&s.p, cap, 0) == 0) {
+            s.cap = cap;
+        } else if (posix_memalign(&s.p, 4096, cap) == 0) {
+            s.cap = cap;
+        } else {
+            s.p = malloc(cap);
+            s.cap = s.p ? cap : 0;
+        }
+    }
+    return s.p;
+}
+
+static void * rpc_seq_pin_full(size_t n, int idx) {
+    struct slot {
+        void * p = nullptr;
+        size_t cap = 0;
+    };
+    static slot extra[RPC_GRAPH_RING];
+    slot & s = extra[idx];
+    if (s.cap < n) {
+        if (s.p) {
+            using free_fn = int (*)(void *);
+            static free_fn hfree = (free_fn) dlsym(RTLD_DEFAULT, "hipHostFree");
+            if (hfree) {
+                hfree(s.p);
+            } else {
+                free(s.p);
+            }
+        }
+        const size_t cap = (n + 4095ull) & ~4095ull;
+        using malloc_fn = int (*)(void **, size_t, unsigned int);
+        static malloc_fn hmalloc = (malloc_fn) dlsym(RTLD_DEFAULT, "hipHostMalloc");
+        if (hmalloc && hmalloc(&s.p, cap, 0) == 0) {
+            s.cap = cap;
+        } else if (posix_memalign(&s.p, 4096, cap) == 0) {
+            s.cap = cap;
+        } else {
+            s.p = malloc(cap);
+            s.cap = s.p ? cap : 0;
+        }
+    }
+    return s.p;
+}
+
+static void seq_ar_host(void * p) {
+    seq_ar_job * j = (seq_ar_job *) p;
+    if (j->nbytes == 0 || j->src == nullptr || j->src->data == nullptr ||
+            j->local == nullptr || j->peer == nullptr || j->disp == nullptr) {
+        j->ok = 0;
+        return;
+    }
+    memcpy(j->local, j->src->data, j->nbytes);
+    if (!j->disp->xchg_direct(j->local, j->peer, j->nbytes)) {
+        j->ok = 0;
+        return;
+    }
+    if (j->kind == 2) {
+        if (j->dest == nullptr || j->dest->data == nullptr || j->full == nullptr) {
+            j->ok = 0;
+            return;
+        }
+        allgather_concat_f32((float *) j->full,
+                (const float *) j->local, (const float *) j->peer, j->wN, j->nT);
+        memcpy(j->dest->data, j->full, j->dest_nbytes);
+    } else if (j->kind == 1) {
+        allreduce_add_f16((ggml_fp16_t *) j->local,
+                (const ggml_fp16_t *) j->peer, j->nbytes / sizeof(ggml_fp16_t));
+        memcpy(j->src->data, j->local, j->nbytes);
+    } else {
+        allreduce_add_f32((float *) j->local,
+                (const float *) j->peer, j->nbytes / sizeof(float));
+        memcpy(j->src->data, j->local, j->nbytes);
+    }
+}
+
+static void * seq_hip_stream(ggml_backend_t local_backend) {
+    ggml_backend_dev_t dev = ggml_backend_get_device(local_backend);
+    ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+    if (reg == nullptr) {
+        return nullptr;
+    }
+    using get_fn = void * (*)(ggml_backend_t);
+    auto fn = (get_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_get_stream");
+    if (fn == nullptr) {
+        return nullptr;
+    }
+    return fn(local_backend);
+}
+
 GGML_BACKEND_API bool ggml_backend_rpc_comm_graph_seq(
         void * comm_ctx,
         ggml_backend_t local_backend,
@@ -3446,6 +3863,7 @@ GGML_BACKEND_API bool ggml_backend_rpc_comm_graph_seq(
         }
         memcpy(payload.data() + 8 + i * sizeof(seq_item), &it, sizeof(it));
     }
+    rpc_append_pending_sets(payload);
     uint8_t ack = 0;
     auto payload_ptr = std::make_shared<std::vector<uint8_t>>(std::move(payload));
     rpc_ctx->dispatcher->send(RPC_CMD_GRAPH_SEQ,
@@ -3459,13 +3877,112 @@ GGML_BACKEND_API bool ggml_backend_rpc_comm_graph_seq(
         nseq++;
         fprintf(stderr, "[RPC_SEQ] n=%zu\n", n);
     }
-    static thread_local std::vector<uint8_t> local_data;
-    static thread_local std::vector<uint8_t> peer_data;
     using clock = std::chrono::steady_clock;
     const auto t_seq0 = clock::now();
-    long hip_us = 0;
-    long xchg_us = 0;
+    using launch_host_fn = int (*)(void *, void (*)(void *), void *);
+    static launch_host_fn hlaunch = (launch_host_fn) dlsym(RTLD_DEFAULT, "hipLaunchHostFunc");
+    void * stream = seq_hip_stream(local_backend);
+    bool uma0 = false;
+    for (size_t i = 0; i < n; i++) {
+        if (local_ar[i] != nullptr && ggml_nbytes(local_ar[i]) > 0) {
+            uma0 = rpc_use_uma(local_ar[i], std::min((size_t) 64, ggml_nbytes(local_ar[i])));
+            break;
+        }
+    }
+    const bool pipe = hlaunch != nullptr && stream != nullptr && uma0 &&
+            getenv("LLAMA_TP_NO_SEQ_PIPE") == nullptr;
+    static int npipe_log;
+    if (npipe_log < 2) {
+        npipe_log++;
+        fprintf(stderr, "[RPC_SEQ] pipe=%d stream=%p hlaunch=%p uma=%d\n",
+                (int) pipe, stream, (void *) hlaunch, (int) uma0);
+    }
     int n_xchg = 0;
+    if (pipe) {
+        for (size_t i = 0; i < n; i++) {
+            g_seq_jobs[i].nbytes = 0;
+            g_seq_jobs[i].ok = 1;
+        }
+        for (size_t i = 0; i < n; i++) {
+            if (local_graphs[i] != nullptr && local_graphs[i]->n_nodes > 0) {
+                const ggml_status st = ggml_backend_graph_compute_async(local_backend, local_graphs[i]);
+                if (st != GGML_STATUS_SUCCESS) {
+                    return false;
+                }
+            }
+            const bool concat = rpc_ar[i] != nullptr;
+            uint32_t ar_bytes = 0;
+            if (local_ar[i] != nullptr) {
+                if (concat && ggml_nbytes(local_ar[i]) == ggml_nbytes(rpc_ar[i])) {
+                    ar_bytes = (uint32_t) (ggml_nbytes(rpc_ar[i]) / 2);
+                } else {
+                    ar_bytes = (uint32_t) ggml_nbytes(local_ar[i]);
+                }
+            }
+            if (ar_bytes == 0) {
+                continue;
+            }
+            seq_ar_job & job = g_seq_jobs[i];
+            job.local = (uint8_t *) rpc_seq_pin_idx(ar_bytes, (int) i, false);
+            job.peer  = (uint8_t *) rpc_seq_pin_idx(ar_bytes, (int) i, true);
+            job.nbytes = ar_bytes;
+            job.src = local_ar[i];
+            job.dest = concat ? rpc_ar[i] : nullptr;
+            job.disp = rpc_ctx->dispatcher.get();
+            job.ok = 1;
+            job.full = nullptr;
+            job.dest_nbytes = 0;
+            job.wN = 0;
+            job.nT = 0;
+            if (!job.local || !job.peer) {
+                return false;
+            }
+            if (concat) {
+                ggml_tensor * dest = rpc_ar[i];
+                const int64_t nT = std::max((int64_t) 1, ggml_nrows(dest));
+                const int64_t wN = dest->ne[0] / 2;
+                if (wN <= 0 || dest->type != GGML_TYPE_F32 ||
+                        (size_t) wN * (size_t) nT * sizeof(float) != (size_t) ar_bytes) {
+                    return false;
+                }
+                job.kind = 2;
+                job.wN = wN;
+                job.nT = nT;
+                job.dest_nbytes = (uint32_t) ggml_nbytes(dest);
+                job.full = (uint8_t *) rpc_seq_pin_full(job.dest_nbytes, (int) i);
+                if (!job.full) {
+                    return false;
+                }
+            } else if (local_ar[i]->type == GGML_TYPE_F32) {
+                job.kind = 0;
+            } else if (local_ar[i]->type == GGML_TYPE_F16) {
+                job.kind = 1;
+            } else {
+                return false;
+            }
+            if (hlaunch(stream, seq_ar_host, &job) != 0) {
+                return false;
+            }
+            n_xchg++;
+        }
+        ggml_backend_synchronize(local_backend);
+        for (size_t i = 0; i < n; i++) {
+            if (g_seq_jobs[i].nbytes > 0 && g_seq_jobs[i].ok == 0) {
+                return false;
+            }
+        }
+        static int ntime;
+        if (ntime < 24) {
+            ntime++;
+            const long tot_us = (long) std::chrono::duration_cast<std::chrono::microseconds>(clock::now() - t_seq0).count();
+            fprintf(stderr, "[RPC_SEQ] pipe n=%zu n_xchg=%d tot_us=%ld\n", n, n_xchg, tot_us);
+        }
+        return true;
+    }
+    long hip_us = 0;
+    long copy_us = 0;
+    long xchg_us = 0;
+    int n_uma = 0;
     static thread_local std::vector<float> concat_full;
     for (size_t i = 0; i < n; i++) {
         const bool concat = rpc_ar[i] != nullptr;
@@ -3477,40 +3994,46 @@ GGML_BACKEND_API bool ggml_backend_rpc_comm_graph_seq(
                 ar_bytes = (uint32_t) ggml_nbytes(local_ar[i]);
             }
         }
+        uint8_t * local_ptr = nullptr;
+        uint8_t * peer_ptr  = nullptr;
+        if (ar_bytes > 0) {
+            local_ptr = (uint8_t *) rpc_pinned_host(ar_bytes, false);
+            peer_ptr  = (uint8_t *) rpc_pinned_host(ar_bytes, true);
+            if (!local_ptr || !peer_ptr) {
+                return false;
+            }
+        }
         if (local_graphs[i] != nullptr && local_graphs[i]->n_nodes > 0) {
             const auto t0 = clock::now();
             const ggml_status st = ggml_backend_graph_compute_async(local_backend, local_graphs[i]);
             if (st != GGML_STATUS_SUCCESS) {
                 return false;
             }
+            ggml_backend_synchronize(local_backend);
+            hip_us += (long) std::chrono::duration_cast<std::chrono::microseconds>(clock::now() - t0).count();
             if (ar_bytes == 0) {
                 continue;
             }
-            if (local_data.size() < ar_bytes) {
-                local_data.resize(ar_bytes);
-            }
-            if (peer_data.size() < ar_bytes) {
-                peer_data.resize(ar_bytes);
-            }
-            ggml_backend_tensor_get_async(local_backend, local_ar[i], local_data.data(), 0, ar_bytes);
-            ggml_backend_synchronize(local_backend);
-            hip_us += (long) std::chrono::duration_cast<std::chrono::microseconds>(clock::now() - t0).count();
         } else if (ar_bytes == 0) {
             continue;
+        }
+        const auto tc0 = clock::now();
+        const bool uma = rpc_use_uma(local_ar[i], ar_bytes);
+        if (uma) {
+            memcpy(local_ptr, local_ar[i]->data, ar_bytes);
+            n_uma++;
         } else {
-            if (local_data.size() < ar_bytes) {
-                local_data.resize(ar_bytes);
-            }
-            if (peer_data.size() < ar_bytes) {
-                peer_data.resize(ar_bytes);
-            }
-            ggml_backend_tensor_get_async(local_backend, local_ar[i], local_data.data(), 0, ar_bytes);
+            ggml_backend_tensor_get_async(local_backend, local_ar[i], local_ptr, 0, ar_bytes);
             ggml_backend_synchronize(local_backend);
         }
+        copy_us += (long) std::chrono::duration_cast<std::chrono::microseconds>(clock::now() - tc0).count();
         const auto tx0 = clock::now();
-        rpc_ctx->dispatcher->xchg_raw(local_data.data(), peer_data.data(), ar_bytes);
+        if (!rpc_ctx->dispatcher->xchg_direct(local_ptr, peer_ptr, ar_bytes)) {
+            return false;
+        }
         xchg_us += (long) std::chrono::duration_cast<std::chrono::microseconds>(clock::now() - tx0).count();
         n_xchg++;
+        const auto th0 = clock::now();
         if (concat) {
             ggml_tensor * dest = rpc_ar[i];
             const int64_t nT = std::max((int64_t) 1, ggml_nrows(dest));
@@ -3520,35 +4043,41 @@ GGML_BACKEND_API bool ggml_backend_rpc_comm_graph_seq(
                 return false;
             }
             concat_full.resize((size_t) dest->ne[0] * (size_t) nT);
-            if (local_ar[i]->ne[0] == 3072 && dest->ne[0] == 6144) {
-                allgather_concat_f32(concat_full.data(),
-                        (const float *) local_data.data(), (const float *) peer_data.data(),
-                        wN, nT);
+            allgather_concat_f32(concat_full.data(),
+                    (const float *) local_ptr, (const float *) peer_ptr, wN, nT);
+            if (rpc_use_uma(dest, ggml_nbytes(dest))) {
+                memcpy(dest->data, concat_full.data(), ggml_nbytes(dest));
             } else {
-                allgather_concat_f32(concat_full.data(),
-                        (const float *) local_data.data(), (const float *) peer_data.data(),
-                        wN, nT);
+                ggml_backend_tensor_set_async(local_backend, dest, concat_full.data(), 0, ggml_nbytes(dest));
             }
-            ggml_backend_tensor_set_async(local_backend, dest, concat_full.data(), 0, ggml_nbytes(dest));
         } else if (local_ar[i]->type == GGML_TYPE_F32) {
-            allreduce_add_f32((float *) local_data.data(),
-                    (const float *) peer_data.data(), ar_bytes / sizeof(float));
-            ggml_backend_tensor_set_async(local_backend, local_ar[i], local_data.data(), 0, ar_bytes);
+            allreduce_add_f32((float *) local_ptr,
+                    (const float *) peer_ptr, ar_bytes / sizeof(float));
+            if (uma) {
+                memcpy(local_ar[i]->data, local_ptr, ar_bytes);
+            } else {
+                ggml_backend_tensor_set_async(local_backend, local_ar[i], local_ptr, 0, ar_bytes);
+            }
         } else if (local_ar[i]->type == GGML_TYPE_F16) {
-            allreduce_add_f16((ggml_fp16_t *) local_data.data(),
-                    (const ggml_fp16_t *) peer_data.data(), ar_bytes / sizeof(ggml_fp16_t));
-            ggml_backend_tensor_set_async(local_backend, local_ar[i], local_data.data(), 0, ar_bytes);
+            allreduce_add_f16((ggml_fp16_t *) local_ptr,
+                    (const ggml_fp16_t *) peer_ptr, ar_bytes / sizeof(ggml_fp16_t));
+            if (uma) {
+                memcpy(local_ar[i]->data, local_ptr, ar_bytes);
+            } else {
+                ggml_backend_tensor_set_async(local_backend, local_ar[i], local_ptr, 0, ar_bytes);
+            }
         } else {
             return false;
         }
+        copy_us += (long) std::chrono::duration_cast<std::chrono::microseconds>(clock::now() - th0).count();
     }
     ggml_backend_synchronize(local_backend);
     static int ntime;
-    if (ntime < 6) {
+    if (ntime < 24) {
         ntime++;
         const long tot_us = (long) std::chrono::duration_cast<std::chrono::microseconds>(clock::now() - t_seq0).count();
-        fprintf(stderr, "[RPC_SEQ] n=%zu n_xchg=%d hip_us=%ld xchg_us=%ld tot_us=%ld\n",
-                n, n_xchg, hip_us, xchg_us, tot_us);
+        fprintf(stderr, "[RPC_SEQ] n=%zu n_xchg=%d n_uma=%d hip_us=%ld copy_us=%ld xchg_us=%ld tot_us=%ld\n",
+                n, n_xchg, n_uma, hip_us, copy_us, xchg_us, tot_us);
     }
     return true;
 }

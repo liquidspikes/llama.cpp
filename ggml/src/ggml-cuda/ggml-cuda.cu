@@ -708,6 +708,12 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     if (copy_event != nullptr) {
         CUDA_CHECK(cudaEventDestroy(copy_event));
     }
+    for (int i = 0; i < MMVQ_Q8_NSLOT; ++i) {
+        if (mmvq_q8_slots[i].buf != nullptr) {
+            CUDA_CHECK(cudaFree(mmvq_q8_slots[i].buf));
+            mmvq_q8_slots[i].buf = nullptr;
+        }
+    }
     for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
         for (int j = 0; j < GGML_CUDA_MAX_STREAMS; ++j) {
             if (streams[i][j] != nullptr) {
@@ -4183,6 +4189,67 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     return 0;
 }
 
+// One-token HIP kernel split (GGML_HIP_PROF=1). Event pairs on the compute
+// stream, one stream sync at graph end — not per-node. Graphs off for this.
+enum {
+    HIP_PROF_Q4K = 0, HIP_PROF_Q8D = 1, HIP_PROF_SHR = 2, HIP_PROF_GDN = 3,
+    HIP_PROF_HC  = 4, HIP_PROF_RTE = 5, HIP_PROF_OTH = 6, HIP_PROF_NF  = 7
+};
+static int ggml_hip_prof_fam(const ggml_tensor * node) {
+    if (node->op == GGML_OP_GATED_DELTA_NET) {
+        return HIP_PROF_GDN;
+    }
+    const char * n = node->name;
+    if (strstr(n, "hc_") || strstr(n, "hc_inject") || strstr(n, "hc_norm") || strstr(n, "hc_gate")) {
+        return HIP_PROF_HC;
+    }
+    if (strstr(n, "ffn_moe_down")) {
+        return HIP_PROF_Q8D;
+    }
+    if (strstr(n, "ffn_moe_gate") || strstr(n, "ffn_moe_up") || strstr(n, "ffn_moe_swiglu")) {
+        return HIP_PROF_Q4K;
+    }
+    if (strstr(n, "ffn_moe")) {
+        return HIP_PROF_RTE;
+    }
+    if (strstr(n, "ffn_gate") || strstr(n, "ffn_up") || strstr(n, "ffn_shexp") ||
+            strstr(n, "ffn_swiglu") || strstr(n, "shared_expert")) {
+        return HIP_PROF_SHR;
+    }
+    return HIP_PROF_OTH;
+}
+
+struct ggml_hip_prof_state {
+    bool on = false;
+    bool inited = false;
+    static constexpr int MAXE = 1536;
+    cudaEvent_t st[MAXE];
+    cudaEvent_t en[MAXE];
+    uint8_t     fam[MAXE];
+    int n = 0;
+    double acc_us[HIP_PROF_NF] = {};
+    int    acc_n[HIP_PROF_NF]  = {};
+    int    nsub = 0;
+    int    ntok = 0;
+};
+
+static ggml_hip_prof_state & ggml_hip_prof() {
+    static ggml_hip_prof_state s;
+    if (!s.inited) {
+        s.inited = true;
+        const char * e = std::getenv("GGML_HIP_PROF");
+        s.on = e && std::atoi(e) != 0;
+        if (s.on) {
+            for (int i = 0; i < ggml_hip_prof_state::MAXE; ++i) {
+                CUDA_CHECK(cudaEventCreateWithFlags(&s.st[i], 0));
+                CUDA_CHECK(cudaEventCreateWithFlags(&s.en[i], 0));
+            }
+            fprintf(stderr, "[HIP_PROF] enabled maxe=%d\n", ggml_hip_prof_state::MAXE);
+        }
+    }
+    return s;
+}
+
 static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
     bool graph_evaluated_or_captured = false;
 
@@ -4323,6 +4390,23 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     continue;
                 }
 
+                ggml_hip_prof_state & hp = ggml_hip_prof();
+                const int fam = hp.on ? ggml_hip_prof_fam(node) : HIP_PROF_OTH;
+                if (hp.on && fam == HIP_PROF_OTH) {
+                    static int nsamp;
+                    if (nsamp < 24) {
+                        nsamp++;
+                        fprintf(stderr, "[HIP_PROF_OP] op=%s name=%s ne=[%lld,%lld,%lld]\n",
+                                ggml_op_name(node->op), node->name,
+                                (long long) node->ne[0], (long long) node->ne[1], (long long) node->ne[2]);
+                    }
+                }
+                const int ek  = (hp.on && hp.n < ggml_hip_prof_state::MAXE) ? hp.n++ : -1;
+                if (ek >= 0) {
+                    hp.fam[ek] = (uint8_t) fam;
+                    CUDA_CHECK(cudaEventRecord(hp.st[ek], cuda_ctx->stream()));
+                }
+
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
 
                 if (nodes_to_skip != 0) {
@@ -4332,6 +4416,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                             nodes_to_skip + 1, ggml_op_name(node->op), node->name,
                             ggml_op_name(cgraph->nodes[last_fused]->op), cgraph->nodes[last_fused]->name);
 #endif
+                    if (ek >= 0) {
+                        CUDA_CHECK(cudaEventRecord(hp.en[ek], cuda_ctx->stream()));
+                    }
                     i += nodes_to_skip;
                     continue;
                 }
@@ -4358,9 +4445,63 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 }
                 GGML_ASSERT(ok);
 
+                if (ek >= 0) {
+                    CUDA_CHECK(cudaEventRecord(hp.en[ek], cuda_ctx->stream()));
+                }
+
                 if (!is_concurrent_event_active) {
                     try_launch_concurrent_event(node);
                }
+            }
+
+            ggml_hip_prof_state & hp_end = ggml_hip_prof();
+            if (hp_end.on && hp_end.n > 0 && !use_cuda_graph) {
+                CUDA_CHECK(cudaEventSynchronize(hp_end.en[hp_end.n - 1]));
+                bool t1 = false;
+                for (int ni = 0; ni < cgraph->n_nodes; ++ni) {
+                    const ggml_tensor * nd = cgraph->nodes[ni];
+                    if (nd && strstr(nd->name, "ffn_moe") && nd->ne[2] == 1) {
+                        t1 = true;
+                        break;
+                    }
+                }
+                for (int k = 0; k < hp_end.n; ++k) {
+                    float ms = 0.0f;
+#if defined(GGML_USE_HIP)
+                    CUDA_CHECK(hipEventElapsedTime(&ms, hp_end.st[k], hp_end.en[k]));
+#else
+                    CUDA_CHECK(cudaEventElapsedTime(&ms, hp_end.st[k], hp_end.en[k]));
+#endif
+                    hp_end.acc_us[hp_end.fam[k]] += (double) ms * 1000.0;
+                    hp_end.acc_n[hp_end.fam[k]]++;
+                }
+                hp_end.n = 0;
+                if (t1) {
+                    hp_end.nsub++;
+                    if (hp_end.nsub >= 49) {
+                        hp_end.ntok++;
+                        double tot = 0;
+                        for (int f = 0; f < HIP_PROF_NF; ++f) {
+                            tot += hp_end.acc_us[f];
+                        }
+                        fprintf(stderr,
+                                "[HIP_PROF] tok=%d q4k_us=%.0f n=%d q8_down_us=%.0f n=%d shared_us=%.0f n=%d gdn_us=%.0f n=%d hc_us=%.0f n=%d moe_rt_us=%.0f n=%d other_us=%.0f n=%d tot_us=%.0f\n",
+                                hp_end.ntok,
+                                hp_end.acc_us[HIP_PROF_Q4K], hp_end.acc_n[HIP_PROF_Q4K],
+                                hp_end.acc_us[HIP_PROF_Q8D], hp_end.acc_n[HIP_PROF_Q8D],
+                                hp_end.acc_us[HIP_PROF_SHR], hp_end.acc_n[HIP_PROF_SHR],
+                                hp_end.acc_us[HIP_PROF_GDN], hp_end.acc_n[HIP_PROF_GDN],
+                                hp_end.acc_us[HIP_PROF_HC],  hp_end.acc_n[HIP_PROF_HC],
+                                hp_end.acc_us[HIP_PROF_RTE], hp_end.acc_n[HIP_PROF_RTE],
+                                hp_end.acc_us[HIP_PROF_OTH], hp_end.acc_n[HIP_PROF_OTH],
+                                tot);
+                        for (int f = 0; f < HIP_PROF_NF; ++f) {
+                            hp_end.acc_us[f] = 0;
+                            hp_end.acc_n[f] = 0;
+                        }
+                        hp_end.nsub = 0;
+                    }
+                }
             }
         }
 
@@ -4470,6 +4611,31 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         }
 
         CUDA_CHECK(cudaStreamBeginCapture(cuda_ctx->stream(), cudaStreamCaptureModeRelaxed));
+    }
+
+    {
+        static int n_hip_graph_use;
+        static int n_hip_graph_direct;
+        static int n_hip_graph_calls;
+        if (use_cuda_graph) {
+            n_hip_graph_use++;
+        } else {
+            n_hip_graph_direct++;
+        }
+        n_hip_graph_calls++;
+        if (n_hip_graph_calls <= 8 || n_hip_graph_calls % 49 == 0) {
+#ifdef USE_CUDA_GRAPH
+            ggml_cuda_graph * glog = cuda_ctx->cuda_graph(graph_key);
+            fprintf(stderr, "[HIP_GRAPH] n=%d use=%d direct=%d this_use=%d update=%d warmup=%d n_nodes=%d uid=%llu\n",
+                    n_hip_graph_calls, n_hip_graph_use, n_hip_graph_direct,
+                    (int) use_cuda_graph, (int) cuda_graph_update_required,
+                    glog ? (int) glog->warmup_complete : -1, cgraph->n_nodes,
+                    (unsigned long long) cgraph->uid);
+#else
+            fprintf(stderr, "[HIP_GRAPH] compiled_off n_nodes=%d\n", cgraph->n_nodes);
+            GGML_UNUSED(graph_key);
+#endif
+        }
     }
 
     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
@@ -5680,8 +5846,19 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
     GGML_UNUSED(reg);
 }
 
+static void * ggml_backend_cuda_get_stream(ggml_backend_t backend) {
+    if (backend == nullptr || backend->context == nullptr) {
+        return nullptr;
+    }
+    ggml_backend_cuda_context * ctx = (ggml_backend_cuda_context *) backend->context;
+    return (void *) ctx->stream();
+}
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
+    if (strcmp(name, "ggml_backend_get_stream") == 0) {
+        return (void *) ggml_backend_cuda_get_stream;
+    }
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
         return (void *)ggml_backend_cuda_comm_init;
     }
