@@ -26,7 +26,8 @@ static __global__ void k_set_rows_quant(const float * __restrict__ src0,
                                         const uint3   ne01,
                                         const uint3   ne02,
                                         const uint3   ne11_fd,
-                                        const uint3   ne12_fd) {
+                                        const uint3   ne12_fd,
+                                        const int64_t dst_ne1) {
     const int64_t i = int64_t(blockDim.x) * blockIdx.x + threadIdx.x;
 
     if (i >= ne_total) {
@@ -56,6 +57,10 @@ static __global__ void k_set_rows_quant(const float * __restrict__ src0,
     ggml_cuda_pdl_sync();
     const int64_t dst_row = *(src1 + i10*s10 + i11*s11 + i12*s12);
 
+    if (dst_row < 0 || (dst_ne1 > 0 && dst_row >= dst_ne1)) {
+        return;
+    }
+
     const float * src0_row = src0 + i01*s01 + i02*s02 + i03*s03;
     block_type * dst_row_ptr = dst + (dst_row*s1 + i02*s2 + i03*s3) / sizeof(block_type);
 
@@ -79,6 +84,7 @@ static void set_rows_cuda_quant(
         const size_t nb01, const size_t nb02, const size_t nb03,
         const size_t nb10, const size_t nb11, const size_t nb12,
         const size_t nb1, const size_t nb2, const size_t nb3,
+        const int64_t dst_ne1,
         cudaStream_t stream) {
 
     GGML_ASSERT(ne00 % qk == 0);
@@ -106,7 +112,7 @@ static void set_rows_cuda_quant(
 
         k_set_rows_quant<idx_t, block_type, qk, quantize_func><<<grid_size, block_size, 0, stream>>>(
             src0_d, src1_d, dst_d, ne_total, ne10, ne11, ne12, ne13, s01, s02, s03, s10, s11, s12, s1, s2, s3, ne00_fd,
-            ne01_fd, ne02_fd, ne11_fd, ne12_fd);
+            ne01_fd, ne02_fd, ne11_fd, ne12_fd, dst_ne1);
     }
 }
 
@@ -132,7 +138,8 @@ static __global__ void k_set_rows(const src_t * src0_ptr,
                                   const uint3   ne01,
                                   const uint3   ne02,
                                   const uint3   ne11_fd,
-                                  const uint3   ne12_fd) {
+                                  const uint3   ne12_fd,
+                                  const int64_t dst_ne1) {
     const src_t * GGML_CUDA_RESTRICT src0 = src0_ptr;
     const idx_t * GGML_CUDA_RESTRICT src1 = src1_ptr;
     dst_t       * GGML_CUDA_RESTRICT dst  = dst_ptr;
@@ -165,6 +172,10 @@ static __global__ void k_set_rows(const src_t * src0_ptr,
     const int64_t dst_row = *(src1 + i10*s10 + i11*s11 + i12*s12);
     ggml_cuda_pdl_lc();
 
+    if (dst_row < 0 || (dst_ne1 > 0 && dst_row >= dst_ne1)) {
+        return;
+    }
+
     const src_t * src0_row = src0 + i01*s01 + i02*s02 + i03*s03;
     dst_t * dst_row_ptr    = dst + dst_row*s1 + i02*s2 + i03*s3;
 
@@ -184,6 +195,7 @@ static void set_rows_cuda(
         const size_t nb01, const size_t nb02, const size_t nb03,
         const size_t nb10, const size_t nb11, const size_t nb12,
         const size_t nb1, const size_t nb2, const size_t nb3,
+        const int64_t dst_ne1,
         cudaStream_t stream) {
 
     const int64_t ne_total = ne00 * ne01 * ne02 * ne03;
@@ -213,7 +225,7 @@ static void set_rows_cuda(
         ggml_cuda_kernel_launch(k_set_rows<src_t, idx_t, dst_t>, launch_params,
             src0_d, src1_d, dst_d, ne_total, ne10, ne11, ne12, ne13, s01,
             s02, s03, s10, s11, s12, s1, s2, s3, ne00_fd, ne01_fd, ne02_fd,
-            ne11_fd, ne12_fd);
+            ne11_fd, ne12_fd, dst_ne1);
     }
 }
 
@@ -235,6 +247,7 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
             nb01, nb02, nb03,
             nb10, nb11, nb12,
             nb1, nb2, nb3,
+            ne1,
             stream
         );
     } else if (dst->type == GGML_TYPE_F16) {
@@ -245,6 +258,7 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
             nb01, nb02, nb03,
             nb10, nb11, nb12,
             nb1, nb2, nb3,
+            ne1,
             stream
         );
     } else if (dst->type == GGML_TYPE_BF16) {
@@ -255,6 +269,7 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
             nb01, nb02, nb03,
             nb10, nb11, nb12,
             nb1, nb2, nb3,
+            ne1,
             stream
         );
     } else if (dst->type == GGML_TYPE_Q4_0) {
@@ -265,6 +280,7 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
             nb01, nb02, nb03,
             nb10, nb11, nb12,
             nb1, nb2, nb3,
+            ne1,
             stream
         );
     } else if (dst->type == GGML_TYPE_Q4_1) {
@@ -275,6 +291,7 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
             nb01, nb02, nb03,
             nb10, nb11, nb12,
             nb1, nb2, nb3,
+            ne1,
             stream
         );
     } else if (dst->type == GGML_TYPE_Q5_0) {
@@ -285,6 +302,7 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
             nb01, nb02, nb03,
             nb10, nb11, nb12,
             nb1, nb2, nb3,
+            ne1,
             stream
         );
     } else if (dst->type == GGML_TYPE_Q5_1) {
@@ -295,6 +313,7 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
             nb01, nb02, nb03,
             nb10, nb11, nb12,
             nb1, nb2, nb3,
+            ne1,
             stream
         );
     } else if (dst->type == GGML_TYPE_Q8_0) {
@@ -305,6 +324,7 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
             nb01, nb02, nb03,
             nb10, nb11, nb12,
             nb1, nb2, nb3,
+            ne1,
             stream
         );
     } else if (dst->type == GGML_TYPE_IQ4_NL) {
@@ -315,6 +335,7 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
             nb01, nb02, nb03,
             nb10, nb11, nb12,
             nb1, nb2, nb3,
+            ne1,
             stream
         );
     } else {
@@ -340,6 +361,7 @@ void set_rows_cuda<half, int32_t>(ggml_backend_cuda_context & ctx, const ggml_te
             nb01, nb02, nb03,
             nb10, nb11, nb12,
             nb1, nb2, nb3,
+            ne1,
             stream
         );
     } else {
@@ -365,6 +387,7 @@ void set_rows_cuda<half, int64_t>(ggml_backend_cuda_context & ctx, const ggml_te
             nb01, nb02, nb03,
             nb10, nb11, nb12,
             nb1, nb2, nb3,
+            ne1,
             stream
         );
     } else {

@@ -167,11 +167,14 @@ static __global__ void top_k_radix_gather(
         const uint32_t key = top_k_float_to_ordered(row_src[col]);
         if (key > state->prefix) {
             const int pos = atomicAdd(&state->greater_count, 1);
-            row_dst[pos] = col;
+            if (pos < k) {
+                row_dst[pos] = col;
+            }
         } else if (key == state->prefix) {
             const int pos = atomicAdd(&state->equal_count, 1);
-            if (pos < state->rank) {
-                row_dst[k - state->rank + pos] = col;
+            const int dst_idx = k - state->rank + pos;
+            if (pos < state->rank && dst_idx >= 0 && dst_idx < k) {
+                row_dst[dst_idx] = col;
             }
         }
     }
