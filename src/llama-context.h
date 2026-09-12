@@ -262,6 +262,8 @@ private:
 
     llm_graph_cb graph_get_cb() const;
 
+    ggml_backend_sched_t sched_now() const;
+
     // disable auto fused ops (Flash Attention, Gated Delta Net) whose op lands on a device
     // that differs from the layer it belongs to (usually due to missing backend support)
     void resolve_fused_ops(const llama_memory_context_i * mctx, uint32_t n_seqs);
@@ -342,6 +344,10 @@ private:
     std::vector<swap_info> output_swaps;
 
     ggml_backend_sched_ptr sched;
+    // Isolated T=1 compute buffers so a T>1 prompt alloc cannot clobber decode
+    // activations / HIP graph device pointers. Null when n_ubatch==1.
+    ggml_backend_sched_ptr sched_decode;
+    ggml_backend_sched_t   sched_cur = nullptr;
 
     bool sched_need_reserve = true;
 
@@ -365,6 +371,7 @@ private:
     std::vector<size_t>                     backend_buf_exp_size; // expected buffer sizes
 
     llm_graph_result_ptr gf_res_prev;
+    llm_graph_result_ptr gf_res_decode;
     llm_graph_result_ptr gf_res_reserve;
 
     // host buffer for the model output (logits and embeddings)

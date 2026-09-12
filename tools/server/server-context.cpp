@@ -2788,6 +2788,10 @@ private:
         }
 #endif
 
+        // Keep decoding while any slot is busy. Posting NEXT_RESPONSE and
+        // returning to the queue cost ~10 ms/token on this USB4 path
+        // (pre_us~2, post_us~80, decode~36 ms, wall~46 ms).
+        for (;;) {
         // check if all slots are idle
         {
             bool all_idle = true;
@@ -2805,16 +2809,10 @@ private:
                 metrics_flush_idle();
 
                 return; // skip further processing
-
-            } else {
-                SRV_DBG("%s", "posting NEXT_RESPONSE\n");
-
-                server_task task(SERVER_TASK_TYPE_NEXT_RESPONSE);
-                task.id = queue_tasks.get_new_id();
-                queue_tasks.post(std::move(task));
             }
         }
 
+        const int64_t t_upd0 = ggml_time_us();
         try {
             scoped_timer t(t_pre_decode, n_pre_decode);
             pre_decode();
@@ -2853,6 +2851,8 @@ private:
         int32_t n_batch = llama_n_batch(ctx_tgt);
         for (int32_t off = 0; off < batch.size(); off = off_next) {
             const int32_t n_tokens = std::min(n_batch, batch.size() - off);
+            const int64_t t_pre_us = ggml_time_us() - t_upd0;
+            int64_t t_dec0 = ggml_time_us();
             try {
                 scoped_timer t(t_decode, n_decode);
                 // TODO @ngxson : maybe handle n_batch == 1 here instead of inside decode()
@@ -2878,7 +2878,9 @@ private:
                 abort_all_slots("decode() failed: " + std::string(e.what()));
                 break; // stop any further processing
             }
+            const int64_t t_dec_us = ggml_time_us() - t_dec0;
 
+            const int64_t t_post0 = ggml_time_us();
             try {
                 scoped_timer t(t_post_decode, n_post_decode);
                 post_decode(n_tokens, off, batch_view);
@@ -2887,7 +2889,22 @@ private:
                 abort_all_slots("post_decode() failed: " + std::string(e.what()));
                 break; // stop any further processing
             }
+            {
+                static int nlog_slot;
+                static int64_t t_prev_post;
+                const int64_t t_now = ggml_time_us();
+                const int64_t gap_us = t_prev_post ? (t_now - t_prev_post) : 0;
+                t_prev_post = t_now;
+                if (nlog_slot < 80) {
+                    nlog_slot++;
+                    fprintf(stderr, "[TOK] slot n_tok=%d batch=%d pre_us=%lld decode_call_us=%lld post_us=%lld gap_us=%lld\n",
+                            n_tokens, batch.size(),
+                            (long long) t_pre_us, (long long) t_dec_us,
+                            (long long) (t_now - t_post0), (long long) gap_us);
+                }
+            }
         }
+        } // keep decoding while slots are busy
     }
 
     void pre_decode() {

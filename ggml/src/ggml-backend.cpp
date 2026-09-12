@@ -1753,13 +1753,21 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         }
 
         // copy the input tensors to the split backend
+        const int64_t t_copy0 = ggml_time_us();
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
             ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[input_id]);
             struct ggml_tensor * input = split->inputs[input_id];
             struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
 
             if (input->flags & GGML_TENSOR_FLAG_INPUT) {
-                // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
+                // Host graph inputs: queue H2D on the compute stream (and RPC
+                // SET into the GRAPH_SEQ payload) instead of per-tensor
+                // cudaStreamPerThread+sync / USB4 SET_TENSOR round-trips.
+                if (input->buffer && ggml_backend_buffer_is_host(input->buffer) &&
+                        input->data && input_cpy && input_cpy != input) {
+                    ggml_backend_tensor_set_async(split_backend, input_cpy, input->data, 0, ggml_nbytes(input));
+                    continue;
+                }
                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                     ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
                 } else {
@@ -1875,6 +1883,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
+        const int64_t t_comp0 = ggml_time_us();
         if (!sched->callback_eval) {
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
             if (ec != GGML_STATUS_SUCCESS) {
@@ -1911,6 +1920,17 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 }
 
                 j0 = j1;
+            }
+        }
+        {
+            static int nlog_sched;
+            if (nlog_sched < 12) {
+                nlog_sched++;
+                fprintf(stderr, "[SCHED] split=%d/%d backend=%s n_in=%d copy_us=%lld compute_us=%lld\n",
+                        split_id, sched->n_splits, ggml_backend_name(split_backend),
+                        split->n_inputs,
+                        (long long) (t_comp0 - t_copy0),
+                        (long long) (ggml_time_us() - t_comp0));
             }
         }
 

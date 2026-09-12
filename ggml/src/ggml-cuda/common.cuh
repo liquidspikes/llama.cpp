@@ -1431,6 +1431,20 @@ struct ggml_backend_cuda_context {
 
     int curr_stream_no = 0;
 
+    // Reuse Q8_1 of src1 across back-to-back T=1 MUL_MAT. A single slot
+    // thrashes on Flash-Next (2560 vs 10240 vs 6144 vs 320); 16 slots keep
+    // those live so HIP-graph capture records one quantize per activation.
+    static constexpr int MMVQ_Q8_NSLOT = 64;
+    struct mmvq_q8_slot {
+        const float * src1 = nullptr;
+        int64_t       ne[4] = {0, 0, 0, 0};
+        size_t        nbytes = 0;
+        void *        buf = nullptr;
+        size_t        cap = 0;
+    };
+    mmvq_q8_slot mmvq_q8_slots[MMVQ_Q8_NSLOT];
+    int           mmvq_q8_clock = 0;
+
 #ifdef USE_CUDA_GRAPH
     // Map from first_node_ptr to cuda_graph - allows multiple graphs per context
     // when the computation is split across CPU/GPU (e.g., with --n-cpu-moe)

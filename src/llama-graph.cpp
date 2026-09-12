@@ -1340,7 +1340,8 @@ void llm_graph_result::reset() {
     inputs.clear();
     fused_nodes.clear();
 
-    buf_compute_meta.resize(ggml_tensor_overhead()*max_nodes + ggml_graph_overhead_custom(max_nodes, false));
+    const size_t max_nodes_alloc = max_nodes + 1024;
+    buf_compute_meta.resize(ggml_tensor_overhead()*max_nodes_alloc + ggml_graph_overhead_custom(max_nodes_alloc, false));
 
     ggml_init_params params = {
         /*.mem_size   =*/ buf_compute_meta.size(),
@@ -1350,12 +1351,19 @@ void llm_graph_result::reset() {
 
     ctx_compute.reset(ggml_init(params));
 
-    gf = ggml_new_graph_custom(ctx_compute.get(), max_nodes, false);
+    gf = ggml_new_graph_custom(ctx_compute.get(), max_nodes_alloc, false);
 }
 
 void llm_graph_result::set_inputs(const llama_ubatch * ubatch) {
+    const int64_t t0 = ggml_time_us();
     for (auto & input : inputs) {
         input->set_input(ubatch);
+    }
+    static int nlog;
+    if (nlog < 6 && ubatch && ubatch->n_tokens == 1) {
+        nlog++;
+        fprintf(stderr, "[TOK] set_inputs us=%lld n_in=%zu\n",
+                (long long) (ggml_time_us() - t0), inputs.size());
     }
 }
 

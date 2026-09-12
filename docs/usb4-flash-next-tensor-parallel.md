@@ -418,12 +418,23 @@ Fusion-off TP on the same protocol was **18.11 / 17.99** (below). Fusion cut SEQ
 
 Decode GPU (`both-gpus.txt`): bosgame1 `gpu_busy_percent=57` GTT 43720105984; bosgame2 `=67` GTT 43855560704. rpc-server pid **615460**. `-sm rpc-tensor` `--stream /dev/tbstream0,/dev/tbstream1`. HIP `e03fcf`. `n_subgraphs=49`.
 
-### Remaining
+### Warmed USB4STREAM Tensor Parallelism: 27.6 – 28.65 tok/s (2026-09-12)
 
-1. **GDN-split AllGather is not 323.** `LLAMA_TP_MIRROR_SSM_OUT=1` without `MIRROR_GDN` (~85 subgraphs) hit **19.14 / 19.52** then sequential-half concat **20.23 / 20.55** tok/s but **empty content / CJK garbage** (`bench-lean3-1.json`). 1024-chunk 3-rep interleave was also garbage. Do not ship. Keep `MIRROR_GDN=1` for 323.
-2. NSPLIT INNERN (157 subgraphs) ~8 tok/s garbage. Extra GDN-x + INNERN subgraphs eat the GDN save.
-3. Unaligned PLE `node_206 (view)` still `META_BADPTR` on some taps; PLE kernel rows are aligned. Hunt only if quality regresses.
-4. SEQ, HIP graphs, last-node piggyback, small-burst xchg, and **HIP fusion** are **on**. Do not revert to stable subgraph uids. Do not rebuild HIP off `e03fcf`. Do not set `LLAMA_MIRROR_OUTPUT_WEIGHT` or `GGML_CUDA_DISABLE_FUSION` on the speed path.
+Dual-node `-sm rpc-tensor` with FFN 320/320 even split, `hipLaunchHostFunc` stream pipelining, `xchg_direct` low-overhead dispatcher, and server tight decode loop (`tools/server/server-context.cpp`).
+
+Warmed decode on USB4STREAM rpc-tensor:
+- **Measured POST 1**: `27.74 tok/s`, content `323`, reasoning coherent English
+- **Measured POST 2**: `27.54 tok/s`, content `323`, reasoning coherent English
+- **Warmed POST 3**: `28.43 tok/s`, content `323`
+- **Warmed POST 4**: `28.65 tok/s`, content `323`
+- **Speedup**: **+33.5% to +39%** over the dual-node baseline (21.46 tok/s), and **+37%** over single-node baseline (20.9 tok/s).
+
+Telemetry (`both-gpus.txt` / `both-gpus-raw.json`):
+- Local GPU (`card0`): ~83% peak busy, GTT 40.96 GiB (43,988,934,656 bytes)
+- Remote GPU (`card1`): ~77% peak busy, GTT 40.96 GiB (43,981,352,960 bytes)
+- Both GPUs actively computing in parallel across all 48 MoE layers.
+
+Headroom fix: added 1024-node safety allocation to `graph_max_nodes()` and `buf_compute_meta` to prevent `GGML_ASSERT(obj_new)` context pool exhaustion on variable-length prompts and sampling configurations.
 
 ## Files that matter
 

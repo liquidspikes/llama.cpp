@@ -2976,12 +2976,35 @@ struct ggml_backend_meta_context {
     bool                                 seq_skip_rpc_sync = false;
     int                                  seq_cached_n_nodes = -1;
     uint64_t                             seq_cached_fp = 0;
+    uint64_t                             seq_cached_ne2 = 0;
+    const ggml_tensor *                  seq_cached_n0 = nullptr;
     size_t                               seq_j_local    = 0;
     size_t                               seq_j_rpc      = 0;
     std::vector<ggml_cgraph *>           seq_local_gs;
     std::vector<ggml_tensor *>           seq_local_ar;
     std::vector<uint64_t>                seq_rpc_uids;
     std::vector<ggml_tensor *>           seq_rpc_ar;
+
+    // Cloned SEQ plans keyed by ggml_meta_seq_slot_pick(ne2). T=4 rebuild
+    // mutates backend_configs cgraphs in place; clones keep T=1 HIP/RPC uids.
+    struct seq_plan_slot {
+        uint64_t                   fp = 0;
+        uint64_t                   ne2 = 0;
+        const ggml_tensor *        n0 = nullptr;
+        bool                       valid = false;
+        int                        n_nodes = -1;
+        uint64_t                   graph_sig = 0;
+        size_t                     n_subgraphs = 0;
+        size_t                     j_local = 0;
+        size_t                     j_rpc = 0;
+        ggml_context_ptr           ctx;
+        std::vector<ggml_cgraph *> owned;
+        std::vector<ggml_cgraph *> local_gs;
+        std::vector<ggml_tensor *> local_ar;
+        std::vector<uint64_t>      rpc_uids;
+        std::vector<ggml_tensor *> rpc_ar;
+    };
+    seq_plan_slot seq_fp_slots[GGML_META_SEQ_FP_SLOTS];
 
     ggml_backend_meta_context(ggml_backend_dev_t meta_dev, const char * params) {
         const size_t n_devs = ggml_backend_meta_dev_n_devs(meta_dev);
@@ -3198,6 +3221,124 @@ static void ggml_backend_meta_synchronize(ggml_backend_t backend) {
     }
 }
 
+static void ggml_backend_meta_seq_slot_save(ggml_backend_meta_context * ctx) {
+    if (!ctx->seq_plan_valid || ctx->n_subgraphs < 2 || ctx->seq_local_gs.size() != ctx->n_subgraphs) {
+        return;
+    }
+    const int si = ggml_meta_seq_slot_pick(ctx->seq_cached_ne2);
+    ggml_backend_meta_context::seq_plan_slot & slot = ctx->seq_fp_slots[si];
+    // First successful plan for this T is the one llama gf_res_decode/prev
+    // keeps. Replacing it with a later 1-token graph (slot cleanup, n_kv
+    // pad change) made POST 3 restore uid=847 clones and emit dots.
+    if (slot.valid) {
+        return;
+    }
+    const size_t ns = ctx->n_subgraphs;
+    size_t cap = 0;
+    for (size_t i = 0; i < ns; i++) {
+        ggml_cgraph * g = ctx->seq_local_gs[i];
+        if (g && g->size > 0) {
+            cap = std::max(cap, (size_t) g->size);
+        }
+    }
+    if (cap == 0) {
+        return;
+    }
+    if (slot.owned.size() != ns || slot.ctx == nullptr) {
+        const size_t mem = ns * ggml_graph_overhead_custom(cap, false) + 4096;
+        const ggml_init_params params = {
+            /*.mem_size   =*/ mem,
+            /*.mem_buffer =*/ nullptr,
+            /*.no_alloc   =*/ true,
+        };
+        slot.ctx.reset(ggml_init(params));
+        slot.owned.assign(ns, nullptr);
+        if (slot.ctx == nullptr) {
+            slot.valid = false;
+            return;
+        }
+        for (size_t i = 0; i < ns; i++) {
+            slot.owned[i] = ggml_new_graph_custom(slot.ctx.get(), cap, false);
+            if (slot.owned[i] == nullptr) {
+                slot.valid = false;
+                return;
+            }
+        }
+    }
+    slot.local_gs.resize(ns);
+    for (size_t i = 0; i < ns; i++) {
+        ggml_cgraph * src = ctx->seq_local_gs[i];
+        ggml_cgraph * dst = slot.owned[i];
+        if (src == nullptr || dst == nullptr || dst->size < src->n_nodes) {
+            slot.valid = false;
+            return;
+        }
+        ggml_graph_clear(dst);
+        ggml_graph_cpy(src, dst);
+        dst->uid = src->uid;
+        slot.local_gs[i] = dst;
+    }
+    slot.fp          = ctx->seq_cached_fp;
+    slot.ne2         = ctx->seq_cached_ne2;
+    slot.n0          = ctx->seq_cached_n0;
+    slot.n_nodes     = ctx->seq_cached_n_nodes;
+    slot.graph_sig   = ctx->graph_sig;
+    slot.n_subgraphs = ns;
+    slot.j_local     = ctx->seq_j_local;
+    slot.j_rpc       = ctx->seq_j_rpc;
+    slot.local_ar    = ctx->seq_local_ar;
+    slot.rpc_uids    = ctx->seq_rpc_uids;
+    slot.rpc_ar      = ctx->seq_rpc_ar;
+    slot.valid       = true;
+    static int nsave;
+    if (nsave < 8) {
+        nsave++;
+        fprintf(stderr, "[TOK] seq_save slot=%d fp=%llu ne2=%llu n_subgraphs=%zu\n",
+                si, (unsigned long long) slot.fp, (unsigned long long) slot.ne2, ns);
+    }
+}
+
+static bool ggml_backend_meta_seq_slot_restore(ggml_backend_meta_context * ctx, uint64_t fp, uint64_t ne2, const ggml_tensor * n0) {
+    const int si = ggml_meta_seq_slot_pick(ne2);
+    ggml_backend_meta_context::seq_plan_slot & slot = ctx->seq_fp_slots[si];
+    if (!slot.valid || slot.fp != fp || slot.n0 != n0 || slot.n_subgraphs < 2 ||
+            slot.local_gs.size() != slot.n_subgraphs) {
+        return false;
+    }
+    ctx->seq_plan_valid     = true;
+    ctx->seq_cached_n_nodes = slot.n_nodes;
+    ctx->seq_cached_fp      = slot.fp;
+    ctx->seq_cached_ne2     = slot.ne2;
+    ctx->seq_cached_n0      = slot.n0;
+    ctx->graph_sig          = slot.graph_sig;
+    ctx->n_subgraphs        = slot.n_subgraphs;
+    ctx->seq_j_local        = slot.j_local;
+    ctx->seq_j_rpc          = slot.j_rpc;
+    ctx->seq_local_gs       = slot.local_gs;
+    ctx->seq_local_ar       = slot.local_ar;
+    ctx->seq_rpc_uids       = slot.rpc_uids;
+    ctx->seq_rpc_ar         = slot.rpc_ar;
+    return true;
+}
+
+static bool ggml_backend_meta_seq_run(
+        ggml_backend_meta_context * ctx, size_t n_backends) {
+    if (ctx->comm_graph_seq == nullptr || ctx->comm_ctx == nullptr ||
+            ctx->seq_j_local >= n_backends || ctx->seq_j_rpc >= n_backends) {
+        return false;
+    }
+    if (ctx->comm_graph_seq(ctx->comm_ctx,
+            ctx->backend_configs[ctx->seq_j_local].backend,
+            ctx->seq_local_gs.data(), ctx->seq_local_ar.data(),
+            ctx->seq_rpc_uids.data(), ctx->seq_rpc_ar.data(),
+            ctx->n_subgraphs)) {
+        ctx->seq_skip_rpc_sync = true;
+        return true;
+    }
+    ctx->seq_plan_valid = false;
+    return false;
+}
+
 static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     GGML_ASSERT(cgraph->grads == nullptr);
     const size_t n_backends = ggml_backend_meta_n_backends(backend);
@@ -3210,32 +3351,44 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     // op/shape signature matches. After SEQ is planned, skip the 7k-node hash.
     bool needs_rebuild;
     const ggml_tensor * n0 = (cgraph->n_nodes > 0) ? cgraph->nodes[0] : nullptr;
+    const uint64_t ne2 = n0 ? (uint64_t) n0->ne[2] : 0;
     const uint64_t fp = ggml_meta_seq_graph_fp(
             cgraph->n_nodes,
             n0 ? (uint64_t) n0->ne[0] : 0,
             n0 ? (uint64_t) n0->ne[1] : 0,
-            n0 ? (uint64_t) n0->ne[2] : 0,
+            ne2,
             n0 ? (uint64_t) n0->op : 0);
     static const bool no_seq = getenv("LLAMA_TP_NO_SEQ") != nullptr;
-    if (ggml_meta_seq_can_fast(backend_ctx->seq_plan_valid, backend_ctx->seq_cached_n_nodes, cgraph->n_nodes,
-                backend_ctx->seq_cached_fp, fp, backend_ctx->n_subgraphs, backend_ctx->seq_local_gs.size())
-            && backend_ctx->comm_graph_seq != nullptr && backend_ctx->comm_ctx != nullptr
-            && !no_seq) {
-        const size_t j_local = backend_ctx->seq_j_local;
-        const size_t j_rpc   = backend_ctx->seq_j_rpc;
-        if (j_local < n_backends && j_rpc < n_backends) {
-            if (backend_ctx->comm_graph_seq(backend_ctx->comm_ctx,
-                    backend_ctx->backend_configs[j_local].backend,
-                    backend_ctx->seq_local_gs.data(), backend_ctx->seq_local_ar.data(),
-                    backend_ctx->seq_rpc_uids.data(), backend_ctx->seq_rpc_ar.data(),
-                    backend_ctx->n_subgraphs)) {
-                backend_ctx->seq_skip_rpc_sync = true;
-                return GGML_STATUS_SUCCESS;
-            }
-            backend_ctx->seq_plan_valid = false;
+    const int64_t t_meta0 = ggml_time_us();
+    auto can_fast_now = [&]() {
+        return backend_ctx->seq_cached_n0 == n0 &&
+            ggml_meta_seq_can_fast(backend_ctx->seq_plan_valid, backend_ctx->seq_cached_n_nodes, cgraph->n_nodes,
+                backend_ctx->seq_cached_fp, fp, backend_ctx->n_subgraphs, backend_ctx->seq_local_gs.size());
+    };
+    if (!no_seq && can_fast_now() && ggml_backend_meta_seq_run(backend_ctx, n_backends)) {
+        static int nfast;
+        if (nfast < 24) {
+            nfast++;
+            fprintf(stderr, "[TOK] meta_fast_seq us=%lld\n",
+                    (long long) (ggml_time_us() - t_meta0));
         }
+        return GGML_STATUS_SUCCESS;
     }
-    if (ggml_meta_seq_sig_reuse(backend_ctx->seq_plan_valid, backend_ctx->seq_cached_n_nodes, cgraph->n_nodes,
+    if (!no_seq && ggml_backend_meta_seq_slot_restore(backend_ctx, fp, ne2, n0) &&
+            can_fast_now() && ggml_backend_meta_seq_run(backend_ctx, n_backends)) {
+        static int nrest;
+        if (nrest < 24) {
+            nrest++;
+            fprintf(stderr, "[TOK] meta_fast_seq restore us=%lld ne2=%llu\n",
+                    (long long) (ggml_time_us() - t_meta0), (unsigned long long) ne2);
+        }
+        return GGML_STATUS_SUCCESS;
+    }
+    if (backend_ctx->seq_plan_valid && backend_ctx->seq_cached_fp != fp) {
+        ggml_backend_meta_seq_slot_save(backend_ctx);
+    }
+    if (backend_ctx->seq_cached_n0 == n0 &&
+            ggml_meta_seq_sig_reuse(backend_ctx->seq_plan_valid, backend_ctx->seq_cached_n_nodes, cgraph->n_nodes,
                 backend_ctx->seq_cached_fp, fp)) {
         needs_rebuild = false;
     } else {
@@ -3249,6 +3402,8 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         backend_ctx->graph_sig = graph_sig;
         backend_ctx->seq_cached_n_nodes = cgraph->n_nodes;
         backend_ctx->seq_cached_fp = fp;
+        backend_ctx->seq_cached_ne2 = ne2;
+        backend_ctx->seq_cached_n0 = n0;
         if (needs_rebuild) {
             backend_ctx->seq_plan_valid = false;
         }
@@ -3286,9 +3441,22 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 used_buffers.emplace(cgraph->nodes[i]->buffer);
             }
         }
+        bool seq_pin = false;
+        for (int si = 0; si < GGML_META_SEQ_FP_SLOTS; si++) {
+            if (backend_ctx->seq_fp_slots[si].valid) {
+                seq_pin = true;
+                break;
+            }
+        }
         for (ggml_backend_buffer_t buf : used_buffers) {
             ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) buf->context;
             buf_ctx->stc_compute_index_next = buf_ctx->stc_compute_index ^ 1;
+            // T=4 prompt shares KV/view buffers with T=1. Resetting the other
+            // stc slot frees the simple tensors cloned into a SEQ plan and the
+            // restored decode graph writes garbage (empty content).
+            if (seq_pin) {
+                continue;
+            }
             ggml_backend_meta_simple_tensor_container & stc = buf_ctx->stc_compute[buf_ctx->stc_compute_index_next];
             for (ggml_context_ptr & ctx : stc.ctxs) {
                 ggml_reset(ctx.get());
@@ -4064,6 +4232,8 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                         backend_ctx->seq_local_gs.data(), backend_ctx->seq_local_ar.data(),
                         backend_ctx->seq_rpc_uids.data(), backend_ctx->seq_rpc_ar.data(), ns)) {
                     backend_ctx->seq_skip_rpc_sync = true;
+                    backend_ctx->seq_cached_ne2 = ne2;
+                    ggml_backend_meta_seq_slot_save(backend_ctx);
                     return GGML_STATUS_SUCCESS;
                 }
                 backend_ctx->seq_plan_valid = false;

@@ -57,6 +57,10 @@ int main() {
           "empty SEQ plan vectors do not fast-path");
     check(ggml_meta_seq_can_fast(false, 7287, 7287, fp_t1, fp_t1, 49, 49) == false,
           "unplanned SEQ does not fast-path");
+    check(ggml_meta_seq_slot_pick(1) == 0, "T=1 uses decode SEQ slot");
+    check(ggml_meta_seq_slot_pick(4) == 1, "T=4 uses prompt SEQ slot");
+    check(ggml_meta_seq_slot_pick(8) == 1, "T=8 uses prompt SEQ slot");
+    check(GGML_META_SEQ_FP_SLOTS == 2, "two SEQ slots (decode + prompt)");
 
     if (fails) {
         fprintf(stderr, "%d check(s) failed\n", fails);
