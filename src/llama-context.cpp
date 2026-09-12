@@ -600,7 +600,7 @@ void llama_context::sched_reserve() {
     const uint32_t n_seqs = cparams.n_seq_max;
     const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
 
-    const size_t max_nodes = this->graph_max_nodes(n_tokens);
+    const size_t max_nodes = std::max<size_t>(this->graph_max_nodes(n_tokens), 16384);
 
     LLAMA_LOG_DEBUG("%s: max_nodes = %zu\n", __func__, max_nodes);
 
@@ -2435,7 +2435,7 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
         res += (n_sampling_outputs_max - 1) * n_sampling_nodes_max;
     }
     // Add headroom for extra graph views, intermediate copies, and sampler overhead
-    res += 1024;
+    res = std::max<uint32_t>(res + 8192, 16384);
     return res;
 }
 

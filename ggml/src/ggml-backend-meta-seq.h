@@ -31,10 +31,9 @@ static inline bool ggml_meta_seq_can_fast(bool plan_valid, int cached_n_nodes, i
         && n_subgraphs >= 2 && seq_gs_len == n_subgraphs;
 }
 
-// Two SEQ plan slots so a T>1 prompt cannot drop the T=1 HIP/RPC uids.
-// Slot 0 is decode (ne2==1); slot 1 is the latest prompt shape.
+// Two SEQ plan slots: slot 0 is decode (n_tokens==1); slot 1 is prompt.
 enum { GGML_META_SEQ_FP_SLOTS = 2 };
 
-static inline int ggml_meta_seq_slot_pick(uint64_t ne2) {
-    return ne2 == 1 ? 0 : 1;
+static inline int ggml_meta_seq_slot_pick(uint64_t n_tokens) {
+    return n_tokens == 1 ? 0 : 1;
 }

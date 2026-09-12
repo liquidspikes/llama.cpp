@@ -1340,7 +1340,7 @@ void llm_graph_result::reset() {
     inputs.clear();
     fused_nodes.clear();
 
-    const size_t max_nodes_alloc = max_nodes + 1024;
+    const size_t max_nodes_alloc = std::max<size_t>(max_nodes * 2 + 8192, 16384);
     buf_compute_meta.resize(ggml_tensor_overhead()*max_nodes_alloc + ggml_graph_overhead_custom(max_nodes_alloc, false));
 
     ggml_init_params params = {
