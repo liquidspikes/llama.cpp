@@ -34,6 +34,7 @@
 #include <limits.h>
 #include <stdarg.h>
 #include <signal.h>
+#include <execinfo.h>
 #if defined(__gnu_linux__)
 #include <syscall.h>
 #endif
@@ -1732,8 +1733,11 @@ static struct ggml_object * ggml_new_object(struct ggml_context * ctx, enum ggml
     }
 
     if (cur_end + size_needed + GGML_OBJECT_SIZE > ctx->mem_size) {
-        GGML_LOG_WARN("%s: not enough space in the context's memory pool (needed %zu, available %zu)\n",
-                __func__, cur_end + size_needed + GGML_OBJECT_SIZE, ctx->mem_size);
+        GGML_LOG_WARN("%s: not enough space in the context's memory pool (needed %zu, available %zu, cur_end %zu, size_needed %zu, mem_buffer %p)\n",
+                __func__, cur_end + size_needed + GGML_OBJECT_SIZE, ctx->mem_size, cur_end, size_needed, ctx->mem_buffer);
+        void * trace[32];
+        int trace_size = backtrace(trace, 32);
+        backtrace_symbols_fd(trace, trace_size, 2);
 #ifndef NDEBUG
         GGML_ABORT("not enough space in the context's memory pool");
 #endif

@@ -2866,14 +2866,14 @@ static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer(ggml_bac
 struct ggml_backend_buffer * ggml_backend_meta_alloc_ctx_tensors_from_buft(struct ggml_context * ctx, ggml_backend_buffer_type_t buft) {
     const size_t n_simple_bufts = ggml_backend_meta_buft_n_bufts(buft);
 
-    constexpr size_t compute_headroom = 16; // Maximum number of views per statically allocated tensor that can be created between evals.
+    const size_t mem_size_compute = std::max<size_t>(1024 * ggml_get_mem_size(ctx), 64 * 1024 * 1024);
     const ggml_init_params params_static = {
         /*.mem_size   =*/ ggml_get_mem_size(ctx),
         /*.mem_buffer =*/ nullptr,
         /*.no_alloc   =*/ true,
     };
     const ggml_init_params params_compute = {
-        /*.mem_size   =*/ compute_headroom*ggml_get_mem_size(ctx),
+        /*.mem_size   =*/ mem_size_compute,
         /*.mem_buffer =*/ nullptr,
         /*.no_alloc   =*/ true,
     };
@@ -2976,6 +2976,7 @@ struct ggml_backend_meta_context {
     bool                                 seq_skip_rpc_sync = false;
     int                                  seq_cached_n_nodes = -1;
     uint64_t                             seq_cached_fp = 0;
+    uint64_t                             seq_cached_n_tokens = 0;
     uint64_t                             seq_cached_ne2 = 0;
     const ggml_tensor *                  seq_cached_n0 = nullptr;
     size_t                               seq_j_local    = 0;
@@ -2985,13 +2986,15 @@ struct ggml_backend_meta_context {
     std::vector<uint64_t>                seq_rpc_uids;
     std::vector<ggml_tensor *>           seq_rpc_ar;
 
-    // Cloned SEQ plans keyed by ggml_meta_seq_slot_pick(ne2). T=4 rebuild
+    // Cloned SEQ plans keyed by ggml_meta_seq_slot_pick(n_tokens). T=4 rebuild
     // mutates backend_configs cgraphs in place; clones keep T=1 HIP/RPC uids.
     struct seq_plan_slot {
         uint64_t                   fp = 0;
+        uint64_t                   n_tokens = 0;
         uint64_t                   ne2 = 0;
         const ggml_tensor *        n0 = nullptr;
         bool                       valid = false;
+        uint64_t                   uid = 0;
         int                        n_nodes = -1;
         uint64_t                   graph_sig = 0;
         size_t                     n_subgraphs = 0;
@@ -3222,10 +3225,10 @@ static void ggml_backend_meta_synchronize(ggml_backend_t backend) {
 }
 
 static void ggml_backend_meta_seq_slot_save(ggml_backend_meta_context * ctx) {
-    if (!ctx->seq_plan_valid || ctx->n_subgraphs < 2 || ctx->seq_local_gs.size() != ctx->n_subgraphs) {
+    if (ctx->seq_cached_n_tokens != 1 || !ctx->seq_plan_valid || ctx->n_subgraphs < 2 || ctx->seq_local_gs.size() != ctx->n_subgraphs) {
         return;
     }
-    const int si = ggml_meta_seq_slot_pick(ctx->seq_cached_ne2);
+    const int si = ggml_meta_seq_slot_pick(ctx->seq_cached_n_tokens);
     ggml_backend_meta_context::seq_plan_slot & slot = ctx->seq_fp_slots[si];
     // First successful plan for this T is the one llama gf_res_decode/prev
     // keeps. Replacing it with a later 1-token graph (slot cleanup, n_kv
@@ -3279,8 +3282,10 @@ static void ggml_backend_meta_seq_slot_save(ggml_backend_meta_context * ctx) {
         slot.local_gs[i] = dst;
     }
     slot.fp          = ctx->seq_cached_fp;
+    slot.n_tokens    = ctx->seq_cached_n_tokens;
     slot.ne2         = ctx->seq_cached_ne2;
     slot.n0          = ctx->seq_cached_n0;
+    slot.uid         = ctx->uid;
     slot.n_nodes     = ctx->seq_cached_n_nodes;
     slot.graph_sig   = ctx->graph_sig;
     slot.n_subgraphs = ns;
@@ -3293,24 +3298,29 @@ static void ggml_backend_meta_seq_slot_save(ggml_backend_meta_context * ctx) {
     static int nsave;
     if (nsave < 8) {
         nsave++;
-        fprintf(stderr, "[TOK] seq_save slot=%d fp=%llu ne2=%llu n_subgraphs=%zu\n",
-                si, (unsigned long long) slot.fp, (unsigned long long) slot.ne2, ns);
+        fprintf(stderr, "[TOK] seq_save slot=%d fp=%llu n_tokens=%llu n_subgraphs=%zu\n",
+                si, (unsigned long long) slot.fp, (unsigned long long) slot.n_tokens, ns);
     }
 }
 
-static bool ggml_backend_meta_seq_slot_restore(ggml_backend_meta_context * ctx, uint64_t fp, uint64_t ne2, const ggml_tensor * n0) {
-    const int si = ggml_meta_seq_slot_pick(ne2);
+static bool ggml_backend_meta_seq_slot_restore(ggml_backend_meta_context * ctx, uint64_t fp, uint64_t n_tokens, const ggml_tensor * n0) {
+    if (n_tokens != 1) {
+        return false;
+    }
+    const int si = ggml_meta_seq_slot_pick(n_tokens);
     ggml_backend_meta_context::seq_plan_slot & slot = ctx->seq_fp_slots[si];
-    if (!slot.valid || slot.fp != fp || slot.n0 != n0 || slot.n_subgraphs < 2 ||
+    if (!slot.valid || slot.fp != fp || slot.n_tokens != 1 || slot.n0 != n0 || slot.n_subgraphs < 2 ||
             slot.local_gs.size() != slot.n_subgraphs) {
         return false;
     }
     ctx->seq_plan_valid     = true;
     ctx->seq_cached_n_nodes = slot.n_nodes;
     ctx->seq_cached_fp      = slot.fp;
+    ctx->seq_cached_n_tokens = slot.n_tokens;
     ctx->seq_cached_ne2     = slot.ne2;
     ctx->seq_cached_n0      = slot.n0;
     ctx->graph_sig          = slot.graph_sig;
+    ctx->uid                = slot.uid;
     ctx->n_subgraphs        = slot.n_subgraphs;
     ctx->seq_j_local        = slot.j_local;
     ctx->seq_j_rpc          = slot.j_rpc;
@@ -3351,17 +3361,22 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     // op/shape signature matches. After SEQ is planned, skip the 7k-node hash.
     bool needs_rebuild;
     const ggml_tensor * n0 = (cgraph->n_nodes > 0) ? cgraph->nodes[0] : nullptr;
+    const uint64_t ne1 = n0 ? (uint64_t) n0->ne[1] : 0;
     const uint64_t ne2 = n0 ? (uint64_t) n0->ne[2] : 0;
+    // In Qwen4exp / Flash-Next, n0 is repeat_4d [2560, 4, n_tokens, 1] (ne1=4, ne2=n_tokens).
+    // In standard LLaMA models, n0 is [n_embd, n_tokens, 1, 1] (ne1=n_tokens, ne2=1).
+    const uint64_t n_tokens = (n0 && ne2 > 0) ? (ne1 == 4 ? ne2 : ne1) : 0;
     const uint64_t fp = ggml_meta_seq_graph_fp(
             cgraph->n_nodes,
             n0 ? (uint64_t) n0->ne[0] : 0,
-            n0 ? (uint64_t) n0->ne[1] : 0,
+            ne1,
             ne2,
             n0 ? (uint64_t) n0->op : 0);
     static const bool no_seq = getenv("LLAMA_TP_NO_SEQ") != nullptr;
     const int64_t t_meta0 = ggml_time_us();
     auto can_fast_now = [&]() {
-        return backend_ctx->seq_cached_n0 == n0 &&
+        return n_tokens == 1 && backend_ctx->seq_cached_n_tokens == 1 &&
+            backend_ctx->seq_cached_n0 == n0 &&
             ggml_meta_seq_can_fast(backend_ctx->seq_plan_valid, backend_ctx->seq_cached_n_nodes, cgraph->n_nodes,
                 backend_ctx->seq_cached_fp, fp, backend_ctx->n_subgraphs, backend_ctx->seq_local_gs.size());
     };
@@ -3374,38 +3389,33 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         }
         return GGML_STATUS_SUCCESS;
     }
-    if (!no_seq && ggml_backend_meta_seq_slot_restore(backend_ctx, fp, ne2, n0) &&
+    if (!no_seq && n_tokens == 1 && ggml_backend_meta_seq_slot_restore(backend_ctx, fp, n_tokens, n0) &&
             can_fast_now() && ggml_backend_meta_seq_run(backend_ctx, n_backends)) {
         static int nrest;
         if (nrest < 24) {
             nrest++;
-            fprintf(stderr, "[TOK] meta_fast_seq restore us=%lld ne2=%llu\n",
-                    (long long) (ggml_time_us() - t_meta0), (unsigned long long) ne2);
+            fprintf(stderr, "[TOK] meta_fast_seq restore us=%lld n_tokens=%llu\n",
+                    (long long) (ggml_time_us() - t_meta0), (unsigned long long) n_tokens);
         }
         return GGML_STATUS_SUCCESS;
     }
     if (backend_ctx->seq_plan_valid && backend_ctx->seq_cached_fp != fp) {
         ggml_backend_meta_seq_slot_save(backend_ctx);
     }
-    if (backend_ctx->seq_cached_n0 == n0 &&
+    if (n_tokens == 1 && backend_ctx->seq_cached_n_tokens == 1 && backend_ctx->seq_cached_n0 == n0 &&
             ggml_meta_seq_sig_reuse(backend_ctx->seq_plan_valid, backend_ctx->seq_cached_n_nodes, cgraph->n_nodes,
                 backend_ctx->seq_cached_fp, fp)) {
         needs_rebuild = false;
     } else {
-        uint64_t graph_sig = (uint64_t) cgraph->n_nodes * 0x9e3779b97f4a7c15ull;
-        for (int i = 0; i < cgraph->n_nodes; i++) {
-            const ggml_tensor * n = cgraph->nodes[i];
-            graph_sig ^= (uint64_t) n->op + 0x9e3779b97f4a7c15ull + (graph_sig << 6) + (graph_sig >> 2);
-            graph_sig ^= (uint64_t) n->ne[0] + ((uint64_t) n->ne[1] << 20) + ((uint64_t) n->ne[2] << 40);
-        }
-        needs_rebuild = (backend_ctx->n_subgraphs == 0) || (graph_sig != backend_ctx->graph_sig);
-        backend_ctx->graph_sig = graph_sig;
+        needs_rebuild = true;
+        backend_ctx->seq_plan_valid = false;
         backend_ctx->seq_cached_n_nodes = cgraph->n_nodes;
         backend_ctx->seq_cached_fp = fp;
+        backend_ctx->seq_cached_n_tokens = n_tokens;
         backend_ctx->seq_cached_ne2 = ne2;
         backend_ctx->seq_cached_n0 = n0;
-        if (needs_rebuild) {
-            backend_ctx->seq_plan_valid = false;
+        for (int si = 0; si < GGML_META_SEQ_FP_SLOTS; si++) {
+            backend_ctx->seq_fp_slots[si].valid = false;
         }
     }
     if (!needs_rebuild) {
@@ -4232,6 +4242,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                         backend_ctx->seq_local_gs.data(), backend_ctx->seq_local_ar.data(),
                         backend_ctx->seq_rpc_uids.data(), backend_ctx->seq_rpc_ar.data(), ns)) {
                     backend_ctx->seq_skip_rpc_sync = true;
+                    backend_ctx->seq_cached_n_tokens = n_tokens;
                     backend_ctx->seq_cached_ne2 = ne2;
                     ggml_backend_meta_seq_slot_save(backend_ctx);
                     return GGML_STATUS_SUCCESS;
@@ -4632,6 +4643,16 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 }
             }
         }
+    }
+    if (n_tokens == 1 && backend_ctx->n_subgraphs >= 2 && backend_ctx->comm_graph_seq != nullptr &&
+            backend_ctx->seq_local_gs.size() == backend_ctx->n_subgraphs) {
+        backend_ctx->seq_plan_valid = true;
+        backend_ctx->seq_cached_n_tokens = n_tokens;
+        backend_ctx->seq_cached_ne2 = ne2;
+        backend_ctx->seq_cached_n0 = n0;
+        backend_ctx->seq_cached_fp = fp;
+        backend_ctx->seq_cached_n_nodes = cgraph->n_nodes;
+        ggml_backend_meta_seq_slot_save(backend_ctx);
     }
     return GGML_STATUS_SUCCESS;
 }

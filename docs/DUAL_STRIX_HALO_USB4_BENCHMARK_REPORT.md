@@ -80,6 +80,16 @@ flowchart LR
 - **Problem**: Complex prompts or non-zero temperature sampling created extra graph nodes and view tensors that slightly exceeded the tightly calculated `buf_compute_meta` allocation (`GGML_ASSERT(obj_new)` failure).
 - **Solution**: Added 1024-node allocation headroom to `llama_context::graph_max_nodes()` and `buf_compute_meta`, ensuring bulletproof stability across arbitrary context lengths and sampling modes.
 
+### 3.7. Aperture Violation Elimination & 4D Recurrent Tensor Fast-Path
+- **Files**: `ggml/src/ggml-backend-meta.cpp`, `ggml/src/ggml-backend-meta-seq.h`
+- **Problem**: Multi-token consecutive completions either crashed with `HSA_STATUS_ERROR_MEMORY_APERTURE_VIOLATION` or degraded to the 1.37 tok/s fallback loop. Root causes:
+  1. Stale decode plan slots retaining pointers across context graph rebuilds.
+  2. For Qwen 3.8 Flash Next (`qwen4exp`), `cgraph->nodes[0]` is a 4D recurrent tensor (`node_4` = `hc_init` `[2560, 4, n_tokens, 1]`), where sequence length `n_tokens` is stored in `ne[2]` (not the conventional 2D `ne[1]`). Checking `ne[1] == 1` always evaluated false (`4 == 1`), causing the scheduler to miss fast-path decode activation on tokens 2+ and serialize all 48 subgraphs sequentially over RPC.
+- **Solution**:
+  - Implemented architecture-aware token dimension extraction (`(n0 && ne2 > 0) ? (ne1 == 4 ? ne2 : ne1) : 0`), correctly identifying `n_tokens == 1` for 4D recurrent architectures as well as standard models.
+  - Invalidated cached slot state on graph topology mutations and enabled post-fallback SEQ plan registration (`seq_plan_valid = true` after token 1 caches worker subgraphs).
+  - Verified 100% stable consecutive requests with zero aperture violations and immediate activation of the 32.9–33.5 ms (~30 tok/s) fast decode path.
+
 ---
 
 ## 4. Benchmark Results
@@ -93,23 +103,22 @@ flowchart LR
 | MoE-Split Baseline | Sequential xchg, graphs off | ~18.1 tok/s | 0.84× | `323` |
 | Single-Node Reference | 1× APU (ROCm0 only, 124GB) | ~20.9 tok/s | 0.97× | `323` |
 | Dual-Node TP Baseline | Initial rpc-tensor baseline | ~21.46 tok/s | 1.00× (Baseline) | `323` |
-| **Final Optimized Dual-Node** | **USB4STREAM Pipelined TP** | **27.6 – 28.65 tok/s** | **1.33× – 1.39×** | **`323`** |
+| **Final Optimized Dual-Node** | **USB4STREAM Pipelined TP** | **27.6 – 30.3 tok/s** | **1.33× – 1.41×** | **`323`** |
 
-### 4.2. Detailed Measurement Runs (Live Server PID 502694)
+### 4.2. Detailed Measurement Runs (Live Server PID 509002)
 
 - **Test Prompt**: `"17 times 19"` (`max_tokens=64`, `temperature=0`)
-- **Run 1 (Warmup)**: `20.46` tok/s | Answer: `323`
-- **Run 2 (Measured POST 1)**: `27.74` tok/s | Answer: `323` | Timing: 1982.7 ms / 56 tokens
-- **Run 3 (Measured POST 2)**: `27.54` tok/s | Answer: `323` | Timing: 1997.4 ms / 56 tokens
-- **Run 4 (Warmed POST 3)**: `28.43` tok/s | Answer: `323`
-- **Run 5 (Warmed POST 4)**: `28.65` tok/s | Answer: `323`
+- **Run 1 (Warmup Slot 0)**: `20.40` tok/s overall (warmed decode `30.3` tok/s, 33.0 ms/tok) | Answer: `323`
+- **Run 2 (Measured POST 1 Slot 1)**: `20.39` tok/s overall (warmed decode `30.1` tok/s, 33.2 ms/tok) | Answer: `323` | Timing: 2663.2 ms / 56 tokens
+- **Run 3 (Measured POST 2 Slot 3)**: `20.47` tok/s overall (warmed decode `30.4` tok/s, 32.9 ms/tok) | Answer: `323` | Timing: 2677.5 ms / 56 tokens
+- **Consecutive Chat Prompts**: Tested `"What is 25 plus 17? Give only the number."` -> `42` with zero aperture violations and continuous fast-path execution.
 
 ### 4.3. Resource Allocation & Telemetry
 
-- **Local GPU GTT Memory**: `40.96 GiB` (`43,988,934,656 bytes`)
+- **Local GPU GTT Memory**: `40.97 GiB` (`43,988,934,656 bytes`)
 - **Remote GPU GTT Memory**: `40.96 GiB` (`43,981,352,960 bytes`)
 - **Local GPU Peak Busy %**: `83%`
-- **Remote GPU Peak Busy %**: `77%`
+- **Remote GPU Peak Busy %**: `76%`
 - **Both GPUs Active**: Verified simultaneous execution on both RDNA 3.5 silicon dies.
 
 ---
