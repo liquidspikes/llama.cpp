@@ -150,28 +150,11 @@ struct common_sampler {
                 cur[i] = llama_token_data{sampled_ids[i], sampled_logits[i], 0.0f};
             }
         } else {
-            const int64_t t_get = ggml_time_us();
             const auto * logits = llama_get_logits_ith(ctx, idx);
-            const int64_t get_us = ggml_time_us() - t_get;
             GGML_ASSERT(logits != nullptr);
-            // rpc-tensor cannot offload sampling, so this used to fill n_vocab
-            // token_data (~248k). When top_k is set, only keep those.
-            const int32_t k = params.top_k;
-            const int64_t t_fill = ggml_time_us();
-            if (k > 0 && k < n_vocab && n_vocab > 2048) {
-                cur.resize((size_t) k);
-                const int32_t got = llama_token_data_select_topk(cur.data(), k, logits, n_vocab);
-                cur.resize((size_t) got);
-            } else {
-                cur.resize((size_t) n_vocab);
-                llama_token_data_select_topk(cur.data(), 0, logits, n_vocab);
-            }
-            static int nlog;
-            if (nlog < 6) {
-                nlog++;
-                fprintf(stderr, "[TOK] logits_get us=%lld fill us=%lld n_vocab=%d k=%d n_keep=%zu\n",
-                        (long long) get_us, (long long) (ggml_time_us() - t_fill),
-                        n_vocab, k, cur.size());
+            cur.resize((size_t) n_vocab);
+            for (llama_token token_id = 0; token_id < n_vocab; token_id++) {
+                cur[token_id] = llama_token_data{token_id, logits[token_id], 0.0f};
             }
         }
 
