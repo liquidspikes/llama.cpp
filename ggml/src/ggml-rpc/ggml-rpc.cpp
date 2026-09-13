@@ -1032,6 +1032,23 @@ static void ggml_backend_rpc_buffer_memset_tensor(
     ctx->dispatcher->send(RPC_CMD_MEMSET_TENSOR, request, sizeof(*request));
 }
 
+static void rpc_maybe_dump_cache(const void * data, size_t size) {
+    static const char * dump_dir = std::getenv("GGML_RPC_CACHE_DUMP_DIR");
+    if (dump_dir && dump_dir[0]) {
+        uint64_t h = fnv_hash((const uint8_t*)data, size);
+        char hash_str[17];
+        snprintf(hash_str, sizeof(hash_str), "%016" PRIx64, h);
+        std::string p = std::string(dump_dir) + "/" + hash_str;
+        if (access(p.c_str(), F_OK) != 0) {
+            FILE * f = fopen(p.c_str(), "wb");
+            if (f) {
+                fwrite(data, 1, size, f);
+                fclose(f);
+            }
+        }
+    }
+}
+
 static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     int64_t t0 = rpc_perf_enabled() ? ggml_time_us() : 0;
     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
@@ -1052,6 +1069,7 @@ static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggm
             return;
         }
     }
+    rpc_maybe_dump_cache(data, size);
     const uint8_t * in_ptr = static_cast<const uint8_t *>(data);
     size_t transferred = 0;
     while (transferred < size) {
@@ -1412,6 +1430,7 @@ static void ggml_backend_rpc_set_tensor_async(ggml_backend_t backend, ggml_tenso
             return;
         }
     }
+    rpc_maybe_dump_cache(data, size);
     const uint8_t * in_ptr = static_cast<const uint8_t *>(data);
     size_t transferred = 0;
     while (transferred < size) {

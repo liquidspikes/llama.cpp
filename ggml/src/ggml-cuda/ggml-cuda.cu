@@ -708,12 +708,7 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     if (copy_event != nullptr) {
         CUDA_CHECK(cudaEventDestroy(copy_event));
     }
-    for (int i = 0; i < MMVQ_Q8_NSLOT; ++i) {
-        if (mmvq_q8_slots[i].buf != nullptr) {
-            CUDA_CHECK(cudaFree(mmvq_q8_slots[i].buf));
-            mmvq_q8_slots[i].buf = nullptr;
-        }
-    }
+
     for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
         for (int j = 0; j < GGML_CUDA_MAX_STREAMS; ++j) {
             if (streams[i][j] != nullptr) {
