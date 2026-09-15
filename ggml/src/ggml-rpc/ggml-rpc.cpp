@@ -1156,7 +1156,8 @@ static void ggml_backend_rpc_buffer_clear(ggml_backend_buffer_t buffer, uint8_t 
     auto request = std::make_shared<rpc_msg_buffer_clear_req>();
     request->remote_ptr = ctx->remote_ptr;
     request->value = value;
-    ctx->dispatcher->send(RPC_CMD_BUFFER_CLEAR, request, sizeof(*request));
+    uint8_t ack = 0;
+    ctx->dispatcher->send(RPC_CMD_BUFFER_CLEAR, request, sizeof(*request), &ack, sizeof(ack));
 }
 
 static ggml_backend_buffer_i ggml_backend_rpc_buffer_interface = {
@@ -3036,7 +3037,8 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                 if (!recv_msg(sock, &request, sizeof(request), cmd_channel)) {
                     return;
                 }
-                if (!server.buffer_clear(request)) {
+                const uint8_t ack = server.buffer_clear(request) ? 1 : 0;
+                if (!send_msg(sock, &ack, sizeof(ack), cmd_channel)) {
                     return;
                 }
                 break;

@@ -139,15 +139,18 @@ llama_memory_recurrent::llama_memory_recurrent(
 }
 
 void llama_memory_recurrent::clear(bool data) {
+    fprintf(stderr, "[RECR_DBG] clear(data=%d) size=%u\n", data, size);
     for (int32_t i = 0; i < (int32_t) size; ++i) {
         cells[i].pos = -1;
         cells[i].seq_id.clear();
         cells[i].src = -1;
+        cells[i].src0 = -1;
         cells[i].tail = -1;
     }
 
     head = 0;
     used = 0;
+    rs_z = -1;
 
     if (data) {
         for (auto & [_, buf] : ctxs_bufs) {
@@ -169,14 +172,46 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
         p1 = std::numeric_limits<llama_pos>::max();
     }
 
-    if ((uint32_t) seq_id >= this->n_seq_max) {
+    if (seq_id >= 0 && (uint32_t) seq_id >= this->n_seq_max) {
         LLAMA_LOG_ERROR("%s: invalid seq_id (%d) - larger than n_seq_max (%d)\n", __func__, seq_id, this->n_seq_max);
         return false;
     }
 
     const bool rm_all = p0 == 0 && p1 == std::numeric_limits<llama_pos>::max();
+    fprintf(stderr, "[RECR_DBG] seq_rm(seq_id=%d, p0=%lld, p1=%lld) rm_all=%d n_seq_max=%u\n",
+            seq_id, (long long)p0, (long long)p1, rm_all, n_seq_max);
     if (rm_all) {
+        if (seq_id < 0 || n_seq_max <= 1) {
+            clear(true);
+            return true;
+        }
+
         set_rs_idx(seq_id, 0);
+        rs_z = -1;
+        for (uint32_t k = 0; k <= n_rs_seq; ++k) {
+            const uint32_t row = k * size + (uint32_t) seq_id;
+            for (ggml_tensor * r : r_l) {
+                if (r) {
+                    const size_t row_bytes = ggml_row_size(r->type, r->ne[0]);
+                    std::vector<uint8_t> zeros(row_bytes, 0);
+                    ggml_backend_tensor_set(r, zeros.data(), row * row_bytes, row_bytes);
+                }
+            }
+            for (ggml_tensor * s : s_l) {
+                if (s) {
+                    const size_t row_bytes = ggml_row_size(s->type, s->ne[0]);
+                    std::vector<uint8_t> zeros(row_bytes, 0);
+                    ggml_backend_tensor_set(s, zeros.data(), row * row_bytes, row_bytes);
+                }
+            }
+            for (ggml_tensor * p : p_l) {
+                if (p) {
+                    const size_t row_bytes = ggml_row_size(p->type, p->ne[0]);
+                    std::vector<uint8_t> zeros(row_bytes, 0);
+                    ggml_backend_tensor_set(p, zeros.data(), row * row_bytes, row_bytes);
+                }
+            }
+        }
     }
 
     // models like Mamba or RWKV can't have a state partially erased at the end
@@ -216,7 +251,7 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
     }
 
     for (uint32_t i = 0; i < size; ++i) {
-        if (cells[i].pos >= p0 && cells[i].pos < p1) {
+        if (rm_all || (cells[i].pos >= p0 && cells[i].pos < p1)) {
             if (seq_id < 0) {
                 cells[i].seq_id.clear();
             } else if (cells[i].has_seq_id(seq_id)) {
@@ -231,6 +266,8 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
                 }
                 cells[i].pos = -1;
                 cells[i].src = -1;
+                cells[i].src0 = -1;
+                cells[i].tail = -1;
                 if (new_head == size) {
                     new_head = i;
                 }
@@ -656,7 +693,7 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
         const int32_t cell_id = s + min;
         auto & cell = cells[cell_id];
 
-        if (cell.pos >= 0 && last_pos != cell.pos + (llama_pos) n_seq_tokens) {
+        if (ubatch.pos[i] != 0 && cell.pos >= 0 && last_pos != cell.pos + (llama_pos) n_seq_tokens) {
             // What should happen when the pos backtracks or skips a value?
             // Clearing the state mid-batch would require special-casing which isn't done.
             // A hybrid model that filters out every recurrent layer leaves this cache with no tensors.
@@ -683,6 +720,17 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
 
     // Find first cell without src refs, to use as the zero-ed state
     {
+        // If a sequence starts at pos 0, its cell has NO incoming state from previous steps.
+        // Reset cell.src to -1 so it will be assigned src0 = rs_z and rs_z will be cleared.
+        for (uint32_t s = 0; s < n_seqs; ++s) {
+            const uint32_t i = s*n_seq_tokens;
+            if (ubatch.pos[i] == 0) {
+                const int32_t cell_id = s + min;
+                cells[cell_id].src = -1;
+                cells[cell_id].src0 = -1;
+            }
+        }
+
         // TODO: bake-in src refcounts in the cell metadata
         std::vector<int32_t> refcounts(size, 0);
         for (size_t i = 0; i < size; ++i) {
@@ -699,6 +747,14 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
                 break;
             }
         }
+        if (rs_z < 0) {
+            for (size_t i = 0; i < size; ++i) {
+                if (refcounts[i] == 0) {
+                    rs_z = i;
+                    break;
+                }
+            }
+        }
 
         for (int i = min; i <= max; ++i) {
             if (cells[i].src < 0) {
@@ -711,6 +767,8 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
             }
             cells[i].src = i; // avoid moving or clearing twice
         }
+        fprintf(stderr, "[RECR_DBG] find_slot: n_seqs=%u pos0=%d min=%d max=%d rs_z=%d src0=%d\n",
+                n_seqs, ubatch.pos[0], min, max, rs_z, cells[min].src0);
     }
 
     // allow getting the range of used cells, from head to head + n

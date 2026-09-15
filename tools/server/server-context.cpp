@@ -242,6 +242,8 @@ struct server_slot {
     llama_context * ctx_tgt = nullptr;
     llama_context * ctx_dft = nullptr;
 
+    common_context_seq_rm_type seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_PART;
+
     common_memory mem;
 
     // multimodal
@@ -332,9 +334,14 @@ struct server_slot {
     }
 
     void prompt_clear() {
+        fprintf(stderr, "[SERVER_DBG] prompt_clear: id=%d prompt_tokens=%zu\n", id, prompt.tokens.size());
         SLT_TRC(*this, "clearing prompt with %zu tokens\n", prompt.tokens.size());
 
         mem.seq_rm(id, -1, -1);
+
+        if (ctx_tgt) {
+            llama_synchronize(ctx_tgt);
+        }
 
         prompt.clear();
     }
@@ -545,6 +552,8 @@ struct server_slot {
         if (is_processing()) {
             GGML_ASSERT(task);
 
+            fprintf(stderr, "[SERVER_DBG] release: id=%d is_child=%d cache_prompt=%d seq_rm_type=%d\n",
+                    id, task->is_child(), task->params.cache_prompt, (int)seq_rm_type);
             SLT_INF(*this, "stop processing: n_tokens = %d, truncated = %d\n", prompt.n_tokens(), truncated);
 
             t_last_used = ggml_time_us();
@@ -552,7 +561,8 @@ struct server_slot {
             state = SLOT_STATE_IDLE;
 
             // do not keep context of the child slots - the parent's context is enough
-            if (task->is_child()) {
+            // also clear if cache_prompt is false or if the model does not support partial seq_rm
+            if (task->is_child() || !task->params.cache_prompt || seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_PART) {
                 prompt_clear();
             }
 
@@ -1298,6 +1308,7 @@ private:
             slot.id      = i;
             slot.ctx_tgt = ctx_tgt;
             slot.ctx_dft = ctx_dft;
+            slot.seq_rm_type = ctx_tgt_seq_rm_type;
             slot.mem.init(ctx_tgt, ctx_dft);
             slot.spec    = spec.get();
             slot.n_ctx   = n_ctx_slot();
@@ -3223,7 +3234,7 @@ private:
                                 return;
                             }
 
-                            if (slot.task->params.cache_prompt) {
+                            if (slot.task->params.cache_prompt && slot.seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_PART) {
                                 // reuse any previously computed tokens that are common with the new prompt
                                 n_past = slot.prompt.tokens.get_common_prefix(input_tokens);
 
@@ -4779,10 +4790,6 @@ void server_routes::init_routes() {
 
     this->post_slots = [this](const server_http_req & req) {
         auto res = create_response();
-        if (params.slot_save_path.empty()) {
-            res->error(format_error_response("This server does not support slots action. Start it with `--slot-save-path`", ERROR_TYPE_NOT_SUPPORTED));
-            return res;
-        }
 
         std::string id_slot_str = req.get_param("id_slot");
 
@@ -4796,14 +4803,20 @@ void server_routes::init_routes() {
 
         std::string action = req.get_param("action");
 
+        if (action == "erase") {
+            return handle_slots_erase(req, id_slot);
+        }
+
+        if (params.slot_save_path.empty()) {
+            res->error(format_error_response("This server does not support slots action. Start it with `--slot-save-path`", ERROR_TYPE_NOT_SUPPORTED));
+            return res;
+        }
+
         if (action == "save") {
             return handle_slots_save(req, id_slot);
         }
         if (action == "restore") {
             return handle_slots_restore(req, id_slot);
-        }
-        if (action == "erase") {
-            return handle_slots_erase(req, id_slot);
         }
 
         res->error(format_error_response("Invalid action", ERROR_TYPE_INVALID_REQUEST));

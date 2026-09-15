@@ -974,6 +974,9 @@ static void ggml_gallocr_init_tensor(ggml_gallocr_t galloc, struct ggml_tensor *
     if (tensor->view_src != NULL) {
         if (tensor->buffer == NULL) {
             assert(tensor_alloc->addr.offset == SIZE_MAX);
+            if (tensor->view_src->buffer == NULL && tensor->view_src->view_src != NULL) {
+                ggml_gallocr_init_tensor(galloc, tensor->view_src, tensor_alloc);
+            }
             if (tensor->view_src->buffer == NULL) {
                 // this tensor was allocated without ggml-backend
                 return;

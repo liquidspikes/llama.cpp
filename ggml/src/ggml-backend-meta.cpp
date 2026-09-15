@@ -43,10 +43,10 @@ static bool ggml_backend_meta_gdn_x_ag(void) {
 
 // Unallocated / poisoned shard pointers (qwen4exp Flash Next TP SIGSEGV:
 // dest 0x555500000032, memset ~29GB). Odd or near-null addresses are never
-// valid GPU/host buffers on this path; 16-byte alignment matches malloc/HIP.
+// valid GPU/host buffers on this path; tensor views require at least 2-byte alignment.
 static bool ggml_backend_meta_data_ptr_ok(const void * p) {
     const uintptr_t u = (uintptr_t) p;
-    return p != nullptr && u >= 0x10000ull && (u & 0xf) == 0;
+    return p != nullptr && u >= 0x10000ull && (u & 0x1) == 0;
 }
 
 static bool ggml_backend_meta_resid_name(const char * name) {
@@ -612,29 +612,96 @@ ggml_backend_buffer_t ggml_backend_meta_buffer_simple_buffer(ggml_backend_buffer
     return buf_ctx->bufs[index].get();
 }
 
+static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_meta_simple_tensor_container & stc, ggml_tensor * tensor);
+
+static void ggml_backend_meta_ensure_buffer(struct ggml_tensor * tensor) {
+    if (tensor == nullptr) {
+        return;
+    }
+    if (tensor->view_src != nullptr) {
+        ggml_backend_meta_ensure_buffer(tensor->view_src);
+        if (tensor->buffer == nullptr && tensor->view_src->buffer != nullptr &&
+                ggml_backend_buffer_is_meta(tensor->view_src->buffer)) {
+            tensor->buffer = tensor->view_src->buffer;
+        }
+        if (tensor->data == nullptr && tensor->view_src->data != nullptr) {
+            tensor->data = (char *) tensor->view_src->data + tensor->view_offs;
+        }
+    }
+}
+
 struct ggml_tensor * ggml_backend_meta_buffer_simple_tensor(const struct ggml_tensor * tensor, size_t index) {
     if (tensor == nullptr) {
         return nullptr;
     }
-    if (tensor->buffer == nullptr || !ggml_backend_buffer_is_meta(tensor->buffer)) {
-        if (tensor->view_src != nullptr && tensor->view_src->buffer != nullptr &&
-                ggml_backend_buffer_is_meta(tensor->view_src->buffer)) {
-            tensor = tensor->view_src;
-        } else {
+    struct ggml_tensor * t = const_cast<struct ggml_tensor *>(tensor);
+    ggml_backend_meta_ensure_buffer(t);
+
+    const struct ggml_tensor * orig_tensor = t;
+    if (t->buffer == nullptr || !ggml_backend_buffer_is_meta(t->buffer)) {
+        while (t != nullptr && (t->buffer == nullptr || !ggml_backend_buffer_is_meta(t->buffer))) {
+            t = t->view_src;
+        }
+        if (t == nullptr || t->buffer == nullptr || !ggml_backend_buffer_is_meta(t->buffer)) {
             return nullptr;
         }
     }
-    ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) tensor->buffer->context;
+    ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) t->buffer->context;
     if (index >= buf_ctx->bufs.size()) {
         return nullptr;
     }
 
-    ggml_backend_meta_simple_tensor_container & stc = buf_ctx->get_simple_tensor_container(tensor);
-    auto it = stc.simple_tensors.find(tensor);
-    if (it == stc.simple_tensors.end()) {
+    // 1. Check static simple tensors for orig_tensor
+    auto it_static = buf_ctx->stc_static.simple_tensors.find(orig_tensor);
+    if (it_static != buf_ctx->stc_static.simple_tensors.end()) {
+        if (index < it_static->second.size()) {
+            return it_static->second[index];
+        }
         return nullptr;
     }
-    return it->second[index];
+
+    // 2. Check active stc_compute for orig_tensor
+    ggml_backend_meta_simple_tensor_container & stc = buf_ctx->get_simple_tensor_container(orig_tensor);
+    auto it = stc.simple_tensors.find(orig_tensor);
+    if (it != stc.simple_tensors.end()) {
+        if (index < it->second.size()) {
+            return it->second[index];
+        }
+        return nullptr;
+    }
+
+    // 3. On-demand initialization if orig_tensor has a meta buffer
+    if (orig_tensor->buffer != nullptr && ggml_backend_buffer_is_meta(orig_tensor->buffer)) {
+        ggml_backend_meta_buffer_context * orig_buf_ctx =
+            (ggml_backend_meta_buffer_context *) orig_tensor->buffer->context;
+        ggml_backend_meta_simple_tensor_container & orig_stc =
+            orig_buf_ctx->get_simple_tensor_container(orig_tensor);
+        if (orig_stc.simple_tensors.find(orig_tensor) == orig_stc.simple_tensors.end()) {
+            ggml_backend_meta_buffer_init_tensor_impl(orig_stc, const_cast<struct ggml_tensor *>(orig_tensor));
+        }
+        auto it_init = orig_stc.simple_tensors.find(orig_tensor);
+        if (it_init != orig_stc.simple_tensors.end() && index < it_init->second.size()) {
+            return it_init->second[index];
+        }
+    }
+
+    // 4. Fallback: check ancestor tensor
+    if (t != orig_tensor) {
+        auto it_p_static = buf_ctx->stc_static.simple_tensors.find(t);
+        if (it_p_static != buf_ctx->stc_static.simple_tensors.end()) {
+            if (index < it_p_static->second.size()) {
+                return it_p_static->second[index];
+            }
+        }
+        auto it_p = stc.simple_tensors.find(t);
+        if (it_p != stc.simple_tensors.end()) {
+            if (index < it_p->second.size()) {
+                return it_p->second[index];
+            }
+        }
+    }
+
+    return nullptr;
 }
 
 static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(const struct ggml_tensor * tensor, bool assume_sync);
@@ -2018,8 +2085,9 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
                     }
                 }
             }
-            if (src->buffer != nullptr && ggml_backend_buffer_is_meta(src->buffer)) {
-                t_ij->src[i] = ggml_backend_meta_buffer_simple_tensor(src, j);
+            ggml_tensor * s_shard = ggml_backend_meta_buffer_simple_tensor(src, j);
+            if (s_shard != nullptr) {
+                t_ij->src[i] = s_shard;
             }
         }
 
@@ -3459,14 +3527,14 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             }
         }
         for (ggml_backend_buffer_t buf : used_buffers) {
-            ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) buf->context;
-            buf_ctx->stc_compute_index_next = buf_ctx->stc_compute_index ^ 1;
             // T=4 prompt shares KV/view buffers with T=1. Resetting the other
             // stc slot frees the simple tensors cloned into a SEQ plan and the
             // restored decode graph writes garbage (empty content).
             if (seq_pin) {
                 continue;
             }
+            ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) buf->context;
+            buf_ctx->stc_compute_index_next = buf_ctx->stc_compute_index ^ 1;
             ggml_backend_meta_simple_tensor_container & stc = buf_ctx->stc_compute[buf_ctx->stc_compute_index_next];
             for (ggml_context_ptr & ctx : stc.ctxs) {
                 ggml_reset(ctx.get());
@@ -3512,6 +3580,14 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                                 j, ggml_op_name(node->op), node->name, shard->data);
                     }
                     shard = nullptr;
+                }
+                if (shard == nullptr) {
+                    static int ndrop;
+                    if (ndrop < 25) {
+                        ndrop++;
+                        fprintf(stderr, "[META_DROP] j=%zu i=%d name=%s op=%s buf=%p vsrc=%p\n",
+                                j, i, node->name, ggml_op_name(node->op), (void*)node->buffer, (void*)node->view_src);
+                    }
                 }
                 bcj.nodes[i] = shard;
             }
