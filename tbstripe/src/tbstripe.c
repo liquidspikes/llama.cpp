@@ -19,6 +19,8 @@
 extern ssize_t tbs_writev_spin(int fd, struct iovec *iov, int iovcnt, int busy_spin);
 extern ssize_t tbs_readv_spin(int fd, struct iovec *iov, int iovcnt, int busy_spin);
 
+#define TBS_SIMPLEX_MAX_BATCH 64
+
 struct tbs_pipe {
     int fd_a;
     int fd_b;
@@ -35,6 +37,13 @@ struct tbs_pipe {
     int is_master;
     int fd_tx;
     int fd_rx;
+
+    pthread_t simplex_tx_th;
+    volatile int simplex_tx_cmd; // 0=idle, 1=send, 2=exit
+    volatile int simplex_tx_running;
+    const void *simplex_tx_buf;
+    size_t simplex_tx_sz;
+    int simplex_tx_err;
 
     pthread_t tx_worker_b;
     pthread_mutex_t tx_mu;
@@ -185,6 +194,55 @@ static inline void tbs_pause(void) {
 #endif
 }
 
+static void *tbs_simplex_tx_worker(void *arg) {
+    tbs_pipe *pipe = (tbs_pipe *)arg;
+
+    int aff = pipe->is_master ? pipe->cpu_affinity_a : pipe->cpu_affinity_b;
+    if (aff >= 0) {
+        cpu_set_t cpuset;
+        CPU_ZERO(&cpuset);
+        CPU_SET(aff, &cpuset);
+        pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
+    }
+
+    while (pipe->simplex_tx_running) {
+        uint64_t spin_cnt = 0;
+        while (pipe->simplex_tx_cmd == 0 && pipe->simplex_tx_running) {
+            tbs_pause();
+            spin_cnt++;
+            if (spin_cnt > 20000000ULL) {
+                usleep(50);
+            }
+        }
+        if (!pipe->simplex_tx_running || pipe->simplex_tx_cmd == 2) {
+            break;
+        }
+
+        const uint8_t *ptr = (const uint8_t *)pipe->simplex_tx_buf;
+        size_t rem = pipe->simplex_tx_sz;
+        int err = 0;
+        while (rem > 0) {
+            ssize_t nw = write(pipe->fd_tx, ptr, rem);
+            if (nw > 0) {
+                rem -= (size_t)nw;
+                ptr += nw;
+            } else if (nw < 0) {
+                if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
+                    tbs_pause();
+                    continue;
+                }
+                err = errno;
+                break;
+            } else {
+                tbs_pause();
+            }
+        }
+        pipe->simplex_tx_err = err;
+        pipe->simplex_tx_cmd = 0;
+    }
+    return NULL;
+}
+
 /* IMP-10: TBSTRIPE_SIMPLEX=master|worker|1. Unset/0/duplex keeps striped duplex. */
 static int tbs_env_simplex(int *is_master) {
     const char *sx = getenv("TBSTRIPE_SIMPLEX");
@@ -248,6 +306,11 @@ static void tbs_pipe_fail_open(tbs_pipe *pipe) {
     if (!pipe) {
         return;
     }
+    if (pipe->simplex && pipe->simplex_tx_running) {
+        pipe->simplex_tx_running = 0;
+        pipe->simplex_tx_cmd = 2;
+        pthread_join(pipe->simplex_tx_th, NULL);
+    }
     if (pipe->fd_a >= 0) {
         close(pipe->fd_a);
     }
@@ -303,7 +366,7 @@ tbs_pipe *tbs_open(const tbs_config *cfg) {
                 return NULL;
             }
             {
-                const size_t batch_bytes = (size_t)TBS_FRAME_BATCH * TBS_FRAME_SIZE;
+                const size_t batch_bytes = (size_t)TBS_SIMPLEX_MAX_BATCH * TBS_FRAME_SIZE;
                 if (posix_memalign((void **)&pipe->tx_a, TBS_ALIGNMENT, batch_bytes) != 0 ||
                     posix_memalign((void **)&pipe->rx_a, TBS_ALIGNMENT, batch_bytes) != 0) {
                     tbs_pipe_fail_open(pipe);
@@ -312,7 +375,15 @@ tbs_pipe *tbs_open(const tbs_config *cfg) {
             }
             pthread_mutex_init(&pipe->send_mu, NULL);
             pthread_mutex_init(&pipe->recv_mu, NULL);
-            fprintf(stderr, "[TBSTRIPE] simplex %s TX=%s RX=%s (no helper threads)\n",
+
+            pipe->simplex_tx_running = 1;
+            pipe->simplex_tx_cmd = 0;
+            if (pthread_create(&pipe->simplex_tx_th, NULL, tbs_simplex_tx_worker, pipe) != 0) {
+                tbs_pipe_fail_open(pipe);
+                return NULL;
+            }
+
+            fprintf(stderr, "[TBSTRIPE] simplex %s TX=%s RX=%s (persistent duplex worker active)\n",
                     is_master ? "master" : "worker",
                     is_master ? cfg->dev_a : cfg->dev_b,
                     is_master ? cfg->dev_b : cfg->dev_a);
@@ -402,6 +473,14 @@ tbs_pipe *tbs_open(const tbs_config *cfg) {
 void tbs_close(tbs_pipe *pipe) {
     if (!pipe) return;
 
+    if (pipe->simplex) {
+        if (pipe->simplex_tx_running) {
+            pipe->simplex_tx_running = 0;
+            pipe->simplex_tx_cmd = 2;
+            pthread_join(pipe->simplex_tx_th, NULL);
+        }
+    }
+
     if (pipe->xchg_running) {
         pthread_mutex_lock(&pipe->xchg_mu);
         pipe->xchg_running = 0;
@@ -461,6 +540,10 @@ void tbs_close(tbs_pipe *pipe) {
 
 int tbs_is_striped(const tbs_pipe *pipe) {
     return pipe ? pipe->is_striped : 0;
+}
+
+int tbs_is_simplex(const tbs_pipe *pipe) {
+    return pipe ? pipe->simplex : 0;
 }
 
 size_t tbs_get_stripe_size(const tbs_pipe *pipe) {
@@ -612,25 +695,35 @@ static int tbs_send_simplex(tbs_pipe *pipe, const void *buf, size_t n) {
     if (n > 0 && buf == NULL) {
         return -1;
     }
+    if (n == 0) {
+        return 0;
+    }
 
     pthread_mutex_lock(&pipe->send_mu);
 
-    const uint8_t *src = (const uint8_t *)buf;
-    uint64_t seq = ++pipe->tx_seq;
-    uint32_t total_chunks = tbs_total_chunks(n);
-    int ret = 0;
-    uint32_t idx = 0;
+    const uint8_t *ptr = (const uint8_t *)buf;
+    size_t rem = n;
+    int err = 0;
 
-    while (idx < total_chunks && ret == 0) {
-        tbs_pack_frame(pipe->tx_a, seq, n, idx, src);
-        if (tbs_write_frame(pipe->fd_tx, pipe->tx_a, pipe->busy_spin) != 0) {
-            ret = -1;
+    while (rem > 0) {
+        ssize_t nw = write(pipe->fd_tx, ptr, rem);
+        if (nw > 0) {
+            rem -= (size_t)nw;
+            ptr += nw;
+        } else if (nw < 0) {
+            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
+                tbs_pause();
+                continue;
+            }
+            err = errno;
+            break;
+        } else {
+            tbs_pause();
         }
-        idx++;
     }
 
     pthread_mutex_unlock(&pipe->send_mu);
-    return ret;
+    return err ? -1 : 0;
 }
 
 static int tbs_recv_simplex(tbs_pipe *pipe, void *buf, size_t n, int timeout_ms) {
@@ -640,66 +733,51 @@ static int tbs_recv_simplex(tbs_pipe *pipe, void *buf, size_t n, int timeout_ms)
     if (n > 0 && buf == NULL) {
         return -1;
     }
+    if (n == 0) {
+        return 0;
+    }
 
     pthread_mutex_lock(&pipe->recv_mu);
 
-    uint8_t *dst = (uint8_t *)buf;
-    uint32_t total_chunks = tbs_total_chunks(n);
-    uint64_t seq = pipe->rx_seq + 1;
-    int ret = 0;
-    uint32_t idx = 0;
+    uint8_t *ptr = (uint8_t *)buf;
+    size_t rem = n;
+    int err = 0;
 
-    while (idx < total_chunks && ret == 0) {
-        int rf = tbs_read_frame(pipe->fd_rx, pipe->rx_a, pipe->busy_spin, timeout_ms);
-        if (rf != 0) {
-            ret = rf;
-            break;
-        }
-        if (tbs_unpack_frame(pipe->rx_a, seq, n, idx, dst) != 0) {
-            ret = -1;
-        }
-        idx++;
+    struct timespec t0;
+    if (timeout_ms >= 0) {
+        clock_gettime(CLOCK_MONOTONIC, &t0);
     }
 
-    if (ret == 0) {
-        pipe->rx_seq = seq;
+    while (rem > 0) {
+        ssize_t nr = read(pipe->fd_rx, ptr, rem);
+        if (nr > 0) {
+            rem -= (size_t)nr;
+            ptr += nr;
+        } else if (nr < 0) {
+            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
+                if (timeout_ms >= 0) {
+                    struct timespec t1;
+                    clock_gettime(CLOCK_MONOTONIC, &t1);
+                    long ms = (t1.tv_sec - t0.tv_sec) * 1000L +
+                              (t1.tv_nsec - t0.tv_nsec) / 1000000L;
+                    if (ms >= timeout_ms) {
+                        err = ETIMEDOUT;
+                        break;
+                    }
+                }
+                tbs_pause();
+                continue;
+            }
+            err = errno;
+            break;
+        } else {
+            err = ENOTCONN;
+            break;
+        }
     }
 
     pthread_mutex_unlock(&pipe->recv_mu);
-    return ret;
-}
-
-/*
- * Sequential simplex xchg. Same-process concurrent TX+RX deadlocks on
- * USB4STREAM (driver cannot write one stream while another thread reads
- * the pair). WINDOW=total of a large payload also deadlocks (fills the
- * RX ring before any RX).
- *
- * FFN AllReduce is ~10 KiB = 3 frames. Burst-TX then RX when the whole
- * message fits in 8 frames (32 KiB) is one cable RTT and fits in the
- * 2048-frame ring. Larger xchg stays 1:1. TBS_XCHG_WINDOW=1 forces 1:1.
- */
-#define TBS_XCHG_SMALL_FRAMES 8
-
-static uint32_t tbs_xchg_window_env(uint32_t total) {
-    const char *we = getenv("TBS_XCHG_WINDOW");
-    if (we != NULL && we[0] != '\0') {
-        int w = atoi(we);
-        if (w == 1) {
-            return 1;
-        }
-        if (w > 0) {
-            uint32_t window = (uint32_t) w;
-            if (window > TBS_XCHG_SMALL_FRAMES) {
-                window = TBS_XCHG_SMALL_FRAMES;
-            }
-            return window;
-        }
-    }
-    if (total <= TBS_XCHG_SMALL_FRAMES) {
-        return total;
-    }
-    return 1;
+    return err ? -1 : 0;
 }
 
 static int tbs_xchg_simplex(tbs_pipe *pipe, const void *out, void *in, size_t n) {
@@ -716,57 +794,46 @@ static int tbs_xchg_simplex(tbs_pipe *pipe, const void *out, void *in, size_t n)
     pthread_mutex_lock(&pipe->send_mu);
     pthread_mutex_lock(&pipe->recv_mu);
 
-    const uint8_t *src = (const uint8_t *)out;
-    uint8_t *dst = (uint8_t *)in;
-    uint32_t total = tbs_total_chunks(n);
-    uint64_t tx_seq = ++pipe->tx_seq;
-    uint64_t rx_seq = pipe->rx_seq + 1;
-    uint32_t window = tbs_xchg_window_env(total);
-    uint32_t tx_idx = 0;
-    uint32_t rx_idx = 0;
-    int ret = 0;
+    pipe->simplex_tx_buf = out;
+    pipe->simplex_tx_sz  = n;
+    pipe->simplex_tx_err = 0;
+    pipe->simplex_tx_cmd = 1; // start TX worker
 
-    if (window < 1) {
-        window = 1;
-    }
-    while ((tx_idx < total || rx_idx < total) && ret == 0) {
-        while (tx_idx < total && (tx_idx - rx_idx) < window && ret == 0) {
-            tbs_pack_frame(pipe->tx_a, tx_seq, n, tx_idx, src);
-            if (tbs_write_frame(pipe->fd_tx, pipe->tx_a, pipe->busy_spin) != 0) {
-                ret = -1;
-                break;
+    uint8_t *ptr = (uint8_t *)in;
+    size_t rem = n;
+    int rx_err = 0;
+    while (rem > 0) {
+        ssize_t nr = read(pipe->fd_rx, ptr, rem);
+        if (nr > 0) {
+            rem -= (size_t)nr;
+            ptr += nr;
+        } else if (nr < 0) {
+            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
+                tbs_pause();
+                continue;
             }
-            tx_idx++;
-        }
-        if (ret != 0) {
+            rx_err = errno;
+            break;
+        } else {
+            rx_err = ENOTCONN;
             break;
         }
-        if (rx_idx < total) {
-            if (tbs_read_frame(pipe->fd_rx, pipe->rx_a, pipe->busy_spin, -1) != 0) {
-                ret = -1;
-                break;
-            }
-            if (tbs_unpack_frame(pipe->rx_a, rx_seq, n, rx_idx, dst) != 0) {
-                ret = -1;
-                break;
-            }
-            rx_idx++;
-        }
     }
 
-    if (ret == 0) {
-        pipe->rx_seq = rx_seq;
-        static int nlog;
-        if (nlog < 2) {
-            nlog++;
-            fprintf(stderr, "[TBSTRIPE] xchg window=%u chunks=%u bytes=%zu\n",
-                    window, total, n);
-        }
+    // Spin-wait for persistent TX worker completion
+    while (pipe->simplex_tx_cmd != 0) {
+        tbs_pause();
     }
 
     pthread_mutex_unlock(&pipe->recv_mu);
     pthread_mutex_unlock(&pipe->send_mu);
-    return ret;
+
+    if (rx_err != 0 || pipe->simplex_tx_err != 0) {
+        fprintf(stderr, "[TBSTRIPE] simplex direct xchg error: tx_err=%d rx_err=%d sz=%zu\n",
+                pipe->simplex_tx_err, rx_err, n);
+        return -1;
+    }
+    return 0;
 }
 
 int tbs_send(tbs_pipe *pipe, const void *buf, size_t n) {
@@ -985,7 +1052,20 @@ int tbs_recv_malloc(tbs_pipe *pipe, void **buf, size_t *n) {
     *buf = NULL;
     *n = 0;
 
-    int fd = pipe->simplex ? pipe->fd_rx : pipe->fd_a;
+    if (pipe->simplex) {
+        uint8_t byte = 0;
+        if (tbs_recv_simplex(pipe, &byte, 1, -1) != 0) {
+            return -1;
+        }
+        uint8_t *mem = (uint8_t *)malloc(1);
+        if (!mem) return -1;
+        mem[0] = byte;
+        *buf = mem;
+        *n = 1;
+        return 0;
+    }
+
+    int fd = pipe->fd_a;
     if (fd < 0) {
         return -1;
     }
@@ -1034,14 +1114,25 @@ find_start:
 
     chunks = tbs_total_chunks(total);
     ret = 0;
-    for (idx = 1; idx < chunks && ret == 0; idx++) {
-        if (tbs_read_frame(fd, pipe->rx_a, pipe->busy_spin, -1) != 0) {
+    idx = 1;
+    while (idx < chunks && ret == 0) {
+        uint32_t to_recv = chunks - idx;
+        if (to_recv > TBS_SIMPLEX_MAX_BATCH) {
+            to_recv = TBS_SIMPLEX_MAX_BATCH;
+        }
+        struct iovec iov = { pipe->rx_a, (size_t)to_recv * TBS_FRAME_SIZE };
+        ssize_t nr = tbs_readv_spin(fd, &iov, 1, pipe->busy_spin);
+        if (nr != (ssize_t)(to_recv * TBS_FRAME_SIZE)) {
             ret = -1;
             break;
         }
-        if (tbs_unpack_frame(pipe->rx_a, seq, total, idx, dst) != 0) {
-            ret = -1;
+        for (uint32_t i = 0; i < to_recv; i++) {
+            if (tbs_unpack_frame(pipe->rx_a + (size_t)i * TBS_FRAME_SIZE, seq, total, idx + i, dst) != 0) {
+                ret = -1;
+                break;
+            }
         }
+        idx += to_recv;
     }
 
     if (ret != 0) {

@@ -139,7 +139,10 @@ llama_memory_recurrent::llama_memory_recurrent(
 }
 
 void llama_memory_recurrent::clear(bool data) {
-    fprintf(stderr, "[RECR_DBG] clear(data=%d) size=%u\n", data, size);
+    static const bool recr_dbg = getenv("LLAMA_RECR_DEBUG") != nullptr;
+    if (recr_dbg) {
+        fprintf(stderr, "[RECR_DBG] clear(data=%d) size=%u\n", data, size);
+    }
     for (int32_t i = 0; i < (int32_t) size; ++i) {
         cells[i].pos = -1;
         cells[i].seq_id.clear();
@@ -178,8 +181,11 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
     }
 
     const bool rm_all = p0 == 0 && p1 == std::numeric_limits<llama_pos>::max();
-    fprintf(stderr, "[RECR_DBG] seq_rm(seq_id=%d, p0=%lld, p1=%lld) rm_all=%d n_seq_max=%u\n",
-            seq_id, (long long)p0, (long long)p1, rm_all, n_seq_max);
+    static const bool recr_dbg = getenv("LLAMA_RECR_DEBUG") != nullptr;
+    if (recr_dbg) {
+        fprintf(stderr, "[RECR_DBG] seq_rm(seq_id=%d, p0=%lld, p1=%lld) rm_all=%d n_seq_max=%u\n",
+                seq_id, (long long)p0, (long long)p1, rm_all, n_seq_max);
+    }
     if (rm_all) {
         if (seq_id < 0 || n_seq_max <= 1) {
             clear(true);
@@ -767,8 +773,11 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
             }
             cells[i].src = i; // avoid moving or clearing twice
         }
-        fprintf(stderr, "[RECR_DBG] find_slot: n_seqs=%u pos0=%d min=%d max=%d rs_z=%d src0=%d\n",
-                n_seqs, ubatch.pos[0], min, max, rs_z, cells[min].src0);
+        static const bool recr_dbg = getenv("LLAMA_RECR_DEBUG") != nullptr;
+        if (recr_dbg) {
+            fprintf(stderr, "[RECR_DBG] find_slot: n_seqs=%u pos0=%d min=%d max=%d rs_z=%d src0=%d\n",
+                    n_seqs, ubatch.pos[0], min, max, rs_z, cells[min].src0);
+        }
     }
 
     // allow getting the range of used cells, from head to head + n

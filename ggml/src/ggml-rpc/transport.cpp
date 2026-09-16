@@ -496,6 +496,22 @@ std::shared_ptr<rpc_transport> tcp_rpc_transport::accept() {
 #include <fcntl.h>
 #include <poll.h>
 
+static inline void rpc_spin_pause(int & retries) {
+    if (++retries < 20000) {
+#if defined(__x86_64__) || defined(_M_X64)
+        _mm_pause();
+#elif defined(__aarch64__)
+        asm volatile("yield" ::: "memory");
+#else
+        std::this_thread::yield();
+#endif
+    } else if (retries < 40000) {
+        std::this_thread::yield();
+    } else {
+        std::this_thread::sleep_for(std::chrono::microseconds(5));
+    }
+}
+
 static bool stream_write_exact(int fd, const void * buf, size_t size) {
     const uint8_t * p = static_cast<const uint8_t *>(buf);
     size_t total = 0;
@@ -516,11 +532,7 @@ static bool stream_write_exact(int fd, const void * buf, size_t size) {
             continue;
         }
         if (n == 0 || (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == ENOBUFS || errno == ENOMEM))) {
-            if (++retries < 100) {
-                std::this_thread::yield();
-            } else {
-                std::this_thread::sleep_for(std::chrono::microseconds(5));
-            }
+            rpc_spin_pause(retries);
             continue;
         }
         GGML_LOG_ERROR("stream_write_exact failed: fd=%d, n=%zd, total=%zu, size=%zu, errno=%d (%s)\n",
@@ -533,18 +545,20 @@ static bool stream_write_exact(int fd, const void * buf, size_t size) {
 static bool stream_read_exact(int fd, void * buf, size_t size) {
     uint8_t * p = static_cast<uint8_t *>(buf);
     size_t total = 0;
+    int retries = 0;
     while (total < size) {
         errno = 0;
         ssize_t n = ::read(fd, p + total, size - total);
         if (n > 0) {
             total += (size_t)n;
+            retries = 0;
             continue;
         }
         if (n < 0 && errno == EINTR) {
             continue;
         }
-        if (n == 0) {
-            std::this_thread::yield();
+        if (n == 0 || (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))) {
+            rpc_spin_pause(retries);
             continue;
         }
         GGML_LOG_ERROR("stream_read_exact failed: fd=%d, n=%zd, total=%zu, size=%zu, errno=%d (%s)\n",
@@ -692,6 +706,7 @@ private:
     static bool buffered_stream_read_exact(int fd, rx_stream_buffer & sbuf, void * dst, size_t size) {
         uint8_t * out = static_cast<uint8_t *>(dst);
         size_t needed = size;
+        int retries = 0;
         if (tb_debug_enabled()) {
             fprintf(stderr, "[RX START fd=%d needed=%zu msg_avail=%zu raw_avail=%zu]\n",
                     fd, needed, sbuf.msg_buf.size() - sbuf.msg_offset, sbuf.raw_tail - sbuf.raw_head);
@@ -758,6 +773,7 @@ private:
             errno = 0;
             ssize_t n = ::read(fd, io_page_buf, sizeof(io_page_buf));
             if (n > 0) {
+                retries = 0;
                 if (tb_debug_enabled()) {
                     fprintf(stderr, "  [RX READ fd=%d n=%zd raw_tail_was=%zu needed=%zu]\n",
                             fd, n, sbuf.raw_tail, needed);
@@ -773,7 +789,7 @@ private:
                 continue;
             }
             if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-                std::this_thread::yield();
+                rpc_spin_pause(retries);
                 continue;
             }
             if (n == 0) {
@@ -882,6 +898,9 @@ public:
 #ifdef GGML_TBSTRIPE
         if (tbs_pipe_handle) {
             if (size == 0 || data == nullptr) return true;
+            if (tbs_is_simplex(tbs_pipe_handle)) {
+                return tbs_recv(tbs_pipe_handle, data, size) == 0;
+            }
             if (!tbs_pending.empty()) {
                 if (tbs_pending_off + size > tbs_pending.size()) {
                     GGML_LOG_ERROR("tbstripe pending underrun want=%zu have=%zu off=%zu\n",
@@ -907,6 +926,9 @@ public:
 #ifdef GGML_TBSTRIPE
         if (tbs_pipe_handle) {
             if (size == 0 || data == nullptr) return true;
+            if (tbs_is_simplex(tbs_pipe_handle)) {
+                return tbs_recv_timeout(tbs_pipe_handle, data, size, timeout_ms) == 0;
+            }
             if (!tbs_pending.empty()) {
                 return recv_exact(data, size);
             }
@@ -1059,6 +1081,9 @@ public:
         if (out_channel) *out_channel = RPC_CHANNEL_CONTROL;
 #ifdef GGML_TBSTRIPE
         if (tbs_pipe_handle) {
+            if (tbs_is_simplex(tbs_pipe_handle)) {
+                return tbs_recv(tbs_pipe_handle, cmd, 1) == 0;
+            }
             void * raw = nullptr;
             size_t n = 0;
             if (tbs_recv_malloc(tbs_pipe_handle, &raw, &n) != 0 || raw == nullptr || n < 1) {

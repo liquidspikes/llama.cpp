@@ -1003,7 +1003,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
     if (qsa) {
         bool skip_unused_indexer = (n_tokens <= 8);
 #if defined(GGML_USE_HIP)
-        static const bool decode_indexer = std::getenv("LLAMA_QSA_DECODE_INDEXER") != nullptr;
+        static const bool decode_indexer = [] {
+            const char * env = std::getenv("LLAMA_QSA_DECODE_INDEXER");
+            return env != nullptr && atoi(env) != 0;
+        }();
         if (decode_indexer) {
             skip_unused_indexer = false;
         }

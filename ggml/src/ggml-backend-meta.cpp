@@ -3482,9 +3482,8 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         backend_ctx->seq_cached_n_tokens = n_tokens;
         backend_ctx->seq_cached_ne2 = ne2;
         backend_ctx->seq_cached_n0 = n0;
-        for (int si = 0; si < GGML_META_SEQ_FP_SLOTS; si++) {
-            backend_ctx->seq_fp_slots[si].valid = false;
-        }
+        const int si_curr = ggml_meta_seq_slot_pick(n_tokens);
+        backend_ctx->seq_fp_slots[si_curr].valid = false;
     }
     if (!needs_rebuild) {
         static int nreuse;
@@ -3505,6 +3504,9 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         backend_ctx->max_nnodes = cgraph->n_nodes;
         max_nnodes_raised = true;
         assert(needs_rebuild);
+        for (int si = 0; si < GGML_META_SEQ_FP_SLOTS; si++) {
+            backend_ctx->seq_fp_slots[si].valid = false;
+        }
     }
 
     if (needs_rebuild) {

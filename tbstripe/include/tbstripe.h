@@ -94,6 +94,7 @@ int tbs_xchg(tbs_pipe *pipe, const void *out, void *in, size_t n);
 
 /* Query and status */
 int tbs_is_striped(const tbs_pipe *pipe);
+int tbs_is_simplex(const tbs_pipe *pipe);
 size_t tbs_get_stripe_size(const tbs_pipe *pipe);
 int tbs_get_fd_a(const tbs_pipe *pipe);
 int tbs_get_fd_b(const tbs_pipe *pipe);

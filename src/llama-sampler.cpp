@@ -2989,30 +2989,45 @@ static void llama_sampler_penalties_accept(struct llama_sampler * smpl, llama_to
 static void llama_sampler_penalties_apply(struct llama_sampler * smpl, llama_token_data_array * cur_p) {
     auto * ctx = (llama_sampler_penalties *) smpl->ctx;
 
-    if (ctx->is_disabled()) {
+    if (ctx->is_disabled() || ctx->token_count.empty() || cur_p->size == 0) {
         return;
     }
 
     // Apply frequency and presence penalties to the cur_p
-    for (size_t i = 0; i < cur_p->size; ++i) {
-        const auto token_iter = ctx->token_count.find(cur_p->data[i].id);
-        if (token_iter == ctx->token_count.end()) {
+    for (const auto & token_iter : ctx->token_count) {
+        const llama_token token = token_iter.first;
+        if (token < 0 || (size_t) token >= cur_p->size) {
             continue;
         }
 
-        const int count = token_iter->second;
+        llama_token_data * td = nullptr;
+        if (!cur_p->sorted && cur_p->data[token].id == token) {
+            td = &cur_p->data[token];
+        } else {
+            for (size_t i = 0; i < cur_p->size; ++i) {
+                if (cur_p->data[i].id == token) {
+                    td = &cur_p->data[i];
+                    break;
+                }
+            }
+        }
+        if (!td) {
+            continue;
+        }
+
+        const int count = token_iter.second;
 
         assert(count > 0 && count <= ctx->penalty_last_n);
 
         // The academic publication that described this technique actually just only divided, but that would cause tokens with negative logits to become more likely, which is obviously wrong.
         // This is common fix for this problem, which is to multiply by the penalty instead of dividing.
-        if (cur_p->data[i].logit <= 0) {
-            cur_p->data[i].logit *= ctx->penalty_repeat;
+        if (td->logit <= 0) {
+            td->logit *= ctx->penalty_repeat;
         } else {
-            cur_p->data[i].logit /= ctx->penalty_repeat;
+            td->logit /= ctx->penalty_repeat;
         }
 
-        cur_p->data[i].logit -= float(count) * ctx->penalty_freq + float(count > 0) * ctx->penalty_present;
+        td->logit -= float(count) * ctx->penalty_freq + float(count > 0) * ctx->penalty_present;
     }
 
     cur_p->sorted = false;
@@ -3600,29 +3615,50 @@ static void llama_sampler_dry_apply(struct llama_sampler * smpl, llama_token_dat
         max_exponent = FLOAT_MAX_LOG / std::log(ctx->dry_base);
     }
 
-    for (size_t i = 0; i < cur_p->size; ++i) {
-        const auto& af_kvp = ctx->dry_max_token_repeat.find(cur_p->data[i].id);
-        if (af_kvp != ctx->dry_max_token_repeat.end()) {
-            // Check all sequence breakers starting with this token
-            auto range = ctx->dry_processed_breakers.equal_range(cur_p->data[i].id);
-            bool is_single_token_breaker = false;
+    if (ctx->dry_max_token_repeat.empty() || cur_p->size == 0) {
+        return;
+    }
 
-            for (auto it = range.first; it != range.second; ++it) {
-                if (it->second.empty()) {
-                    is_single_token_breaker = true;
+    for (const auto & af_kvp : ctx->dry_max_token_repeat) {
+        const llama_token token = af_kvp.first;
+        if (token < 0 || (size_t) token >= cur_p->size) {
+            continue;
+        }
+
+        llama_token_data * td = nullptr;
+        if (!cur_p->sorted && cur_p->data[token].id == token) {
+            td = &cur_p->data[token];
+        } else {
+            for (size_t i = 0; i < cur_p->size; ++i) {
+                if (cur_p->data[i].id == token) {
+                    td = &cur_p->data[i];
                     break;
                 }
             }
+        }
+        if (!td) {
+            continue;
+        }
 
-            // Apply penalty only if it's not a single-token sequence breaker
-            if (!is_single_token_breaker) {
-                int repeat_exp = af_kvp->second - ctx->dry_allowed_length;
-                if (max_exponent > 0 && repeat_exp > max_exponent) {
-                    repeat_exp = max_exponent;
-                }
-                float penalty = ctx->dry_multiplier * std::pow(ctx->dry_base, repeat_exp);
-                cur_p->data[i].logit -= penalty;
+        // Check all sequence breakers starting with this token
+        auto range = ctx->dry_processed_breakers.equal_range(token);
+        bool is_single_token_breaker = false;
+
+        for (auto it = range.first; it != range.second; ++it) {
+            if (it->second.empty()) {
+                is_single_token_breaker = true;
+                break;
             }
+        }
+
+        // Apply penalty only if it's not a single-token sequence breaker
+        if (!is_single_token_breaker) {
+            int repeat_exp = af_kvp.second - ctx->dry_allowed_length;
+            if (max_exponent > 0 && repeat_exp > max_exponent) {
+                repeat_exp = max_exponent;
+            }
+            float penalty = ctx->dry_multiplier * std::pow(ctx->dry_base, repeat_exp);
+            td->logit -= penalty;
         }
     }
 

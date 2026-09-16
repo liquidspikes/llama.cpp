@@ -4618,7 +4618,8 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
             n_hip_graph_direct++;
         }
         n_hip_graph_calls++;
-        if (n_hip_graph_calls <= 8 || n_hip_graph_calls % 49 == 0) {
+        static const bool hip_graph_debug = getenv("GGML_HIP_GRAPH_DEBUG") != nullptr;
+        if (hip_graph_debug && (n_hip_graph_calls <= 8 || n_hip_graph_calls % 49 == 0)) {
 #ifdef USE_CUDA_GRAPH
             ggml_cuda_graph * glog = cuda_ctx->cuda_graph(graph_key);
             fprintf(stderr, "[HIP_GRAPH] n=%d use=%d direct=%d this_use=%d update=%d warmup=%d n_nodes=%d uid=%llu\n",

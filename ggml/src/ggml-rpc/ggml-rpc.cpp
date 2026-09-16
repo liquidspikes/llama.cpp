@@ -220,7 +220,22 @@ static size_t rpc_set_tensor_chunk() {
                 return v;
             }
         }
-        return (size_t) 2048;
+        return (size_t) 1048576;
+    }();
+    return chunk;
+}
+
+// Prefill cgraph serialization chunk size (default 16 MiB for single-shot graph transfer).
+static size_t rpc_graph_compute_chunk() {
+    static size_t chunk = []() {
+        const char * e = std::getenv("GGML_RPC_GRAPH_COMPUTE_CHUNK");
+        if (e && *e) {
+            size_t v = (size_t) std::strtoull(e, nullptr, 10);
+            if (v >= 2048) {
+                return v;
+            }
+        }
+        return (size_t) 16777216;
     }();
     return chunk;
 }
@@ -1053,7 +1068,8 @@ static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggm
     int64_t t0 = rpc_perf_enabled() ? ggml_time_us() : 0;
     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
     rpc_tensor rpc_tensor = serialize_tensor(tensor);
-    if (size > rpc_hash_threshold()) {
+    const bool is_weight = (buffer != nullptr && ggml_backend_buffer_get_usage(buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    if (is_weight && size > rpc_hash_threshold()) {
         auto request = std::make_shared<rpc_msg_set_tensor_hash_req>();
         request->tensor = rpc_tensor;
         request->offset = offset;
@@ -1069,7 +1085,9 @@ static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggm
             return;
         }
     }
-    rpc_maybe_dump_cache(data, size);
+    if (is_weight) {
+        rpc_maybe_dump_cache(data, size);
+    }
     const uint8_t * in_ptr = static_cast<const uint8_t *>(data);
     size_t transferred = 0;
     while (transferred < size) {
@@ -1418,7 +1436,8 @@ static void ggml_backend_rpc_set_tensor_async(ggml_backend_t backend, ggml_tenso
         return;
     }
     rpc_flush_pending_sets_standalone(ctx);
-    if (size > rpc_hash_threshold()) {
+    const bool is_weight = (tensor->buffer != nullptr && ggml_backend_buffer_get_usage(tensor->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    if (is_weight && size > rpc_hash_threshold()) {
         auto request = std::make_shared<rpc_msg_set_tensor_hash_req>();
         request->tensor = rpc_tensor;
         request->offset = offset;
@@ -1431,7 +1450,9 @@ static void ggml_backend_rpc_set_tensor_async(ggml_backend_t backend, ggml_tenso
             return;
         }
     }
-    rpc_maybe_dump_cache(data, size);
+    if (is_weight) {
+        rpc_maybe_dump_cache(data, size);
+    }
     const uint8_t * in_ptr = static_cast<const uint8_t *>(data);
     size_t transferred = 0;
     while (transferred < size) {
@@ -1587,7 +1608,7 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
         }
         size_t input_size = 0;
         uint8_t * input = serialize_graph(rpc_ctx->device, cgraph, rpc_ctx->dispatcher, &input_size);
-        const size_t chunk = rpc_set_tensor_chunk();
+        const size_t chunk = rpc_graph_compute_chunk();
         size_t transferred = 0;
         size_t nchunk = 0;
         while (transferred < input_size) {
@@ -1602,9 +1623,9 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
             memcpy(msg + 2 * sizeof(uint64_t), input + transferred, n);
             std::shared_ptr<uint8_t> msg_ptr(msg, std::default_delete<uint8_t[]>());
             ack = 0;
-            // Intermediate chunks are SET_TENSOR-sized USB4 frames: 100ms ACK
-            // retry. The last chunk runs HIP graph_compute before ACK — wait.
-            const int timeout_ms = last ? -1 : 100;
+            // Intermediate chunks use 1000ms ACK retry. The last chunk runs HIP
+            // graph_compute before ACK — wait forever (-1).
+            const int timeout_ms = last ? -1 : 1000;
             const int max_try    = last ? 1  : 64;
             rpc_ctx->dispatcher->send(RPC_CMD_GRAPH_COMPUTE, msg_ptr, msg_size, &ack, sizeof(ack),
                                       timeout_ms, max_try);
@@ -1616,7 +1637,7 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
             }
             transferred += n;
             nchunk++;
-            if (!last && (nchunk % 32u) == 0u) {
+            if (!last && (nchunk % 16u) == 0u) {
                 fprintf(stderr, "[rpc graph_compute] chunks %zu off=%zu/%zu\n",
                         nchunk, transferred, input_size);
             }
@@ -1768,6 +1789,11 @@ public:
         ggml_context_ptr     ctx;
         ggml_cgraph *        graph = nullptr;
         uint64_t             uid   = 0;
+        ggml_tensor *        cached_ar = nullptr;
+        uint32_t             cached_ar_bytes = 0;
+        ggml_tensor *        cached_concat_shard = nullptr;
+        ggml_tensor *        cached_concat_dest = nullptr;
+        uint32_t             cached_concat_bytes = 0;
     };
     struct graph_ring {
         stored_graph                         slots[RPC_GRAPH_RING];
@@ -2096,15 +2122,11 @@ bool rpc_server::get_cached_file(uint64_t hash, std::vector<uint8_t> & data) {
 
 bool rpc_server::set_tensor_hash(const rpc_msg_set_tensor_hash_req & request, rpc_msg_set_tensor_hash_rsp & response)
 {
-    auto t1 = std::chrono::high_resolution_clock::now();
     std::vector<uint8_t> cached_file;
     if (!get_cached_file(request.hash, cached_file)) {
         response.result = 0;
         return true;
     }
-    auto t2 = std::chrono::high_resolution_clock::now();
-    long us = std::chrono::duration_cast<std::chrono::microseconds>(t2 - t1).count();
-    printf("DEBUG: get_cached_file took %ld us\n", us); fflush(stdout);
     size_t size = cached_file.size();
     struct ggml_init_params params {
         /*.mem_size   =*/ ggml_tensor_overhead(),
@@ -2374,6 +2396,11 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
     slot.ctx.reset();
     slot.graph = nullptr;
     slot.uid = 0;
+    slot.cached_ar = nullptr;
+    slot.cached_ar_bytes = 0;
+    slot.cached_concat_shard = nullptr;
+    slot.cached_concat_dest = nullptr;
+    slot.cached_concat_bytes = 0;
     if (slot.buffer.size() < buf_size) {
         slot.buffer.resize(buf_size);
     }
@@ -2604,24 +2631,29 @@ bool rpc_server::allreduce_last(socket_ptr sock, uint32_t device, uint64_t uid, 
         return false;
     }
     graph_ring & ring = stored_graphs[device];
-    ggml_cgraph * graph = nullptr;
     auto it = ring.by_uid.find(uid);
-    if (it != ring.by_uid.end()) {
-        graph = ring.slots[it->second].graph;
+    if (it == ring.by_uid.end()) {
+        return false;
     }
+    stored_graph & slot = ring.slots[it->second];
+    ggml_cgraph * graph = slot.graph;
     if (graph == nullptr) {
         return false;
     }
-    ggml_tensor * ar = nullptr;
-    for (int ni = graph->n_nodes - 1; ni >= 0; ni--) {
-        ggml_tensor * n = graph->nodes[ni];
-        if (n == nullptr || n->data == nullptr) {
-            continue;
-        }
-        if ((n->type == GGML_TYPE_F32 || n->type == GGML_TYPE_F16) &&
-                ggml_nbytes(n) == (size_t) ar_bytes) {
-            ar = n;
-            break;
+    ggml_tensor * ar = slot.cached_ar;
+    if (ar == nullptr || slot.cached_ar_bytes != ar_bytes) {
+        for (int ni = graph->n_nodes - 1; ni >= 0; ni--) {
+            ggml_tensor * n = graph->nodes[ni];
+            if (n == nullptr || n->data == nullptr) {
+                continue;
+            }
+            if ((n->type == GGML_TYPE_F32 || n->type == GGML_TYPE_F16) &&
+                    ggml_nbytes(n) == (size_t) ar_bytes) {
+                ar = n;
+                slot.cached_ar = ar;
+                slot.cached_ar_bytes = ar_bytes;
+                break;
+            }
         }
     }
     if (ar == nullptr) {
@@ -2636,32 +2668,33 @@ bool rpc_server::allreduce_last(socket_ptr sock, uint32_t device, uint64_t uid, 
     }
     static thread_local std::vector<uint8_t> local_data;
     static thread_local std::vector<uint8_t> peer_data;
-    if (local_data.size() < ar_bytes) {
-        local_data.resize(ar_bytes);
-    }
     if (peer_data.size() < ar_bytes) {
         peer_data.resize(ar_bytes);
     }
-    if (rpc_use_uma(ar, ar_bytes)) {
-        memcpy(local_data.data(), ar->data, ar_bytes);
-    } else {
+    const bool uma = rpc_use_uma(ar, ar_bytes);
+    void * send_ptr = uma ? ar->data : nullptr;
+    if (!uma) {
+        if (local_data.size() < ar_bytes) {
+            local_data.resize(ar_bytes);
+        }
         ggml_backend_tensor_get_async(backends[device], ar, local_data.data(), 0, ar_bytes);
         ggml_backend_synchronize(backends[device]);
+        send_ptr = local_data.data();
     }
-    if (!sock->xchg(local_data.data(), peer_data.data(), ar_bytes)) {
+    if (!sock->xchg(send_ptr, peer_data.data(), ar_bytes)) {
         GGML_LOG_ERROR("RECOMPUTE AR tbs_xchg failed bytes=%u\n", ar_bytes);
         return false;
     }
     if (ar->type == GGML_TYPE_F32) {
-        allreduce_add_f32((float *) local_data.data(),
+        float * target = (float *)(uma ? ar->data : local_data.data());
+        allreduce_add_f32(target,
                 (const float *) peer_data.data(), ar_bytes / sizeof(float));
     } else {
-        allreduce_add_f16((ggml_fp16_t *) local_data.data(),
+        ggml_fp16_t * target = (ggml_fp16_t *)(uma ? ar->data : local_data.data());
+        allreduce_add_f16(target,
                 (const ggml_fp16_t *) peer_data.data(), ar_bytes / sizeof(ggml_fp16_t));
     }
-    if (rpc_use_uma(ar, ar_bytes)) {
-        memcpy(ar->data, local_data.data(), ar_bytes);
-    } else {
+    if (!uma) {
         ggml_backend_tensor_set_async(backends[device], ar, local_data.data(), 0, ar_bytes);
     }
     return true;
@@ -2672,34 +2705,40 @@ bool rpc_server::allreduce_concat_last(socket_ptr sock, uint32_t device, uint64_
         return false;
     }
     graph_ring & ring = stored_graphs[device];
-    ggml_cgraph * graph = nullptr;
     auto it = ring.by_uid.find(uid);
-    if (it != ring.by_uid.end()) {
-        graph = ring.slots[it->second].graph;
+    if (it == ring.by_uid.end()) {
+        return false;
     }
+    stored_graph & slot = ring.slots[it->second];
+    ggml_cgraph * graph = slot.graph;
     if (graph == nullptr) {
         return false;
     }
-    ggml_tensor * shard = nullptr;
-    ggml_tensor * dest = nullptr;
-    for (int ni = graph->n_nodes - 1; ni >= 0; ni--) {
-        ggml_tensor * n = graph->nodes[ni];
-        if (n == nullptr || n->data == nullptr || n->type != GGML_TYPE_F32) {
-            continue;
+    ggml_tensor * shard = slot.cached_concat_shard;
+    ggml_tensor * dest = slot.cached_concat_dest;
+    if (shard == nullptr || dest == nullptr || slot.cached_concat_bytes != ar_bytes) {
+        for (int ni = graph->n_nodes - 1; ni >= 0; ni--) {
+            ggml_tensor * n = graph->nodes[ni];
+            if (n == nullptr || n->data == nullptr || n->type != GGML_TYPE_F32) {
+                continue;
+            }
+            const size_t nb = ggml_nbytes(n);
+            if (shard == nullptr && nb == (size_t) ar_bytes) {
+                shard = n;
+            }
+            if (dest == nullptr && nb == 2 * (size_t) ar_bytes) {
+                dest = n;
+            }
+            if (shard != nullptr && dest != nullptr) {
+                break;
+            }
         }
-        const size_t nb = ggml_nbytes(n);
-        if (shard == nullptr && nb == (size_t) ar_bytes) {
-            shard = n;
+        if (shard == nullptr && dest != nullptr) {
+            shard = dest; // GDN: first half of the full dest
         }
-        if (dest == nullptr && nb == 2 * (size_t) ar_bytes) {
-            dest = n;
-        }
-        if (shard != nullptr && dest != nullptr) {
-            break;
-        }
-    }
-    if (shard == nullptr && dest != nullptr) {
-        shard = dest; // GDN: first half of the full dest
+        slot.cached_concat_shard = shard;
+        slot.cached_concat_dest = dest;
+        slot.cached_concat_bytes = ar_bytes;
     }
     if (dest == nullptr || shard == nullptr) {
         GGML_LOG_ERROR("SEQ CONCAT: no shard/dest for ar_bytes=%u\n", ar_bytes);
@@ -2708,19 +2747,20 @@ bool rpc_server::allreduce_concat_last(socket_ptr sock, uint32_t device, uint64_
     static thread_local std::vector<uint8_t> local_data;
     static thread_local std::vector<uint8_t> peer_data;
     static thread_local std::vector<float> full;
-    if (local_data.size() < ar_bytes) {
-        local_data.resize(ar_bytes);
-    }
     if (peer_data.size() < ar_bytes) {
         peer_data.resize(ar_bytes);
     }
-    if (rpc_use_uma(shard, ar_bytes)) {
-        memcpy(local_data.data(), shard->data, ar_bytes);
-    } else {
+    const bool uma_shard = rpc_use_uma(shard, ar_bytes);
+    void * send_ptr = uma_shard ? shard->data : nullptr;
+    if (!uma_shard) {
+        if (local_data.size() < ar_bytes) {
+            local_data.resize(ar_bytes);
+        }
         ggml_backend_tensor_get_async(backends[device], shard, local_data.data(), 0, ar_bytes);
         ggml_backend_synchronize(backends[device]);
+        send_ptr = local_data.data();
     }
-    if (!sock->xchg(local_data.data(), peer_data.data(), ar_bytes)) {
+    if (!sock->xchg(send_ptr, peer_data.data(), ar_bytes)) {
         GGML_LOG_ERROR("SEQ CONCAT tbs_xchg failed bytes=%u\n", ar_bytes);
         return false;
     }
@@ -2731,23 +2771,22 @@ bool rpc_server::allreduce_concat_last(socket_ptr sock, uint32_t device, uint64_
                        (long long) dest->ne[0], (long long) nT, ar_bytes);
         return false;
     }
-    full.resize((size_t) dest->ne[0] * (size_t) nT);
-    // Worker is TP rank 1: peer is the left half.
-    if (kind == 2 && wN == 3072 && dest->ne[0] == 6144) {
-        // Sequential halves: local 24 heads flatten to 3072, then d0|d1 → 6144.
-        // 1024-chunk 3-rep interleave was also garbage (pid 304455 / 309878).
-        allgather_concat_f32(full.data(),
-                (const float *) peer_data.data(), (const float *) local_data.data(),
-                wN, nT);
+    const bool uma_dest = rpc_use_uma(dest, ggml_nbytes(dest));
+    float * dest_buf = nullptr;
+    if (uma_dest && shard != dest) {
+        dest_buf = (float *) dest->data;
     } else {
-        allgather_concat_f32(full.data(),
-                (const float *) peer_data.data(), (const float *) local_data.data(),
-                wN, nT);
+        full.resize((size_t) dest->ne[0] * (size_t) nT);
+        dest_buf = full.data();
     }
-    if (rpc_use_uma(dest, ggml_nbytes(dest))) {
-        memcpy(dest->data, full.data(), ggml_nbytes(dest));
-    } else {
-        ggml_backend_tensor_set_async(backends[device], dest, full.data(), 0, ggml_nbytes(dest));
+    // Worker is TP rank 1: peer is the left half.
+    allgather_concat_f32(dest_buf,
+            (const float *) peer_data.data(), (const float *) send_ptr,
+            wN, nT);
+    if (!uma_dest) {
+        ggml_backend_tensor_set_async(backends[device], dest, dest_buf, 0, ggml_nbytes(dest));
+    } else if (dest_buf != (float *) dest->data) {
+        memcpy(dest->data, dest_buf, ggml_nbytes(dest));
     }
     static int nlog;
     if (nlog < 4) {
@@ -2796,6 +2835,55 @@ bool rpc_server::apply_seq_input_sets(const uint8_t * p, size_t n) {
         off += rec;
     }
     return true;
+}
+
+static bool rpc_uma_mapped(const void * p, size_t n) {
+    if (p == nullptr || n == 0) {
+        return false;
+    }
+    const long page = sysconf(_SC_PAGESIZE);
+    if (page <= 0) {
+        return false;
+    }
+    const uintptr_t start = (uintptr_t) p & ~(uintptr_t) (page - 1);
+    const size_t len = ((uintptr_t) p + n + (size_t) page - 1 - start);
+    std::vector<unsigned char> vec((len + (size_t) page - 1) / (size_t) page + 1);
+    return mincore((void *) start, len, vec.data()) == 0;
+}
+
+static int g_rpc_uma = -1;
+
+static bool rpc_use_uma(const ggml_tensor * t, size_t n) {
+    if (t == nullptr || t->data == nullptr || n == 0) {
+        return false;
+    }
+    if (g_rpc_uma == 0) {
+        return false;
+    }
+    if (g_rpc_uma > 0) {
+        return true;
+    }
+    if (!rpc_uma_mapped(t->data, n)) {
+        g_rpc_uma = 0;
+        return false;
+    }
+    g_rpc_uma = 1;
+    fprintf(stderr, "[RPC_SEQ] uma_memcpy=1 ptr=%p n=%zu\n", t->data, n);
+    return true;
+}
+
+static void * seq_hip_stream(ggml_backend_t local_backend) {
+    ggml_backend_dev_t dev = ggml_backend_get_device(local_backend);
+    ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+    if (reg == nullptr) {
+        return nullptr;
+    }
+    using get_fn = void * (*)(ggml_backend_t);
+    auto fn = (get_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_get_stream");
+    if (fn == nullptr) {
+        return nullptr;
+    }
+    return fn(local_backend);
 }
 
 bool rpc_server::graph_seq(const std::vector<uint8_t> & input, socket_ptr sock) {
@@ -3580,59 +3668,37 @@ GGML_BACKEND_API bool ggml_backend_rpc_comm_finish_ar(void * comm_ctx, struct gg
     if (bytes == 0) {
         return false;
     }
-    std::vector<uint8_t> local_data(bytes);
-    std::vector<uint8_t> peer_data(bytes);
-    ggml_backend_tensor_get(local_ar, local_data.data(), 0, bytes);
-    rpc_ctx->dispatcher->xchg_raw(local_data.data(), peer_data.data(), bytes);
+    static thread_local std::vector<uint8_t> peer_data;
+    if (peer_data.size() < bytes) {
+        peer_data.resize(bytes);
+    }
+    const bool uma = rpc_use_uma(local_ar, bytes);
+    static thread_local std::vector<uint8_t> local_data;
+    void * send_ptr = uma ? local_ar->data : nullptr;
+    if (!uma) {
+        if (local_data.size() < bytes) {
+            local_data.resize(bytes);
+        }
+        ggml_backend_tensor_get(local_ar, local_data.data(), 0, bytes);
+        send_ptr = local_data.data();
+    }
+    rpc_ctx->dispatcher->xchg_raw(send_ptr, peer_data.data(), bytes);
+    void * target = uma ? local_ar->data : local_data.data();
     if (local_ar->type == GGML_TYPE_F32) {
-        allreduce_add_f32((float *) local_data.data(),
+        allreduce_add_f32((float *) target,
                 (const float *) peer_data.data(), bytes / sizeof(float));
     } else if (local_ar->type == GGML_TYPE_F16) {
-        allreduce_add_f16((ggml_fp16_t *) local_data.data(),
+        allreduce_add_f16((ggml_fp16_t *) target,
                 (const ggml_fp16_t *) peer_data.data(), bytes / sizeof(ggml_fp16_t));
     } else {
         return false;
     }
-    ggml_backend_tensor_set(local_ar, local_data.data(), 0, bytes);
+    if (!uma) {
+        ggml_backend_tensor_set(local_ar, local_data.data(), 0, bytes);
+    }
     static std::atomic<int> n_logged{0};
     if (n_logged.fetch_add(1) < 4) {
-        fprintf(stderr, "[RPC_AR_PIGGY] bytes=%zu type=%d\n", bytes, (int) local_ar->type);
-    }
-    return true;
-}
-
-// gfx1151 UMA: hipMalloc GTT is CPU-mapped. After stream sync, memcpy to/from
-// tensor->data matches hipMemcpy and GPU kernels see CPU stores (probed).
-static bool rpc_uma_mapped(const void * p, size_t n) {
-    if (p == nullptr || n == 0) {
-        return false;
-    }
-    const long page = sysconf(_SC_PAGESIZE);
-    if (page <= 0) {
-        return false;
-    }
-    const uintptr_t start = (uintptr_t) p & ~(uintptr_t) (page - 1);
-    const size_t len = ((uintptr_t) p + n + (size_t) page - 1 - start);
-    std::vector<unsigned char> vec((len + (size_t) page - 1) / (size_t) page + 1);
-    return mincore((void *) start, len, vec.data()) == 0;
-}
-
-static int g_rpc_uma = -1;
-
-static bool rpc_use_uma(const ggml_tensor * t, size_t n) {
-    if (t == nullptr || t->data == nullptr || n == 0) {
-        return false;
-    }
-    if (g_rpc_uma == 0) {
-        return false;
-    }
-    if (!rpc_uma_mapped(t->data, n)) {
-        g_rpc_uma = 0;
-        return false;
-    }
-    if (g_rpc_uma < 0) {
-        g_rpc_uma = 1;
-        fprintf(stderr, "[RPC_SEQ] uma_memcpy=1 ptr=%p n=%zu\n", t->data, n);
+        fprintf(stderr, "[RPC_AR_PIGGY] bytes=%zu type=%d uma=%d\n", bytes, (int) local_ar->type, (int) uma);
     }
     return true;
 }
@@ -3783,12 +3849,20 @@ static void * rpc_seq_pin_full(size_t n, int idx) {
 static void seq_ar_host(void * p) {
     seq_ar_job * j = (seq_ar_job *) p;
     if (j->nbytes == 0 || j->src == nullptr || j->src->data == nullptr ||
-            j->local == nullptr || j->peer == nullptr || j->disp == nullptr) {
+            j->peer == nullptr || j->disp == nullptr) {
         j->ok = 0;
         return;
     }
-    memcpy(j->local, j->src->data, j->nbytes);
-    if (!j->disp->xchg_direct(j->local, j->peer, j->nbytes)) {
+    const bool uma = rpc_use_uma(j->src, j->nbytes);
+    void * send_buf = (uma && j->kind <= 1) ? j->src->data : j->local;
+    if (send_buf == nullptr) {
+        j->ok = 0;
+        return;
+    }
+    if (send_buf != j->src->data) {
+        memcpy(send_buf, j->src->data, j->nbytes);
+    }
+    if (!j->disp->xchg_direct(send_buf, j->peer, j->nbytes)) {
         j->ok = 0;
         return;
     }
@@ -3797,32 +3871,28 @@ static void seq_ar_host(void * p) {
             j->ok = 0;
             return;
         }
-        allgather_concat_f32((float *) j->full,
-                (const float *) j->local, (const float *) j->peer, j->wN, j->nT);
-        memcpy(j->dest->data, j->full, j->dest_nbytes);
+        const bool uma_dest = rpc_use_uma(j->dest, j->dest_nbytes);
+        float * dest_buf = (uma_dest && j->src != j->dest) ? (float *) j->dest->data : (float *) j->full;
+        allgather_concat_f32(dest_buf,
+                (const float *) send_buf, (const float *) j->peer, j->wN, j->nT);
+        if (dest_buf != (float *) j->dest->data) {
+            memcpy(j->dest->data, j->full, j->dest_nbytes);
+        }
     } else if (j->kind == 1) {
-        allreduce_add_f16((ggml_fp16_t *) j->local,
+        void * target = uma ? j->src->data : j->local;
+        allreduce_add_f16((ggml_fp16_t *) target,
                 (const ggml_fp16_t *) j->peer, j->nbytes / sizeof(ggml_fp16_t));
-        memcpy(j->src->data, j->local, j->nbytes);
+        if (target != j->src->data) {
+            memcpy(j->src->data, j->local, j->nbytes);
+        }
     } else {
-        allreduce_add_f32((float *) j->local,
+        void * target = uma ? j->src->data : j->local;
+        allreduce_add_f32((float *) target,
                 (const float *) j->peer, j->nbytes / sizeof(float));
-        memcpy(j->src->data, j->local, j->nbytes);
+        if (target != j->src->data) {
+            memcpy(j->src->data, j->local, j->nbytes);
+        }
     }
-}
-
-static void * seq_hip_stream(ggml_backend_t local_backend) {
-    ggml_backend_dev_t dev = ggml_backend_get_device(local_backend);
-    ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
-    if (reg == nullptr) {
-        return nullptr;
-    }
-    using get_fn = void * (*)(ggml_backend_t);
-    auto fn = (get_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_get_stream");
-    if (fn == nullptr) {
-        return nullptr;
-    }
-    return fn(local_backend);
 }
 
 GGML_BACKEND_API bool ggml_backend_rpc_comm_graph_seq(
@@ -4040,16 +4110,19 @@ GGML_BACKEND_API bool ggml_backend_rpc_comm_graph_seq(
         }
         const auto tc0 = clock::now();
         const bool uma = rpc_use_uma(local_ar[i], ar_bytes);
-        if (uma) {
+        void * send_ptr = (uma && !concat) ? local_ar[i]->data : local_ptr;
+        if (!uma) {
+            ggml_backend_tensor_get_async(local_backend, local_ar[i], local_ptr, 0, ar_bytes);
+            ggml_backend_synchronize(local_backend);
+        } else if (concat) {
             memcpy(local_ptr, local_ar[i]->data, ar_bytes);
             n_uma++;
         } else {
-            ggml_backend_tensor_get_async(local_backend, local_ar[i], local_ptr, 0, ar_bytes);
-            ggml_backend_synchronize(local_backend);
+            n_uma++;
         }
         copy_us += (long) std::chrono::duration_cast<std::chrono::microseconds>(clock::now() - tc0).count();
         const auto tx0 = clock::now();
-        if (!rpc_ctx->dispatcher->xchg_direct(local_ptr, peer_ptr, ar_bytes)) {
+        if (!rpc_ctx->dispatcher->xchg_direct(send_ptr, peer_ptr, ar_bytes)) {
             return false;
         }
         xchg_us += (long) std::chrono::duration_cast<std::chrono::microseconds>(clock::now() - tx0).count();
@@ -4063,28 +4136,33 @@ GGML_BACKEND_API bool ggml_backend_rpc_comm_graph_seq(
                     (size_t) wN * (size_t) nT * sizeof(float) != (size_t) ar_bytes) {
                 return false;
             }
-            concat_full.resize((size_t) dest->ne[0] * (size_t) nT);
-            allgather_concat_f32(concat_full.data(),
-                    (const float *) local_ptr, (const float *) peer_ptr, wN, nT);
-            if (rpc_use_uma(dest, ggml_nbytes(dest))) {
-                memcpy(dest->data, concat_full.data(), ggml_nbytes(dest));
+            const bool uma_dest = rpc_use_uma(dest, ggml_nbytes(dest));
+            float * dest_buf = nullptr;
+            if (uma_dest && local_ar[i] != dest) {
+                dest_buf = (float *) dest->data;
             } else {
-                ggml_backend_tensor_set_async(local_backend, dest, concat_full.data(), 0, ggml_nbytes(dest));
+                concat_full.resize((size_t) dest->ne[0] * (size_t) nT);
+                dest_buf = concat_full.data();
+            }
+            allgather_concat_f32(dest_buf,
+                    (const float *) send_ptr, (const float *) peer_ptr, wN, nT);
+            if (!uma_dest) {
+                ggml_backend_tensor_set_async(local_backend, dest, dest_buf, 0, ggml_nbytes(dest));
+            } else if (dest_buf != (float *) dest->data) {
+                memcpy(dest->data, dest_buf, ggml_nbytes(dest));
             }
         } else if (local_ar[i]->type == GGML_TYPE_F32) {
-            allreduce_add_f32((float *) local_ptr,
+            float * target = (float *)(uma ? local_ar[i]->data : local_ptr);
+            allreduce_add_f32(target,
                     (const float *) peer_ptr, ar_bytes / sizeof(float));
-            if (uma) {
-                memcpy(local_ar[i]->data, local_ptr, ar_bytes);
-            } else {
+            if (!uma) {
                 ggml_backend_tensor_set_async(local_backend, local_ar[i], local_ptr, 0, ar_bytes);
             }
         } else if (local_ar[i]->type == GGML_TYPE_F16) {
-            allreduce_add_f16((ggml_fp16_t *) local_ptr,
+            ggml_fp16_t * target = (ggml_fp16_t *)(uma ? local_ar[i]->data : local_ptr);
+            allreduce_add_f16(target,
                     (const ggml_fp16_t *) peer_ptr, ar_bytes / sizeof(ggml_fp16_t));
-            if (uma) {
-                memcpy(local_ar[i]->data, local_ptr, ar_bytes);
-            } else {
+            if (!uma) {
                 ggml_backend_tensor_set_async(local_backend, local_ar[i], local_ptr, 0, ar_bytes);
             }
         } else {
