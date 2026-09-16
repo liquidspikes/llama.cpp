@@ -2910,7 +2910,7 @@ static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer(ggml_bac
     const size_t n_simple_bufts = ggml_backend_meta_buft_n_bufts(buft);
 
     const ggml_init_params params = {
-        /*.mem_size   =*/ 1024*1024*ggml_tensor_overhead(), // FIXME
+        /*.mem_size   =*/ (size_t) 8192*1024*ggml_tensor_overhead(), // 8M tensors for extreme context and multi-slot concurrency
         /*.mem_buffer =*/ nullptr,
         /*.no_alloc   =*/ true,
     };
