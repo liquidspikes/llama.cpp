@@ -1511,29 +1511,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
         <div class="bg-slate-950/80 p-4 rounded-xl border border-slate-800 space-y-3">
           <div class="text-xs font-bold text-slate-300 flex items-center justify-between">
-            <span>🧠 AMD XDNA 2 NPU Coprocessor</span>
-            <div class="text-[11px] font-mono">
-              <span id="node2-npu-clock" class="text-amber-400">1800MHz</span> | 
-              <span id="node2-npu-tops" class="text-emerald-400">58 TOPS</span>
-            </div>
-          </div>
-          <div>
-            <div class="flex justify-between text-xs mb-1 font-mono">
-              <span class="text-slate-400">Hardware Compute Load (<span id="node2-npu-tasks" class="text-slate-300">0/16 Tasks</span>)</span>
-              <span id="node2-npu-busy" class="text-emerald-400 font-bold">0%</span>
-            </div>
-            <div class="w-full bg-slate-800 rounded-full h-2.5 overflow-hidden">
-              <div id="node2-npu-busy-bar" class="bg-gradient-to-r from-emerald-500 to-teal-400 h-2.5 rounded-full transition-all duration-300" style="width: 0%"></div>
-            </div>
-          </div>
-          <div class="flex justify-between text-xs font-mono text-slate-400">
-            <span>Role: <span id="node2-npu-model" class="text-slate-200">Worker Standby / Draft Target</span></span>
-            <span id="node2-npu-status" class="text-emerald-400">Ready (D0)</span>
-          </div>
-        </div>
-
-        <div class="bg-slate-950/80 p-4 rounded-xl border border-slate-800 space-y-3">
-          <div class="text-xs font-bold text-slate-300 flex items-center justify-between">
             <span>⚡ Wirespeeds & Bandwidth</span>
             <span class="text-emerald-400 font-mono text-[11px]">USB4STREAM Active</span>
           </div>
@@ -1645,6 +1622,29 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             <div class="w-full bg-slate-800 rounded-full h-2 overflow-hidden">
               <div id="node2-gpu-vram-bar" class="bg-cyan-500 h-2 rounded-full transition-all duration-300" style="width: 0%"></div>
             </div>
+          </div>
+        </div>
+
+        <div class="bg-slate-950/80 p-4 rounded-xl border border-slate-800 space-y-3">
+          <div class="text-xs font-bold text-slate-300 flex items-center justify-between">
+            <span>🧠 AMD XDNA 2 NPU Coprocessor</span>
+            <div class="text-[11px] font-mono">
+              <span id="node2-npu-clock" class="text-amber-400">792MHz</span> | 
+              <span id="node2-npu-tops" class="text-emerald-400">25 TOPS</span>
+            </div>
+          </div>
+          <div>
+            <div class="flex justify-between text-xs mb-1 font-mono">
+              <span class="text-slate-400">Hardware Compute Load (<span id="node2-npu-tasks" class="text-slate-300">0/16 Tasks</span>)</span>
+              <span id="node2-npu-busy" class="text-emerald-400 font-bold">0%</span>
+            </div>
+            <div class="w-full bg-slate-800 rounded-full h-2.5 overflow-hidden">
+              <div id="node2-npu-busy-bar" class="bg-gradient-to-r from-emerald-500 to-teal-400 h-2.5 rounded-full transition-all duration-300" style="width: 0%"></div>
+            </div>
+          </div>
+          <div class="flex justify-between text-xs font-mono text-slate-400">
+            <span>Role: <span id="node2-npu-model" class="text-slate-200">Worker Standby / Draft Target</span></span>
+            <span id="node2-npu-status" class="text-emerald-400">Ready (D0)</span>
           </div>
         </div>
 
