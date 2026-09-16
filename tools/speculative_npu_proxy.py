@@ -181,13 +181,14 @@ class ProxyHTTPHandler(BaseHTTPRequestHandler):
         except Exception:
             pass
 
-        status_code = 200 if (npu_ok or gpu_ok or lem_ok) else 503
+        healthy = bool(gpu_ok)
+        status_code = 200 if healthy else 503
         self.send_response(status_code)
         self.send_header("Content-Type", "application/json")
         self._send_cors_headers()
         self.end_headers()
         resp_data = {
-            "status": "ok" if status_code == 200 else "degraded",
+            "status": "ok" if healthy else "degraded",
             "npu_coprocessor_online": npu_ok,
             "gpu_cluster_online": gpu_ok,
             "lemonade_core_online": lem_ok,

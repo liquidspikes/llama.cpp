@@ -196,18 +196,21 @@ def main():
 
     slot_last_state = {}
     consecutive_health_failures = 0
+    consecutive_slots_failures = 0
     last_canary_time = time.time()
 
     while True:
         try:
             # 1. Check primary proxy health
             code13306, h13306 = get_json("http://127.0.0.1:13306/health", timeout=3)
-            if code13306 != 200 or not h13306 or h13306.get("status") != "ok":
+            gpu_online = h13306.get("gpu_cluster_online", False) if h13306 else False
+            if code13306 != 200 or not h13306 or h13306.get("status") != "ok" or not gpu_online:
                 consecutive_health_failures += 1
-                logging.warning(f"Health check failed on 13306 (attempt {consecutive_health_failures}/6, code={code13306})")
+                logging.warning(f"Health check failed on 13306 (attempt {consecutive_health_failures}/6, code={code13306}, gpu_online={gpu_online})")
                 if consecutive_health_failures >= 6:
-                    recover_cluster(f"Proxy 13306 unhealthy for 6 consecutive checks (code={code13306})")
+                    recover_cluster(f"Proxy 13306 / GPU cluster unhealthy for 6 consecutive checks (code={code13306}, gpu_online={gpu_online})")
                     consecutive_health_failures = 0
+                    consecutive_slots_failures = 0
                     slot_last_state.clear()
                 time.sleep(5)
                 continue
@@ -225,9 +228,16 @@ def main():
             # 3. Check slots on active GPU port
             slots, active_port = get_slots()
             if not slots:
-                # Active port might be loading or restarting
+                consecutive_slots_failures += 1
+                logging.warning(f"GPU slots unreachable on port {active_port} (attempt {consecutive_slots_failures}/6)")
+                if consecutive_slots_failures >= 6:
+                    recover_cluster(f"GPU slots unreachable on port {active_port} for 6 consecutive checks")
+                    consecutive_slots_failures = 0
+                    slot_last_state.clear()
                 time.sleep(5)
                 continue
+
+            consecutive_slots_failures = 0
 
             current_time = time.time()
             for s in slots:
