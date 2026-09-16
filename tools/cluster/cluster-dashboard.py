@@ -2308,90 +2308,93 @@ def get_remote_stats():
 
 class DashboardHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
-        if self.path == "/api/consciousness":
-            llm = get_llm_status()
-            payload = json.dumps(llm).encode("utf-8")
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
-            self.send_header("Pragma", "no-cache")
-            self.send_header("Expires", "0")
-            self.send_header("Content-Length", str(len(payload)))
-            self.end_headers()
-            self.wfile.write(payload)
+        try:
+            if self.path == "/api/consciousness":
+                llm = get_llm_status()
+                payload = json.dumps(llm).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+                self.send_header("Pragma", "no-cache")
+                self.send_header("Expires", "0")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
 
-        elif self.path == "/api/stream_consciousness":
-            try:
-                self.connection.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-            except Exception:
-                pass
-            self.send_response(200)
-            self.send_header("Content-Type", "text/event-stream")
-            self.send_header("Cache-Control", "no-cache")
-            self.send_header("Connection", "keep-alive")
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.end_headers()
+            elif self.path == "/api/stream_consciousness":
+                try:
+                    self.connection.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+                except Exception:
+                    pass
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("Connection", "keep-alive")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
 
-            try:
-                while True:
-                    # Check if client disconnected via non-blocking select
-                    rlist, _, _ = select.select([self.connection], [], [], 0.0)
-                    if rlist:
-                        peek = self.connection.recv(1, socket.MSG_PEEK)
-                        if not peek:
-                            break
-                    llm = get_llm_status()
-                    payload = f"data: {json.dumps(llm)}\n\n".encode("utf-8")
-                    self.wfile.write(payload)
-                    self.wfile.flush()
-                    if llm.get("active_prompt"):
-                        time.sleep(0.05)  # 20fps ultra-fluid stream when actively generating
-                    else:
-                        time.sleep(1.0)   # 1 Hz idle heartbeat
-            except (BrokenPipeError, ConnectionResetError):
-                pass
-            except Exception:
-                pass
+                try:
+                    while True:
+                        # Check if client disconnected via non-blocking select
+                        rlist, _, _ = select.select([self.connection], [], [], 0.0)
+                        if rlist:
+                            peek = self.connection.recv(1, socket.MSG_PEEK)
+                            if not peek:
+                                break
+                        llm = get_llm_status()
+                        payload = f"data: {json.dumps(llm)}\n\n".encode("utf-8")
+                        self.wfile.write(payload)
+                        self.wfile.flush()
+                        if llm.get("active_prompt"):
+                            time.sleep(0.05)  # 20fps ultra-fluid stream when actively generating
+                        else:
+                            time.sleep(1.0)   # 1 Hz idle heartbeat
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+                except Exception:
+                    pass
 
-        elif self.path == "/api/stats":
-            local = get_all_local_stats()
-            remote = get_remote_stats()
+            elif self.path == "/api/stats":
+                local = get_all_local_stats()
+                remote = get_remote_stats()
 
-            payload = json.dumps({"local": local, "remote": remote}).encode("utf-8")
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
-            self.send_header("Pragma", "no-cache")
-            self.send_header("Expires", "0")
-            self.send_header("Content-Length", str(len(payload)))
-            self.end_headers()
-            self.wfile.write(payload)
+                payload = json.dumps({"local": local, "remote": remote}).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+                self.send_header("Pragma", "no-cache")
+                self.send_header("Expires", "0")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
 
-        elif self.path == "/api/local_stats":
-            local = get_all_local_stats()
-            payload = json.dumps(local).encode("utf-8")
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
-            self.send_header("Pragma", "no-cache")
-            self.send_header("Expires", "0")
-            self.send_header("Content-Length", str(len(payload)))
-            self.end_headers()
-            self.wfile.write(payload)
+            elif self.path == "/api/local_stats":
+                local = get_all_local_stats()
+                payload = json.dumps(local).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+                self.send_header("Pragma", "no-cache")
+                self.send_header("Expires", "0")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
 
-        else:
-            payload = HTML_TEMPLATE.encode("utf-8")
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
-            self.send_header("Pragma", "no-cache")
-            self.send_header("Expires", "0")
-            self.send_header("Content-Length", str(len(payload)))
-            self.end_headers()
-            self.wfile.write(payload)
+            else:
+                payload = HTML_TEMPLATE.encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+                self.send_header("Pragma", "no-cache")
+                self.send_header("Expires", "0")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
 
     def do_HEAD(self):
         self.send_response(200)
