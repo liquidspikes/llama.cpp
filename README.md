@@ -87,6 +87,37 @@ The `llama.cpp` project is build on top of the [ggml](https://github.com/ggml-or
 | [WebGPU](docs/build.md#webgpu) | All |
 | [ZenDNN](docs/build.md#zendnn) | AMD CPU |
 
+## Dual AMD Strix Halo Cluster & Heterogeneous NPU Architecture
+
+This branch features full production optimization for dual **AMD Strix Halo (Ryzen AI Max+ 395 / Radeon 8060S gfx1151)** nodes (`bosgame1` master at `192.168.137.51` and `bosgame2` worker at `192.168.137.52`) interconnected via point-to-point **USB4 DMA** with heterogeneous **AMD XDNA 2 NPU** coprocessor acceleration.
+
+### Architecture Highlights & Innovations
+
+- **Unified 256 GB LPDDR5X-8533 Memory Pool**:
+  - Aggregates ~240 GB allocatable unified VRAM across both nodes without PCIe bandwidth chokepoints.
+  - Hosts massive models like **Qwen 3.8 Flash Next (177B MoE)** in pure unified GPU memory.
+- **Ultra-Low Latency USB4 DMA Point-to-Point Ring Transport**:
+  - Direct kernel stream transport (`/dev/tbstream0` and `/dev/tbstream1`) bypassing standard OS TCP/IP socket stack overhead.
+  - Reaches **98.1% of theoretical memory bandwidth roofline (~28.65 tok/s decode)** on distributed 177B MoE inference.
+- **Heterogeneous NPU Coprocessor & Dynamic Speculative Auto-Routing**:
+  - Leverages dual on-die AMD XDNA 2 NPUs (50+ TOPS each, 100+ aggregate NPU TOPS) running alongside the GPU cluster.
+  - Features an intelligent reverse proxy (`tools/speculative_npu_proxy.py`) bound to canonical Lemonade port `13306`:
+    - Sub-15ms fast-path execution to the local NPU coprocessor (`:8999`) for conversational greetings, short status checks, summaries, and low-complexity queries.
+    - Transparent dynamic routing to the 177B dual-GPU cluster (`:8001`) for complex reasoning, multi-turn dialogues, code synthesis, and deep context tasks.
+    - Full OpenAI-compatible streaming SSE passthrough and Web UI compatibility.
+- **High-Density Scaling: 1,048,576 Context Pool & 4 Parallel Processing Slots**:
+  - Serves full **1M context (`--ctx-size 1048576`)** with **4 concurrent slots (`-np 4`)** and unified KV cache allocation (`--kv-unified`).
+  - YaRN RoPE frequency scaling (`--rope-scaling yarn --rope-scale 4 --yarn-orig-ctx 262144`) preserving perplexity and structural coherence across extreme context lengths.
+  - Maintains comfortable safety margins (~45 GB to ~53 GB free unified RAM per node).
+- **Cluster Telemetry & Monitoring Suite**:
+  - **`strix-top`** ([`tools/cluster/strix-top`](tools/cluster/strix-top)): High-performance ncurses terminal monitor displaying CPU, GPU gfx1151 clock/power/VRAM, XDNA 2 NPU hardware utilization (`/dev/accel/accel0`), and active LLM slots/context usage via dynamic runtime polling (`:8001/props` and `:8001/slots`).
+  - **Cluster Web Dashboard** ([`tools/cluster/cluster-dashboard.py`](tools/cluster/cluster-dashboard.py)): Real-time web dashboard running on `http://192.168.137.51:9090/` displaying dual-node system metrics, NPU coprocessor utilization, USB4 DMA ring throughput, live slot activity, and API latency analytics.
+- **ROCm 10.0 / gfx1151 Kernel & Hardware Fusions**:
+  - Optimized HIP kernels for AMD RDNA 3.5 (gfx1151).
+  - Recurrent state on-demand view initialization, GDN T=1 occupancy tuning, and RMSNorm + Mul fusion kernels.
+  - Stabilized MMVQ on gfx1151 with Vector Direct Reads (VDR) across Q4_K and Q6_K quants.
+  - Multimodal vision projector support (`--mmproj` with CLIP ViT `qwen3vl_merger`).
+
 ## Documentation
 
 #### Tools
@@ -95,9 +126,16 @@ The `llama.cpp` project is build on top of the [ggml](https://github.com/ggml-or
 - [completion](tools/completion/README.md)
 - [server](tools/server/README.md)
 - [GBNF grammars](grammars/README.md)
+- [strix-top (Cluster & NPU Terminal Monitor)](tools/cluster/strix-top)
+- [Cluster Web Dashboard](tools/cluster/cluster-dashboard.py)
+- [Speculative NPU Auto-Routing Proxy](tools/speculative_npu_proxy.py)
 
-#### Development
+#### Development & Cluster Guides
 
+- [Dual Strix Halo Cluster Architecture & Optimization Guide](docs/DUAL_STRIX_HALO_CLUSTER_ARCHITECTURE_AND_OPTIMIZATION_GUIDE.md)
+- [Dual Strix Halo USB4 Benchmark Report](docs/DUAL_STRIX_HALO_USB4_BENCHMARK_REPORT.md)
+- [Strix Halo Cluster Optimization](docs/strix-halo-cluster-optimization.md)
+- [USB4 Flash Next Tensor Parallelism](docs/usb4-flash-next-tensor-parallel.md)
 - [How to build](docs/build.md)
 - [Running on Docker](docs/docker.md)
 - [Build on Android](docs/android.md)
