@@ -102,7 +102,7 @@ def run_canary_inference():
     )
     t0 = time.time()
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
+        with urllib.request.urlopen(req, timeout=120) as resp:
             code = resp.getcode()
             body = json.loads(resp.read().decode("utf-8"))
             elapsed = time.time() - t0
@@ -269,14 +269,26 @@ def main():
                         }
 
             # 4. Periodic Active Canary
-            if current_time - last_canary_time >= CANARY_INTERVAL_SECONDS:
-                logging.info("Running scheduled 10-minute active canary test...")
+            any_slot_active = any(s.get("is_processing", False) for s in slots)
+            if any_slot_active:
+                # Active generation on cluster constitutes live proof of health
+                last_canary_time = current_time
+            elif current_time - last_canary_time >= CANARY_INTERVAL_SECONDS:
+                logging.info("Slots idle. Running scheduled 10-minute active canary test...")
                 canary_ok = run_canary_inference()
                 if not canary_ok:
-                    logging.warning("Canary failed once, retrying immediately...")
-                    if not run_canary_inference():
-                        recover_cluster("Consecutive canary inference failures on port 13306")
-                        slot_last_state.clear()
+                    logging.warning("Canary failed once, verifying backend health before retry...")
+                    code13306, h13306 = get_json("http://127.0.0.1:13306/health", timeout=3)
+                    if code13306 == 200 and h13306 and h13306.get("status") == "ok":
+                        logging.info("Proxy reports healthy. Retrying canary...")
+                        canary_ok = run_canary_inference()
+                    if not canary_ok:
+                        fresh_slots, _ = get_slots()
+                        if fresh_slots and any(s.get("is_processing", False) for s in fresh_slots):
+                            logging.info("A slot became active during canary; skipping recovery.")
+                        else:
+                            recover_cluster("Consecutive canary inference failures on port 13306 while slots idle")
+                            slot_last_state.clear()
                 last_canary_time = time.time()
 
             # 5. Periodic status log if any slot is processing
