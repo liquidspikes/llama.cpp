@@ -1111,8 +1111,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
         // Target prefill may contain token IDs or multimodal embeddings. Both
         // produce the target-layer features used to seed the draft KV cache, so
-        // skipping the embedding batches leaves a hole in the draft's cache and
-        // the next injection fails to initialize.
+        // embeddings are injected too, except the pinned ones skipped below.
         // TODO: revisit after https://github.com/ggml-org/llama.cpp/pull/24669 is merged
         const bool has_tokens     = batch_in.token != nullptr;
         const bool has_embeddings = batch_in.embd  != nullptr;
@@ -1148,6 +1147,13 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             }
             llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id, batch_in.pos[i_batch_beg[seq_id]], -1);
             const int32_t n_rows = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
+
+            // an M-RoPE image pins all its rows to one position, so a windowed draft
+            // cache cannot free cells for it - skip it, the draft can jump over the gap
+            const bool pos_pinned = batch_in.pos[i_batch_beg[seq_id]] == batch_in.pos[i_batch_end[seq_id]];
+            if (has_embeddings && n_rows > 1 && pos_pinned) {
+                continue;
+            }
 
             for (int32_t offset = 0; offset < n_rows; offset += n_ubatch) {
                 const int32_t n_chunk = std::min(n_ubatch, n_rows - offset);
