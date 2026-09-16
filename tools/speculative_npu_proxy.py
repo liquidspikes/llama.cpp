@@ -307,7 +307,7 @@ class ProxyHTTPHandler(BaseHTTPRequestHandler):
 
     def _dispatch_backend(self, url, payload, engine_label, reason, decision, stream):
         if stream:
-            resp = self.session.post(url, json=payload, stream=True, timeout=180)
+            resp = self.session.post(url, json=payload, stream=True, timeout=600)
             self.send_response(resp.status_code)
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-cache")
@@ -319,12 +319,15 @@ class ProxyHTTPHandler(BaseHTTPRequestHandler):
             self._send_cors_headers()
             self.end_headers()
 
-            for chunk in resp.iter_content(chunk_size=1024):
-                if chunk:
-                    self.wfile.write(chunk)
-                    self.wfile.flush()
+            try:
+                for chunk in resp.iter_content(chunk_size=1024):
+                    if chunk:
+                        self.wfile.write(chunk)
+                        self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                pass
         else:
-            resp = self.session.post(url, json=payload, timeout=180)
+            resp = self.session.post(url, json=payload, timeout=600)
             data = resp.json()
             data["routed_engine"] = engine_label
             data["routing_reason"] = reason
@@ -339,7 +342,10 @@ class ProxyHTTPHandler(BaseHTTPRequestHandler):
             self.send_header("X-Routing-Decision", decision)
             self._send_cors_headers()
             self.end_headers()
-            self.wfile.write(resp_bytes)
+            try:
+                self.wfile.write(resp_bytes)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
 
     def _forward_to_lemonade(self, method):
         """
