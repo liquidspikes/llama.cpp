@@ -65,6 +65,13 @@ def find_active_gpu_port():
             return p
     return 8002
 
+def is_gpu_loading():
+    for p in range(8001, 8007):
+        code, data = get_json(f"http://127.0.0.1:{p}/health", timeout=1.0)
+        if code == 503 and data and "Loading model" in str(data.get("error", {}).get("message", "")):
+            return True, p
+    return False, None
+
 def get_slots():
     port = find_active_gpu_port()
     code, data = get_json(f"http://127.0.0.1:{port}/slots", timeout=2.5)
@@ -201,6 +208,15 @@ def main():
 
     while True:
         try:
+            # 0. Check if GPU backend is in the middle of streaming weights / loading model
+            loading, load_port = is_gpu_loading()
+            if loading:
+                logging.info(f"Model backend on port {load_port} is actively streaming weights / loading...")
+                time.sleep(5)
+                consecutive_health_failures = 0
+                consecutive_slots_failures = 0
+                continue
+
             # 1. Check primary proxy health
             code13306, h13306 = get_json("http://127.0.0.1:13306/health", timeout=3)
             gpu_online = h13306.get("gpu_cluster_online", False) if h13306 else False
