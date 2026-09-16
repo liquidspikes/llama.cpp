@@ -695,16 +695,38 @@ def build_waveforms_panel(hist: ClusterHistory, curr_dma_mode: str) -> Panel:
     )
 
 
+def get_local_llm_info() -> Dict[str, Any]:
+    info = {
+        "model_name": "Qwen3.8-Flash-Next-Uncensored-Q4_K_M",
+        "split_mode_label": "HYBRID TP (80G DMA RING)",
+        "ctx_size": 1048576,
+        "port": 8001
+    }
+    try:
+        req = urllib.request.Request("http://127.0.0.1:9090/api/local_stats", headers={"User-Agent": "strix-top"})
+        with urllib.request.urlopen(req, timeout=0.2) as resp:
+            data = json.loads(resp.read().decode())
+            if "llm" in data and data["llm"].get("server_online"):
+                info["model_name"] = data["llm"].get("model_name", info["model_name"])
+                info["ctx_size"] = data["llm"].get("ctx_size", info["ctx_size"])
+                info["port"] = data["llm"].get("port", info["port"])
+                info["split_mode_label"] = data["llm"].get("split_mode_label", info["split_mode_label"])
+    except Exception:
+        pass
+    return info
+
+
 def build_llm_panel(llm_info: Dict[str, Any]) -> Panel:
     t = Table.grid(padding=(0, 1), expand=True)
     t.add_column(ratio=1)
 
-    model_name = llm_info.get("model_name", "Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-Q4_K_P")
+    model_name = llm_info.get("model_name", "Qwen3.8-Flash-Next-Uncensored-Q4_K_M")
     split_label = llm_info.get("split_mode_label", "HYBRID TP (80G DMA RING)")
-    ctx = llm_info.get("ctx_size", 4096)
-    port = llm_info.get("port", 8002)
+    ctx = llm_info.get("ctx_size", 1048576)
+    ctx_display = f"{ctx // 1024}k" if ctx >= 1024 else str(ctx)
+    port = llm_info.get("port", 8001)
 
-    line1 = f"[bold white]Model:[/bold white] [bold bright_yellow]{model_name}[/bold bright_yellow] · [cyan]{ctx} Ctx[/cyan] · [bold green]{split_label}[/bold green]"
+    line1 = f"[bold white]Model:[/bold white] [bold bright_yellow]{model_name}[/bold bright_yellow] · [cyan]{ctx_display} Ctx (4 Slots)[/cyan] · [bold green]{split_label}[/bold green]"
     line2 = f"[dim]Serving:[/dim] [bold cyan]Lemonade :13306[/bold cyan] ➔ [bold magenta]llama-server :{port}[/bold magenta] (dev: ROCm0,RPC0) · [dim]Speculative Draft Acceptance: ~55.5%[/dim]"
 
     t.add_row(Text.from_markup(line1))
@@ -1049,7 +1071,7 @@ def render_ui(
     node_grid.add_row(n1_box, n2_box)
 
     waveforms = build_waveforms_panel(hist, dma_mode)
-    llm_info = peer.get("llm", {}) if (not is_n1 and peer) else {}
+    llm_info = get_local_llm_info() if is_n1 else (peer.get("llm", {}) if peer else {})
     llm_panel = build_llm_panel(llm_info)
     procs_panel = build_overview_processes(all_procs)
 
