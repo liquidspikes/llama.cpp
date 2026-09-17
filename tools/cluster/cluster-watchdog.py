@@ -43,6 +43,7 @@ SSH_KEY = "/home/alexzimmerman/.ssh/id_ed25519"
 DEFAULT_MODEL = "qwen3.8-flash-next"
 CTX_SIZE = "1048576"
 MAX_STALL_SECONDS = 240
+MAX_HEALTH_FAILURES = 18
 CANARY_INTERVAL_SECONDS = 600
 
 def get_json(url, timeout=5):
@@ -222,9 +223,9 @@ def main():
             gpu_online = h13306.get("gpu_cluster_online", False) if h13306 else False
             if code13306 != 200 or not h13306 or h13306.get("status") != "ok" or not gpu_online:
                 consecutive_health_failures += 1
-                logging.warning(f"Health check failed on 13306 (attempt {consecutive_health_failures}/6, code={code13306}, gpu_online={gpu_online})")
-                if consecutive_health_failures >= 6:
-                    recover_cluster(f"Proxy 13306 / GPU cluster unhealthy for 6 consecutive checks (code={code13306}, gpu_online={gpu_online})")
+                logging.warning(f"Health check failed on 13306 (attempt {consecutive_health_failures}/{MAX_HEALTH_FAILURES}, code={code13306}, gpu_online={gpu_online})")
+                if consecutive_health_failures >= MAX_HEALTH_FAILURES:
+                    recover_cluster(f"Proxy 13306 / GPU cluster unhealthy for {MAX_HEALTH_FAILURES} consecutive checks (code={code13306}, gpu_online={gpu_online})")
                     consecutive_health_failures = 0
                     consecutive_slots_failures = 0
                     slot_last_state.clear()

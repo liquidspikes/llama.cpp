@@ -26,19 +26,29 @@ NPU_URL = "http://127.0.0.1:8999"
 NODE2_NPU_URL = "http://192.168.137.52:8998"
 LEMONADE_URL = "http://127.0.0.1:13307"
 
+_GPU_URL_CACHE = {"url": "http://127.0.0.1:8002", "time": 0}
+_HEALTH_CACHE = {"data": None, "code": 503, "time": 0}
+_HEALTH_LOCK = threading.Lock()
+
 def get_gpu_url():
     """
     Dynamically locates the active llama-server.real port (8001..8004)
-    or falls back to 8002.
+    with 3-second cache to prevent multi-hop scan latency.
     """
+    now = time.time()
+    if now - _GPU_URL_CACHE["time"] < 3.0:
+        return _GPU_URL_CACHE["url"]
+
     for port in (8001, 8002, 8003, 8004):
         try:
             r = requests.get(f"http://127.0.0.1:{port}/health", timeout=0.2)
             if r.status_code in (200, 503):
-                return f"http://127.0.0.1:{port}"
+                _GPU_URL_CACHE["url"] = f"http://127.0.0.1:{port}"
+                _GPU_URL_CACHE["time"] = now
+                return _GPU_URL_CACHE["url"]
         except Exception:
             pass
-    return "http://127.0.0.1:8002"
+    return _GPU_URL_CACHE["url"]
 
 PRIMARY_PORT = 13306
 SECONDARY_PORT = 8000
@@ -194,52 +204,69 @@ class ProxyHTTPHandler(BaseHTTPRequestHandler):
             self.wfile.write(json.dumps({"error": f"Node 2 NPU embeddings unreachable: {str(e)}"}).encode("utf-8"))
 
     def _handle_health(self):
-        npu_ok = False
-        gpu_ok = False
-        lem_ok = False
-        node2_npu_ok = False
-        try:
-            r = self.session.get(f"{NPU_URL}/v1/models", timeout=2)
-            npu_ok = (r.status_code == 200)
-        except Exception:
-            pass
+        now = time.time()
+        with _HEALTH_LOCK:
+            if _HEALTH_CACHE["data"] and (now - _HEALTH_CACHE["time"] < 2.0):
+                status_code = _HEALTH_CACHE["code"]
+                resp_bytes = _HEALTH_CACHE["data"]
+            else:
+                npu_ok = False
+                gpu_ok = False
+                lem_ok = False
+                node2_npu_ok = False
+                try:
+                    r = self.session.get(f"{NPU_URL}/v1/models", timeout=0.4)
+                    npu_ok = (r.status_code == 200)
+                except Exception:
+                    pass
+
+                try:
+                    gpu_url = get_gpu_url()
+                    r = self.session.get(f"{gpu_url}/health", timeout=0.4)
+                    gpu_ok = (r.status_code == 200)
+                except Exception:
+                    pass
+
+                try:
+                    r = self.session.get(f"{LEMONADE_URL}/v1/models", timeout=0.4)
+                    lem_ok = (r.status_code == 200)
+                except Exception:
+                    pass
+
+                try:
+                    r = self.session.get(f"{NODE2_NPU_URL}/v1/models", timeout=0.4)
+                    node2_npu_ok = (r.status_code == 200)
+                except Exception:
+                    pass
+
+                healthy = bool(gpu_ok)
+                status_code = 200 if healthy else 503
+                resp_data = {
+                    "status": "ok" if healthy else "degraded",
+                    "npu_coprocessor_online": npu_ok,
+                    "gpu_cluster_online": gpu_ok,
+                    "lemonade_core_online": lem_ok,
+                    "node2_npu_embeddings_online": node2_npu_ok,
+                    "auto_router": "enabled (semantic complexity heuristic)",
+                    "primary_port": PRIMARY_PORT,
+                    "secondary_port": SECONDARY_PORT
+                }
+                resp_bytes = json.dumps(resp_data, indent=2).encode("utf-8")
+                _HEALTH_CACHE["data"] = resp_bytes
+                _HEALTH_CACHE["code"] = status_code
+                _HEALTH_CACHE["time"] = now
 
         try:
-            gpu_url = get_gpu_url()
-            r = self.session.get(f"{gpu_url}/health", timeout=2)
-            gpu_ok = (r.status_code == 200)
-        except Exception:
+            self.send_response(status_code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(resp_bytes)))
+            self._send_cors_headers()
+            self.end_headers()
+            self.wfile.write(resp_bytes)
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
             pass
-
-        try:
-            r = self.session.get(f"{LEMONADE_URL}/v1/models", timeout=2)
-            lem_ok = (r.status_code == 200)
-        except Exception:
-            pass
-
-        try:
-            r = self.session.get(f"{NODE2_NPU_URL}/v1/models", timeout=2)
-            node2_npu_ok = (r.status_code == 200)
-        except Exception:
-            pass
-
-        healthy = bool(gpu_ok)
-        status_code = 200 if healthy else 503
-        self.send_response(status_code)
-        self.send_header("Content-Type", "application/json")
-        self._send_cors_headers()
-        self.end_headers()
-        resp_data = {
-            "status": "ok" if healthy else "degraded",
-            "npu_coprocessor_online": npu_ok,
-            "gpu_cluster_online": gpu_ok,
-            "lemonade_core_online": lem_ok,
-            "node2_npu_embeddings_online": node2_npu_ok,
-            "auto_router": "enabled (semantic complexity heuristic)",
-            "primary_port": PRIMARY_PORT,
-            "secondary_port": SECONDARY_PORT
-        }
-        self.wfile.write(json.dumps(resp_data, indent=2).encode("utf-8"))
+        self.close_connection = True
 
     def _handle_models(self):
         models_data = [
@@ -482,12 +509,19 @@ class ProxyHTTPHandler(BaseHTTPRequestHandler):
             self._send_cors_headers()
             self.end_headers()
             self.wfile.write(resp.content)
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
         except Exception as e:
-            self.send_response(502)
-            self.send_header("Content-Type", "application/json")
-            self._send_cors_headers()
-            self.end_headers()
-            self.wfile.write(json.dumps({"error": f"GPU backend unreachable on {gpu_url}: {str(e)}"}).encode("utf-8"))
+            try:
+                self.send_response(502)
+                self.send_header("Content-Type", "application/json")
+                self._send_cors_headers()
+                self.end_headers()
+                self.wfile.write(json.dumps({"error": f"GPU backend unreachable on {gpu_url}: {str(e)}"}).encode("utf-8"))
+            except Exception:
+                pass
+        self.close_connection = True
 
 def start_listener(port):
     try:
