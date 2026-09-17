@@ -325,8 +325,13 @@ class ProxyHTTPHandler(BaseHTTPRequestHandler):
                     if chunk:
                         self.wfile.write(chunk)
                         self.wfile.flush()
+                        if b"data: [DONE]" in chunk or b"[DONE]" in chunk:
+                            break
             except (BrokenPipeError, ConnectionResetError):
                 pass
+            finally:
+                resp.close()
+            self.close_connection = True
         else:
             resp = self.session.post(url, json=payload, timeout=600)
             data = resp.json()
