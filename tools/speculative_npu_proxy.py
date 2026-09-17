@@ -138,6 +138,10 @@ class ProxyHTTPHandler(BaseHTTPRequestHandler):
             self._handle_health()
             return
 
+        if self.path.startswith("/slots") or self.path.startswith("/props"):
+            self._forward_to_gpu("GET")
+            return
+
         # Reverse proxy any other GET request (e.g. Lemonade WebUI, static assets) to Lemonade core
         self._forward_to_lemonade("GET")
 
@@ -350,8 +354,10 @@ class ProxyHTTPHandler(BaseHTTPRequestHandler):
             self.end_headers()
             try:
                 self.wfile.write(resp_bytes)
+                self.wfile.flush()
             except (BrokenPipeError, ConnectionResetError):
                 pass
+            self.close_connection = True
 
     def _forward_to_lemonade(self, method):
         """
@@ -395,10 +401,50 @@ class ProxyHTTPHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(json.dumps({"error": f"Lemonade core unreachable on {LEMONADE_URL}: {str(e)}"}).encode("utf-8"))
 
+    def _forward_to_gpu(self, method):
+        """
+        Transparently forwards requests to active GPU backend (llama-server.real).
+        Enables /slots, /props, and other llama.cpp endpoints across all proxy ports.
+        """
+        gpu_url = get_gpu_url()
+        target_url = f"{gpu_url}{self.path}"
+        headers = {k: v for k, v in self.headers.items() if k.lower() not in HOP_BY_HOP}
+
+        body = None
+        if method in ("POST", "PUT", "PATCH"):
+            content_length = int(self.headers.get("Content-Length", 0))
+            if content_length > 0:
+                body = self.rfile.read(content_length)
+
+        try:
+            resp = self.session.request(
+                method=method,
+                url=target_url,
+                headers=headers,
+                data=body,
+                timeout=10
+            )
+            self.send_response(resp.status_code)
+            for k, v in resp.headers.items():
+                if k.lower() not in HOP_BY_HOP:
+                    self.send_header(k, v)
+            self._send_cors_headers()
+            self.end_headers()
+            self.wfile.write(resp.content)
+        except Exception as e:
+            self.send_response(502)
+            self.send_header("Content-Type", "application/json")
+            self._send_cors_headers()
+            self.end_headers()
+            self.wfile.write(json.dumps({"error": f"GPU backend unreachable on {gpu_url}: {str(e)}"}).encode("utf-8"))
+
 def start_listener(port):
-    server = ThreadingHTTPServer(("0.0.0.0", port), ProxyHTTPHandler)
-    print(f"[AUTO-ROUTING-PROXY] Listening on http://0.0.0.0:{port}")
-    server.serve_forever()
+    try:
+        server = ThreadingHTTPServer(("0.0.0.0", port), ProxyHTTPHandler)
+        print(f"[AUTO-ROUTING-PROXY] Listening on http://0.0.0.0:{port}")
+        server.serve_forever()
+    except OSError as e:
+        print(f"[AUTO-ROUTING-PROXY] Port {port} not available or already bound: {e}")
 
 def run_servers():
     print("=" * 70)
@@ -412,8 +458,11 @@ def run_servers():
     print(f" • Secondary Port:        {SECONDARY_PORT} (Speculative proxy legacy)")
     print("=" * 70)
 
-    t = threading.Thread(target=start_listener, args=(SECONDARY_PORT,), daemon=True)
-    t.start()
+    # Start optional backward-compatibility listeners (8000, 8001)
+    for extra_port in (8000, 8001):
+        if extra_port != PRIMARY_PORT:
+            t = threading.Thread(target=start_listener, args=(extra_port,), daemon=True)
+            t.start()
 
     start_listener(PRIMARY_PORT)
 
