@@ -4,7 +4,7 @@ ggml_add_backend_library(ggml-rpc
                          ggml-rpc.cpp
                          transport.cpp
                         )
-target_compile_options(ggml-rpc PRIVATE -ftls-model=initial-exec)
+target_compile_options(ggml-rpc PRIVATE -march=native -ftls-model=initial-exec)
 
 if (WIN32)
     target_link_libraries(ggml-rpc PRIVATE ws2_32)

@@ -45,6 +45,10 @@ static void allreduce_add_f32(float * dst, const float * src, size_t count) {
     size_t i = 0;
 #if defined(__AVX512F__)
     for (; i + 64 <= count; i += 64) {
+#if defined(__x86_64__) || defined(_M_X64)
+        _mm_prefetch((const char*)(src + i + 64), _MM_HINT_T0);
+        _mm_prefetch((const char*)(dst + i + 64), _MM_HINT_T0);
+#endif
         __m512 d0 = _mm512_loadu_ps(dst + i);
         __m512 s0 = _mm512_loadu_ps(src + i);
         __m512 d1 = _mm512_loadu_ps(dst + i + 16);
@@ -722,6 +726,7 @@ private:
         const void                  * xchg_out = nullptr;
         void                        * xchg_in  = nullptr;
         size_t                        xchg_n   = 0;
+        std::atomic<bool>             done{false};
         std::promise<void>            completion;
     };
     using rpc_msg_ptr   = std::shared_ptr<rpc_msg>;
@@ -750,6 +755,16 @@ void rpc_dispatcher::send(enum rpc_cmd cmd, std::shared_ptr<const void> input, s
     msg->output_size = 0;
     GGML_ASSERT(queue.push(msg));
     auto future = msg->completion.get_future();
+    for (int spin = 0; spin < 25000; spin++) {
+        if (msg->done.load(std::memory_order_acquire)) {
+            return;
+        }
+#if defined(__x86_64__) || defined(_M_X64)
+        _mm_pause();
+#else
+        std::this_thread::yield();
+#endif
+    }
     future.wait();
 }
 
@@ -779,6 +794,16 @@ void rpc_dispatcher::send(enum rpc_cmd cmd, std::shared_ptr<const void> input, s
     msg->max_try = max_try;
     GGML_ASSERT(queue.push(msg));
     auto future = msg->completion.get_future();
+    for (int spin = 0; spin < 25000; spin++) {
+        if (msg->done.load(std::memory_order_acquire)) {
+            return;
+        }
+#if defined(__x86_64__) || defined(_M_X64)
+        _mm_pause();
+#else
+        std::this_thread::yield();
+#endif
+    }
     future.wait();
 }
 
@@ -805,6 +830,16 @@ void rpc_dispatcher::send_xchg(enum rpc_cmd cmd, std::shared_ptr<const void> inp
     msg->xchg_n = xchg_n;
     GGML_ASSERT(queue.push(msg));
     auto future = msg->completion.get_future();
+    for (int spin = 0; spin < 25000; spin++) {
+        if (msg->done.load(std::memory_order_acquire)) {
+            return;
+        }
+#if defined(__x86_64__) || defined(_M_X64)
+        _mm_pause();
+#else
+        std::this_thread::yield();
+#endif
+    }
     future.wait();
 }
 
@@ -870,7 +905,18 @@ bool rpc_dispatcher::xchg_raw(const void * out, void * in, size_t n) {
     msg->xchg_in = in;
     msg->xchg_n = n;
     GGML_ASSERT(queue.push(msg));
-    msg->completion.get_future().wait();
+    auto future = msg->completion.get_future();
+    for (int spin = 0; spin < 25000; spin++) {
+        if (msg->done.load(std::memory_order_acquire)) {
+            return true;
+        }
+#if defined(__x86_64__) || defined(_M_X64)
+        _mm_pause();
+#else
+        std::this_thread::yield();
+#endif
+    }
+    future.wait();
     return true;
 }
 
@@ -907,6 +953,7 @@ void rpc_dispatcher::work() {
                 RPC_STATUS_ASSERT(status);
             }
         }
+        msg_ptr->done.store(true, std::memory_order_release);
         msg_ptr->completion.set_value();
     }
 }
@@ -2626,6 +2673,8 @@ bool rpc_server::graph_recompute(const rpc_msg_graph_recompute_req & request) {
     return true;
 }
 
+static void * rpc_pinned_host(size_t n, bool peer);
+
 bool rpc_server::allreduce_last(socket_ptr sock, uint32_t device, uint64_t uid, uint32_t ar_bytes) {
     if (ar_bytes == 0 || device >= stored_graphs.size()) {
         return false;
@@ -2667,9 +2716,11 @@ bool rpc_server::allreduce_last(socket_ptr sock, uint32_t device, uint64_t uid, 
         return sock->xchg(dummy.data(), peer.data(), ar_bytes);
     }
     static thread_local std::vector<uint8_t> local_data;
-    static thread_local std::vector<uint8_t> peer_data;
-    if (peer_data.size() < ar_bytes) {
-        peer_data.resize(ar_bytes);
+    uint8_t * peer_ptr = (uint8_t *) rpc_pinned_host(ar_bytes, true);
+    static thread_local std::vector<uint8_t> fallback_peer;
+    if (!peer_ptr) {
+        if (fallback_peer.size() < ar_bytes) fallback_peer.resize(ar_bytes);
+        peer_ptr = fallback_peer.data();
     }
     const bool uma = rpc_use_uma(ar, ar_bytes);
     void * send_ptr = uma ? ar->data : nullptr;
@@ -2681,18 +2732,18 @@ bool rpc_server::allreduce_last(socket_ptr sock, uint32_t device, uint64_t uid, 
         ggml_backend_synchronize(backends[device]);
         send_ptr = local_data.data();
     }
-    if (!sock->xchg(send_ptr, peer_data.data(), ar_bytes)) {
+    if (!sock->xchg(send_ptr, peer_ptr, ar_bytes)) {
         GGML_LOG_ERROR("RECOMPUTE AR tbs_xchg failed bytes=%u\n", ar_bytes);
         return false;
     }
     if (ar->type == GGML_TYPE_F32) {
         float * target = (float *)(uma ? ar->data : local_data.data());
         allreduce_add_f32(target,
-                (const float *) peer_data.data(), ar_bytes / sizeof(float));
+                (const float *) peer_ptr, ar_bytes / sizeof(float));
     } else {
         ggml_fp16_t * target = (ggml_fp16_t *)(uma ? ar->data : local_data.data());
         allreduce_add_f16(target,
-                (const ggml_fp16_t *) peer_data.data(), ar_bytes / sizeof(ggml_fp16_t));
+                (const ggml_fp16_t *) peer_ptr, ar_bytes / sizeof(ggml_fp16_t));
     }
     if (!uma) {
         ggml_backend_tensor_set_async(backends[device], ar, local_data.data(), 0, ar_bytes);
@@ -2745,11 +2796,13 @@ bool rpc_server::allreduce_concat_last(socket_ptr sock, uint32_t device, uint64_
         return false;
     }
     static thread_local std::vector<uint8_t> local_data;
-    static thread_local std::vector<uint8_t> peer_data;
-    static thread_local std::vector<float> full;
-    if (peer_data.size() < ar_bytes) {
-        peer_data.resize(ar_bytes);
+    uint8_t * peer_ptr = (uint8_t *) rpc_pinned_host(ar_bytes, true);
+    static thread_local std::vector<uint8_t> fallback_peer;
+    if (!peer_ptr) {
+        if (fallback_peer.size() < ar_bytes) fallback_peer.resize(ar_bytes);
+        peer_ptr = fallback_peer.data();
     }
+    static thread_local std::vector<float> full;
     const bool uma_shard = rpc_use_uma(shard, ar_bytes);
     void * send_ptr = uma_shard ? shard->data : nullptr;
     if (!uma_shard) {
@@ -2760,7 +2813,7 @@ bool rpc_server::allreduce_concat_last(socket_ptr sock, uint32_t device, uint64_
         ggml_backend_synchronize(backends[device]);
         send_ptr = local_data.data();
     }
-    if (!sock->xchg(send_ptr, peer_data.data(), ar_bytes)) {
+    if (!sock->xchg(send_ptr, peer_ptr, ar_bytes)) {
         GGML_LOG_ERROR("SEQ CONCAT tbs_xchg failed bytes=%u\n", ar_bytes);
         return false;
     }
@@ -2781,7 +2834,7 @@ bool rpc_server::allreduce_concat_last(socket_ptr sock, uint32_t device, uint64_
     }
     // Worker is TP rank 1: peer is the left half.
     allgather_concat_f32(dest_buf,
-            (const float *) peer_data.data(), (const float *) send_ptr,
+            (const float *) peer_ptr, (const float *) send_ptr,
             wN, nT);
     if (!uma_dest) {
         ggml_backend_tensor_set_async(backends[device], dest, dest_buf, 0, ggml_nbytes(dest));
@@ -3255,7 +3308,7 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                 break;
             }
             case RPC_CMD_GRAPH_SEQ: {
-                std::vector<uint8_t> input;
+                static thread_local std::vector<uint8_t> input;
                 if (!recv_msg(sock, input, cmd_channel)) {
                     return;
                 }
@@ -3594,17 +3647,21 @@ GGML_BACKEND_API bool ggml_backend_rpc_comm_allreduce_tensor(void * comm_ctx, st
         return false;
     }
 
-    std::vector<uint8_t> local_data(bytes);
-    std::vector<uint8_t> peer_data(bytes);
+    // IMP-26: Persistent thread-local staging avoids 256 heap allocations/frees per token
+    static thread_local std::vector<uint8_t> local_data;
+    static thread_local std::vector<uint8_t> peer_data;
+    if (local_data.size() < bytes) local_data.resize(bytes);
+    if (peer_data.size() < bytes) peer_data.resize(bytes);
     ggml_backend_tensor_get(local_tensor, local_data.data(), 0, bytes);
 
-    auto payload = std::make_shared<rpc_msg_get_tensor_req>();
-    payload->tensor = serialize_tensor(rpc_tensor);
-    payload->offset = 0;
-    payload->size = bytes;
+    rpc_msg_get_tensor_req payload;
+    payload.tensor = serialize_tensor(rpc_tensor);
+    payload.offset = 0;
+    payload.size = bytes;
 
     ggml_backend_rpc_context * rpc_ctx = (ggml_backend_rpc_context *)rpc_backend->context;
-    rpc_ctx->dispatcher->send_xchg(RPC_CMD_ALL_REDUCE, payload, sizeof(*payload),
+    std::shared_ptr<const void> payload_ref(std::shared_ptr<void>{}, &payload);
+    rpc_ctx->dispatcher->send_xchg(RPC_CMD_ALL_REDUCE, payload_ref, sizeof(payload),
                                    local_data.data(), peer_data.data(), bytes);
 
     if (local_tensor->type == GGML_TYPE_F32) {
@@ -3932,11 +3989,13 @@ GGML_BACKEND_API bool ggml_backend_rpc_comm_graph_seq(
         uint32_t ar_bytes;
         uint32_t pad;
     };
-    std::vector<uint8_t> payload(8 + n * sizeof(seq_item));
+    static thread_local std::vector<uint8_t> s_seq_payload;
+    const size_t req_sz = 8 + n * sizeof(seq_item);
+    s_seq_payload.resize(req_sz);
     uint32_t device = rpc_ctx->device;
     uint32_t nn = (uint32_t) n;
-    memcpy(payload.data(), &device, 4);
-    memcpy(payload.data() + 4, &nn, 4);
+    memcpy(s_seq_payload.data(), &device, 4);
+    memcpy(s_seq_payload.data() + 4, &nn, 4);
     for (size_t i = 0; i < n; i++) {
         seq_item it{};
         it.uid = rpc_uids[i];
@@ -3952,14 +4011,14 @@ GGML_BACKEND_API bool ggml_backend_rpc_comm_graph_seq(
         } else {
             it.ar_bytes = (uint32_t) ggml_nbytes(local_ar[i]);
         }
-        memcpy(payload.data() + 8 + i * sizeof(seq_item), &it, sizeof(it));
+        memcpy(s_seq_payload.data() + 8 + i * sizeof(seq_item), &it, sizeof(it));
     }
-    rpc_append_pending_sets(payload);
+    rpc_append_pending_sets(s_seq_payload);
     uint8_t ack = 0;
-    auto payload_ptr = std::make_shared<std::vector<uint8_t>>(std::move(payload));
+    std::shared_ptr<const void> payload_ref(std::shared_ptr<void>{}, s_seq_payload.data());
     rpc_ctx->dispatcher->send(RPC_CMD_GRAPH_SEQ,
-            std::shared_ptr<const void>(payload_ptr, payload_ptr->data()),
-            payload_ptr->size(), &ack, sizeof(ack));
+            payload_ref,
+            s_seq_payload.size(), &ack, sizeof(ack));
     if (ack != 1) {
         return false;
     }
