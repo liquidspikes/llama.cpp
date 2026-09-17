@@ -9842,6 +9842,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 #endif
 
+    // a narrow src0 with many columns: mmf tiles the columns and masks the partial row tile
+    for (ggml_type ta : {GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_F32}) {
+        for (int m : {1, 4, 17, 48, 64}) {
+            for (int n : {1, 15, 16, 17, 64, 129}) {
+                test_cases.emplace_back(new test_mul_mat(ta, GGML_TYPE_F32, m, n, 256, {1, 1}, {1, 1}));
+            }
+        }
+    }
+
     for (auto bs2 : {1,3}) {
         for (auto bs : {1,2,4,8}) {
             for (auto nr : {1,4}) {
@@ -11151,6 +11160,28 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 256, 1)); // PP-256
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 512, 1)); // PP-512
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1024, 1)); // PP-1024
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 2048, 1)); // PP-2048
+
+    // qwen4exp gdn conv input: concat(state, ggml_transpose(x), 0), [3+2048, 10240]
+    test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {3, 10240, 1, 1}, 2048, 0, 16));
+
+    // qwen4exp mHC head: bf16 [320, 10240] x [320, 1] -- one decode matvec per layer, twice
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32, 10240, 1, 320, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32,  2560, 1, 2560, {1, 1}, {1, 1}));
+
+    // qwen4exp bf16 prefill shapes with a narrow src0: cuBLAS converts the whole activation
+    // tensor to bf16 and back for each of these, mmf converts as it loads
+    for (int n : {1, 512, 2048}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32,    4, n, 10240, {1, 1}, {1, 1})); // hc_*_inject
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32,   48, n,  2560, {1, 1}, {1, 1})); // ssm_alpha/beta
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32,    1, n,  2560, {1, 1}, {1, 1})); // gate_inp_shexp
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32,  320, n, 10240, {1, 1}, {1, 1})); // hc_*_down
+    }
+    test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {32, 10240, 1, 1}, 2048, 0, 16)); // ne0=2080, 64B-aligned rows
+    test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {0,  10240, 1, 1}, 2048, 0, 16)); // ne0=2080, pure transpose
+    // qwen4exp (Qwen3.8-Flash-Next): 16 k/q groups, 48 value heads, d=128
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128,  512, 1, 3));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 2048, 1, 3));
     // Small model configs (fewer heads = less GPU occupancy for autoregressive)
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 64, 1));   // 4h PP-64
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 256, 1));  // 4h PP-256
