@@ -23,6 +23,7 @@ import requests
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
 NPU_URL = "http://127.0.0.1:8999"
+NODE2_NPU_URL = "http://192.168.137.52:8998"
 LEMONADE_URL = "http://127.0.0.1:13307"
 
 def get_gpu_url():
@@ -89,6 +90,8 @@ class AutoRouter:
         m_lower = (model_param or "").lower()
         if any(k in m_lower for k in ("npu", "0.6b", "flm")):
             return "npu", "manual override (requested NPU model)"
+        if any(k in m_lower for k in ("spec", "speculative", "ngram")):
+            return "gpu", "manual override (speculative decoding mode)"
         if any(k in m_lower for k in ("gpu", "177b", "flash-next")):
             return "gpu", "manual override (requested GPU 177B model)"
 
@@ -150,6 +153,10 @@ class ProxyHTTPHandler(BaseHTTPRequestHandler):
             self._handle_chat_completions()
             return
 
+        if self.path in ("/v1/embeddings", "/embeddings"):
+            self._handle_embeddings()
+            return
+
         # Reverse proxy any other POST request (e.g. Lemonade API endpoints) to Lemonade core
         self._forward_to_lemonade("POST")
 
@@ -162,10 +169,35 @@ class ProxyHTTPHandler(BaseHTTPRequestHandler):
     def do_HEAD(self):
         self._forward_to_lemonade("HEAD")
 
+    def _handle_embeddings(self):
+        content_length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(content_length)
+        node2_url = f"{NODE2_NPU_URL}/v1/embeddings"
+        try:
+            req_data = json.loads(body.decode("utf-8")) if body else {}
+            if "model" not in req_data or "gemma" not in req_data.get("model", "").lower():
+                req_data["model"] = "embed-gemma:300m"
+            headers = {k: v for k, v in self.headers.items() if k.lower() not in HOP_BY_HOP}
+            resp = self.session.post(node2_url, json=req_data, headers=headers, timeout=15)
+            self.send_response(resp.status_code)
+            for k, v in resp.headers.items():
+                if k.lower() not in HOP_BY_HOP:
+                    self.send_header(k, v)
+            self._send_cors_headers()
+            self.end_headers()
+            self.wfile.write(resp.content)
+        except Exception as e:
+            self.send_response(502)
+            self.send_header("Content-Type", "application/json")
+            self._send_cors_headers()
+            self.end_headers()
+            self.wfile.write(json.dumps({"error": f"Node 2 NPU embeddings unreachable: {str(e)}"}).encode("utf-8"))
+
     def _handle_health(self):
         npu_ok = False
         gpu_ok = False
         lem_ok = False
+        node2_npu_ok = False
         try:
             r = self.session.get(f"{NPU_URL}/v1/models", timeout=2)
             npu_ok = (r.status_code == 200)
@@ -185,6 +217,12 @@ class ProxyHTTPHandler(BaseHTTPRequestHandler):
         except Exception:
             pass
 
+        try:
+            r = self.session.get(f"{NODE2_NPU_URL}/v1/models", timeout=2)
+            node2_npu_ok = (r.status_code == 200)
+        except Exception:
+            pass
+
         healthy = bool(gpu_ok)
         status_code = 200 if healthy else 503
         self.send_response(status_code)
@@ -196,6 +234,7 @@ class ProxyHTTPHandler(BaseHTTPRequestHandler):
             "npu_coprocessor_online": npu_ok,
             "gpu_cluster_online": gpu_ok,
             "lemonade_core_online": lem_ok,
+            "node2_npu_embeddings_online": node2_npu_ok,
             "auto_router": "enabled (semantic complexity heuristic)",
             "primary_port": PRIMARY_PORT,
             "secondary_port": SECONDARY_PORT
@@ -217,10 +256,22 @@ class ProxyHTTPHandler(BaseHTTPRequestHandler):
                 "description": "177B MoE Deep Reasoning on Dual Strix Halo (28.4 tok/s)"
             },
             {
+                "id": "qwen3.8-flash-next-speculative",
+                "object": "model",
+                "owned_by": "dual-gpu-cluster-ngram-spec",
+                "description": "177B MoE Deep Reasoning with Speculative Decoding and Q4_0 Unified KV Cache"
+            },
+            {
                 "id": "qwen3:0.6b-npu",
                 "object": "model",
                 "owned_by": "amd-xdna2",
                 "description": "Ultra-fast Coprocessor on /dev/accel/accel0 (95.4 tok/s, 0% GPU load)"
+            },
+            {
+                "id": "embed-gemma:300m-npu",
+                "object": "model",
+                "owned_by": "bosgame2-xdna2",
+                "description": "Zero-VRAM Text Embeddings on Node 2 NPU (dim=768, 0% GPU load)"
             }
         ]
 
