@@ -164,15 +164,15 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
     // sidecar MTP GGUFs have no blk.0; in-model NextN lives at layers[n_layer]
     const bool mtp_only = (hparams.n_layer_nextn > 0) && (ml.get_weight("blk.0.hc_attn_norm.weight") == nullptr);
     const int trunk_flags = mtp_only ? TENSOR_NOT_REQUIRED : 0;
-    const int mtp_flags   = !ml.load_mtp ? TENSOR_SKIP : 0;
+    const int mtp_flags   = (!ml.load_mtp && !mtp_only) ? TENSOR_SKIP : 0;
 
-    tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, 0);
+    tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, trunk_flags);
 
     // there is no output_norm: the final hyper-connection mixer carries it
     // the gammas load as [n_embd, hc] so the grouped norm multiplies them without a graph reshape
-    hc_head_norm = create_tensor(tn(LLM_TENSOR_HC_HEAD_NORM, "weight"), { n_embd, hc }, TENSOR_ALLOW_RESHAPE);
-    hc_head_down = create_tensor(tn(LLM_TENSOR_HC_HEAD_DOWN, "weight"), { hc_dim, hc_lr }, 0);
-    hc_head_up   = create_tensor(tn(LLM_TENSOR_HC_HEAD_UP,   "weight"), { hc_lr, hc_dim }, 0);
+    hc_head_norm = create_tensor(tn(LLM_TENSOR_HC_HEAD_NORM, "weight"), { n_embd, hc }, trunk_flags | TENSOR_ALLOW_RESHAPE);
+    hc_head_down = create_tensor(tn(LLM_TENSOR_HC_HEAD_DOWN, "weight"), { hc_dim, hc_lr }, trunk_flags);
+    hc_head_up   = create_tensor(tn(LLM_TENSOR_HC_HEAD_UP,   "weight"), { hc_lr, hc_dim }, trunk_flags);
 
     output = create_tensor(tn(LLM_TENSOR_OUTPUT, "weight"), { n_embd, n_vocab }, TENSOR_NOT_REQUIRED);
     if (output == NULL) {
@@ -198,7 +198,7 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
         }
 
         per_layer_tok_embd = create_tensor(tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight"),
-                                           { hparams.ple_head_dim, ple_rows }, TENSOR_READ_LAZY);
+                                           { hparams.ple_head_dim, ple_rows }, trunk_flags | TENSOR_READ_LAZY);
     }
 
     auto load_block = [&](int il, int flags, bool mtp) {
@@ -276,6 +276,9 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
             layer.nextn.embed_tokens     = create_tensor(tn(LLM_TENSOR_NEXTN_EMBED_TOKENS,     "weight", il), { n_embd, n_vocab }, flags | TENSOR_NOT_REQUIRED);
             layer.nextn.shared_head_head = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD, "weight", il), { n_embd, n_vocab }, flags | TENSOR_NOT_REQUIRED);
             layer.nextn.shared_head_norm = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_NORM, "weight", il), { n_embd }, flags | TENSOR_NOT_REQUIRED);
+            layer.nextn.hc_head_norm     = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_NORM,     "weight", il), { n_embd, hc }, flags | TENSOR_NOT_REQUIRED | TENSOR_ALLOW_RESHAPE);
+            layer.nextn.hc_head_down     = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_DOWN,     "weight", il), { hc_dim, hc_lr }, flags | TENSOR_NOT_REQUIRED);
+            layer.nextn.hc_head_up       = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_UP,       "weight", il), { hc_lr, hc_dim }, flags | TENSOR_NOT_REQUIRED);
         }
     };
 
@@ -607,7 +610,15 @@ void llama_model_qwen4exp::graph::build_mtp() {
     res->t_h_nextn = h_nextn;
     ggml_build_forward_expand(gf, h_nextn);
 
-    cur = build_hc_mix(res_hc, model.hc_head_norm, model.hc_head_down, model.hc_head_up,
+    ggml_tensor * head_norm = layer.nextn.hc_head_norm ? layer.nextn.hc_head_norm : model.hc_head_norm;
+    ggml_tensor * head_down = layer.nextn.hc_head_down ? layer.nextn.hc_head_down : model.hc_head_down;
+    ggml_tensor * head_up   = layer.nextn.hc_head_up   ? layer.nextn.hc_head_up   : model.hc_head_up;
+
+    GGML_ASSERT(head_norm && "QWEN4EXP MTP: missing head_norm");
+    GGML_ASSERT(head_down && "QWEN4EXP MTP: missing head_down");
+    GGML_ASSERT(head_up   && "QWEN4EXP MTP: missing head_up");
+
+    cur = build_hc_mix(res_hc, head_norm, head_down, head_up,
             nullptr, nullptr, -1);
     cb(cur, "mtp_result_norm", -1);
 

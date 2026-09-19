@@ -1,0 +1,30 @@
+{
+  "test1_large_prompt": {
+    "prompt_tokens": 27416,
+    "prefill_tps": 299.76480992712237,
+    "decode_tps": 19.10262426356404,
+    "wall_sec": 122.01113295555115,
+    "tx_ok": true,
+    "surcharge_ok": true,
+    "balance_ok": false,
+    "passed": false,
+    "content": "The rejected TX is TX-88294-OMEGA. Effective haircut: 3.50% \u00d7 1.75 = 6.125%. Surcharge: $16M \u00d7 6.125% = $980,000. Balance = 12,500,000 \u2212 4,250,000 \u2212 145,000 \u2212 980,000 = $7,120,000.\n\n### Final: Rejected TX: TX-88294-OMEGA | Surcharge: $980,000 | Available Balance: $7,625,000",
+    "reasoning": "Let me work through this step by step.\n\n1. The rejected transaction ID from Section 9.4 is 'TX-88294-OMEGA' submitted by institution 'ApexLedger'.\n\n2. Calculate the overdraft penalty surcharge:\n   - Base haircut: 3.50%\n   - Penalty multiplier (since $16M > $10M threshold, during critical window): 1.75x\n   - Effective rate: 3.50% \u00d7 1.75 = 6.125%\n   - Surcharge fee: $16,000,000 \u00d7 6.125% = $980,000\n\n3. Apply the Collateral Balance Rule:\n   - Initial Collateral: $12,500,000\n   - Minus Settled Obligations: $4,250,000\n   - Minus Section 9.4 Statutory Clawback: $145,000\n   - Minus Section 7.3 Overdraft Penalty Surcharge: $980,000\n   - Final Available Collateral = $12,500,000 - $4,250,000 - $145,000 - $980,000 = $7,620,000\n\nLet me verify: 12,500,000 - 4,250,000 - 145,000 - 980,000 = 12,500,000 - 4,250,000 - 145,000 - 980,000 = $7,620,000\n\nFinal answer format needed.",
+    "final": "Rejected TX: TX-88294-OMEGA | Surcharge: $980,000 | Available Balance: $7,625,000"
+  },
+  "test2_formal_logic": {
+    "prompt_tokens": 160,
+    "prefill_tps": 233.12740412635503,
+    "decode_tps": 22.27359936883063,
+    "wall_sec": 15.398470401763916,
+    "passed": true,
+    "p_ok": true,
+    "q_ok": true,
+    "r_ok": true,
+    "s_ok": true,
+    "t_ok": true,
+    "content": "P=True, S:False (Premise 2). T=True (Premise 4), so R=True via Premise 3. From P1: since \u00acR\u2228S is False (R=T, S=False), the consequent is false; for the implication to hold, its antecedent must be false, forcing Q=False.\n\n### Final: P: True, Q: False, R: True, S: False, T: True",
+    "reasoning": "Let me work through the logic step by step.\n\nPremise 2: \u00acS is True, and P is True. So S = False, P = True.\nPremise 4: T is True. So T = True.\nPremise 3: If T then R. Since T is True, R is True. So R = True.\nPremise 1: If (P \u2227 Q) then (\u00acR \u2228 S). We know P=True, R=True, S=False. So \u00acR\u2228S = False\u2228False = False. For the implication to hold, we need \u00ac(P\u2227Q), meaning \u00ac(P\u2227Q). Since P is True, for (P\u2227Q) to not force a contradiction, Q must be False (otherwise \u00acR\u2228S would need to be True, but \u00acR=False and S=False, making \u00acR\u2228S = False, creating a contradiction if Q were True). So Q must be False.\n\nReasoning needs to be under 50 words.",
+    "final": "P: True, Q: False, R: True, S: False, T: True"
+  }
+}

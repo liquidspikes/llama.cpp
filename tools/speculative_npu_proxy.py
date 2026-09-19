@@ -76,7 +76,7 @@ def get_gpu_url():
     if now - _GPU_URL_CACHE["time"] < 3.0:
         return _GPU_URL_CACHE["url"]
 
-    for port in (8004, 8002, 8003):
+    for port in (8001, 8004, 8002, 8003):
         try:
             with requests.get(f"http://127.0.0.1:{port}/health", timeout=0.5) as r:
                 if r.status_code in (200, 503) and "status" in r.text and "npu_coprocessor" not in r.text:
@@ -481,8 +481,8 @@ class ProxyHTTPHandler(BaseHTTPRequestHandler):
                 thinking_enabled = False
 
             mt = payload.get("max_tokens", payload.get("n_predict", None))
-            if mt is None:
-                payload["max_tokens"] = 8192
+            if mt is None or int(mt) <= 0 or int(mt) > 1048576:
+                payload["max_tokens"] = 1048576
                 payload.pop("n_predict", None)
 
             if thinking_enabled:
@@ -493,7 +493,11 @@ class ProxyHTTPHandler(BaseHTTPRequestHandler):
                 payload.setdefault("min_p", 0.0)
                 ctk["enable_thinking"] = True
                 ctk.setdefault("preserve_thinking", False)
-                ctk["reasoning_effort"] = "xhigh"
+                if "reasoning_effort" not in ctk:
+                    ctk["reasoning_effort"] = payload.get("reasoning_effort", "xhigh")
+                ctk.setdefault("thinking_budget_tokens", 131072)
+                ctk.setdefault("reasoning_budget_tokens", 131072)
+                payload.setdefault("reasoning_budget", 131072)
             else:
                 payload.setdefault("temperature", 0.7)
                 payload.setdefault("top_p", 0.80)
@@ -513,12 +517,16 @@ class ProxyHTTPHandler(BaseHTTPRequestHandler):
             for idx, msg in enumerate(payload["messages"]):
                 m_copy = dict(msg)
                 # Strip thinking from prior completed assistant turns (keep current/last turn intact)
-                if m_copy.get("role") == "assistant" and idx < total_m - 1 and isinstance(m_copy.get("content"), str):
-                    raw_text = m_copy["content"]
-                    cleaned_text = re.sub(r'<think>[\s\S]*?</think>', '', raw_text).strip()
-                    if cleaned_text != raw_text:
-                        n_evaporated += (len(raw_text) - len(cleaned_text)) // 4
-                        m_copy["content"] = cleaned_text
+                if m_copy.get("role") == "assistant" and idx < total_m - 1:
+                    if isinstance(m_copy.get("content"), str):
+                        raw_text = m_copy["content"]
+                        cleaned_text = re.sub(r'<think>[\s\S]*?</think>', '', raw_text).strip()
+                        if cleaned_text != raw_text:
+                            n_evaporated += (len(raw_text) - len(cleaned_text)) // 4
+                            m_copy["content"] = cleaned_text
+                    if "reasoning_content" in m_copy and m_copy["reasoning_content"]:
+                        n_evaporated += len(str(m_copy["reasoning_content"])) // 4
+                        del m_copy["reasoning_content"]
                 cleaned_msgs.append(m_copy)
             payload["messages"] = cleaned_msgs
             if n_evaporated > 0:
@@ -541,9 +549,9 @@ class ProxyHTTPHandler(BaseHTTPRequestHandler):
                 session_key = self.headers.get("X-Session-ID") or self.client_address[0]
                 try:
                     custom_chunk = int(self.headers.get("X-Compaction-Chunk", 24000))
-                    custom_thresh = int(self.headers.get("X-Compaction-Threshold", 32000))
+                    custom_thresh = int(self.headers.get("X-Compaction-Threshold", 240000))
                 except Exception:
-                    custom_chunk, custom_thresh = 24000, 32000
+                    custom_chunk, custom_thresh = 24000, 240000
 
                 with _COMPACTOR_LOCK:
                     if session_key not in _SESSION_COMPACTORS:
@@ -640,6 +648,11 @@ class ProxyHTTPHandler(BaseHTTPRequestHandler):
         payload.setdefault("frequency_penalty", 0.0)
         payload.setdefault("repeat_penalty", 1.0)
 
+        mt = payload.get("max_tokens", payload.get("n_predict", None))
+        if mt is None or int(mt) <= 0 or int(mt) > 1048576:
+            payload["max_tokens"] = 1048576
+            payload.pop("n_predict", None)
+
         ctk = payload.get("chat_template_kwargs")
         if not isinstance(ctk, dict):
             ctk = {}
@@ -655,7 +668,11 @@ class ProxyHTTPHandler(BaseHTTPRequestHandler):
             payload.setdefault("min_p", 0.0)
             ctk["enable_thinking"] = True
             ctk.setdefault("preserve_thinking", False)
-            ctk["reasoning_effort"] = "xhigh"
+            if "reasoning_effort" not in ctk:
+                ctk["reasoning_effort"] = payload.get("reasoning_effort", "xhigh")
+            ctk.setdefault("thinking_budget_tokens", 131072)
+            ctk.setdefault("reasoning_budget_tokens", 131072)
+            payload.setdefault("reasoning_budget", 131072)
         else:
             payload.setdefault("temperature", 0.7)
             payload.setdefault("top_p", 0.80)
@@ -689,7 +706,7 @@ class ProxyHTTPHandler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-cache")
-            self.send_header("Connection", "keep-alive")
+            self.send_header("Connection", "close")
             self.send_header("X-Accel-Buffering", "no")
             self.send_header("X-Routed-Engine", engine_label)
             self.send_header("X-Routing-Reason", reason)
