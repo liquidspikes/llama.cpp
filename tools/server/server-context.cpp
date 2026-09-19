@@ -242,6 +242,8 @@ struct server_slot {
     llama_context * ctx_tgt = nullptr;
     llama_context * ctx_dft = nullptr;
 
+    common_context_seq_rm_type seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_PART;
+
     common_memory mem;
 
     // multimodal
@@ -332,9 +334,14 @@ struct server_slot {
     }
 
     void prompt_clear() {
+        fprintf(stderr, "[SERVER_DBG] prompt_clear: id=%d prompt_tokens=%zu\n", id, prompt.tokens.size());
         SLT_TRC(*this, "clearing prompt with %zu tokens\n", prompt.tokens.size());
 
         mem.seq_rm(id, -1, -1);
+
+        if (ctx_tgt) {
+            llama_synchronize(ctx_tgt);
+        }
 
         prompt.clear();
     }
@@ -545,6 +552,8 @@ struct server_slot {
         if (is_processing()) {
             GGML_ASSERT(task);
 
+            fprintf(stderr, "[SERVER_DBG] release: id=%d is_child=%d cache_prompt=%d seq_rm_type=%d\n",
+                    id, task->is_child(), task->params.cache_prompt, (int)seq_rm_type);
             SLT_INF(*this, "stop processing: n_tokens = %d, truncated = %d\n", prompt.n_tokens(), truncated);
 
             t_last_used = ggml_time_us();
@@ -552,7 +561,8 @@ struct server_slot {
             state = SLOT_STATE_IDLE;
 
             // do not keep context of the child slots - the parent's context is enough
-            if (task->is_child()) {
+            // also clear if cache_prompt is false or if the model does not support partial seq_rm
+            if (task->is_child() || !task->params.cache_prompt || seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_PART) {
                 prompt_clear();
             }
 
@@ -1011,6 +1021,14 @@ private:
         const bool is_resume = sleeping;
 
         params_base = params;
+        // A zero draft length means no speculation. Without this the context is sized from
+        // common_speculative_n_max() == 0 while the draft path is still initialized, and the
+        // first decode trips GGML_ASSERT(n_outputs_max <= cparams.n_outputs_max).
+        if (params_base.speculative.has_dft() && common_speculative_n_max(&params_base.speculative) <= 0) {
+            SRV_WRN("%s", "draft length is 0 - disabling speculative decoding\n");
+            params_base.speculative.types = { COMMON_SPECULATIVE_TYPE_NONE };
+        }
+
         const auto output_limits = server_output_limits(params_base);
         params_base.n_outputs_max = output_limits.total;
         params_base.n_outputs_max_per_seq = output_limits.per_seq;
@@ -1290,6 +1308,7 @@ private:
             slot.id      = i;
             slot.ctx_tgt = ctx_tgt;
             slot.ctx_dft = ctx_dft;
+            slot.seq_rm_type = ctx_tgt_seq_rm_type;
             slot.mem.init(ctx_tgt, ctx_dft);
             slot.spec    = spec.get();
             slot.n_ctx   = n_ctx_slot();
@@ -1493,11 +1512,22 @@ private:
                 auto caps = common_chat_templates_get_caps(chat_params.tmpls.get());
                 auto it = params_base.default_template_kwargs.find("preserve_reasoning");
                 bool supported = caps.at("supports_preserve_reasoning");
-                bool enabled = it != params_base.default_template_kwargs.end();
+                bool specified = params_base.preserve_reasoning_specified;
+                // note: the kwarg is enabled by default if not specified explicitly, so check the value
+                bool enabled = it != params_base.default_template_kwargs.end() && it->second == "true";
+                if (supported) {
+                    SRV_TRC("preserve_reasoning kwarg: %s\n",
+                            it == params_base.default_template_kwargs.end() ? "unset (template default)" : it->second.c_str());
+                } else {
+                    SRV_TRC("%s", "preserve_reasoning kwarg: not supported by template\n");
+                }
+                if (supported && !specified) {
+                    SRV_WRN("%s", "chat template supports preserving reasoning, it is enabled by default (may use more tokens, disable via --no-reasoning-preserve)\n");
+                }
                 if (supported && !enabled) {
                     SRV_INF("%s", "chat template supports preserving reasoning, consider enabling it via --reasoning-preserve\n");
                 }
-                if (!supported && enabled) {
+                if (!supported && specified && enabled) {
                     SRV_WRN("%s", "chat template does NOT support preserving reasoning, --reasoning-preserve has no effect\n");
                 }
             }
@@ -2777,6 +2807,10 @@ private:
         }
 #endif
 
+        // Keep decoding while any slot is busy. Posting NEXT_RESPONSE and
+        // returning to the queue cost ~10 ms/token on this USB4 path
+        // (pre_us~2, post_us~80, decode~36 ms, wall~46 ms).
+        for (;;) {
         // check if all slots are idle
         {
             bool all_idle = true;
@@ -2794,16 +2828,10 @@ private:
                 metrics_flush_idle();
 
                 return; // skip further processing
-
-            } else {
-                SRV_DBG("%s", "posting NEXT_RESPONSE\n");
-
-                server_task task(SERVER_TASK_TYPE_NEXT_RESPONSE);
-                task.id = queue_tasks.get_new_id();
-                queue_tasks.post(std::move(task));
             }
         }
 
+        const int64_t t_upd0 = ggml_time_us();
         try {
             scoped_timer t(t_pre_decode, n_pre_decode);
             pre_decode();
@@ -2842,6 +2870,8 @@ private:
         int32_t n_batch = llama_n_batch(ctx_tgt);
         for (int32_t off = 0; off < batch.size(); off = off_next) {
             const int32_t n_tokens = std::min(n_batch, batch.size() - off);
+            const int64_t t_pre_us = ggml_time_us() - t_upd0;
+            int64_t t_dec0 = ggml_time_us();
             try {
                 scoped_timer t(t_decode, n_decode);
                 // TODO @ngxson : maybe handle n_batch == 1 here instead of inside decode()
@@ -2867,7 +2897,9 @@ private:
                 abort_all_slots("decode() failed: " + std::string(e.what()));
                 break; // stop any further processing
             }
+            const int64_t t_dec_us = ggml_time_us() - t_dec0;
 
+            const int64_t t_post0 = ggml_time_us();
             try {
                 scoped_timer t(t_post_decode, n_post_decode);
                 post_decode(n_tokens, off, batch_view);
@@ -2876,7 +2908,22 @@ private:
                 abort_all_slots("post_decode() failed: " + std::string(e.what()));
                 break; // stop any further processing
             }
+            {
+                static int nlog_slot;
+                static int64_t t_prev_post;
+                const int64_t t_now = ggml_time_us();
+                const int64_t gap_us = t_prev_post ? (t_now - t_prev_post) : 0;
+                t_prev_post = t_now;
+                if (nlog_slot < 80) {
+                    nlog_slot++;
+                    fprintf(stderr, "[TOK] slot n_tok=%d batch=%d pre_us=%lld decode_call_us=%lld post_us=%lld gap_us=%lld\n",
+                            n_tokens, batch.size(),
+                            (long long) t_pre_us, (long long) t_dec_us,
+                            (long long) (t_now - t_post0), (long long) gap_us);
+                }
+            }
         }
+        } // keep decoding while slots are busy
     }
 
     void pre_decode() {
@@ -3001,7 +3048,7 @@ private:
                         common_speculative_get_draft_params(spec.get(), slot.id) = {
                             /* .drafting = */ true,
                             /* .n_max    = */ n_draft_max,
-                            /* .n_past   = */ slot.prompt.n_tokens(),
+                            /* .pos0     = */ slot.prompt.tokens.pos_next(),
                             /* .id_last  = */ slot.sampled,
                             /* .prompt   = */ &slot.spec_prompt,
                             /* .result   = */ &slot.spec_draft,
@@ -3187,7 +3234,7 @@ private:
                                 return;
                             }
 
-                            if (slot.task->params.cache_prompt) {
+                            if (slot.task->params.cache_prompt && slot.seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_PART) {
                                 // reuse any previously computed tokens that are common with the new prompt
                                 n_past = slot.prompt.tokens.get_common_prefix(input_tokens);
 
@@ -4743,10 +4790,6 @@ void server_routes::init_routes() {
 
     this->post_slots = [this](const server_http_req & req) {
         auto res = create_response();
-        if (params.slot_save_path.empty()) {
-            res->error(format_error_response("This server does not support slots action. Start it with `--slot-save-path`", ERROR_TYPE_NOT_SUPPORTED));
-            return res;
-        }
 
         std::string id_slot_str = req.get_param("id_slot");
 
@@ -4760,14 +4803,20 @@ void server_routes::init_routes() {
 
         std::string action = req.get_param("action");
 
+        if (action == "erase") {
+            return handle_slots_erase(req, id_slot);
+        }
+
+        if (params.slot_save_path.empty()) {
+            res->error(format_error_response("This server does not support slots action. Start it with `--slot-save-path`", ERROR_TYPE_NOT_SUPPORTED));
+            return res;
+        }
+
         if (action == "save") {
             return handle_slots_save(req, id_slot);
         }
         if (action == "restore") {
             return handle_slots_restore(req, id_slot);
-        }
-        if (action == "erase") {
-            return handle_slots_erase(req, id_slot);
         }
 
         res->error(format_error_response("Invalid action", ERROR_TYPE_INVALID_REQUEST));
