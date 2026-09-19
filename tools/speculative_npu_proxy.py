@@ -13,6 +13,7 @@ Features:
 - Health monitoring and metrics injection
 """
 
+import os
 import sys
 import re
 import time
@@ -35,6 +36,32 @@ LEMONADE_URL = "http://127.0.0.1:13307"
 
 _SESSION_COMPACTORS = {}
 _COMPACTOR_LOCK = threading.Lock()
+
+_PREFETCH_CACHE = {}
+_PREFETCH_LOCK = threading.Lock()
+
+def check_and_prefetch_tools(chunks):
+    """Speculatively prefetches read-only files referenced in streaming tool calls."""
+    try:
+        combined = b"".join(chunks).decode("utf-8", errors="ignore")
+        # Match common file path patterns in tool call arguments (e.g. "path": "/path/to/file")
+        matches = re.findall(r'"(?:path|filepath|filename|file)"\s*:\s*"([^"]+)"', combined)
+        for path in matches:
+            if path and os.path.isabs(path) and os.path.isfile(path):
+                with _PREFETCH_LOCK:
+                    if path not in _PREFETCH_CACHE:
+                        def _prefetch(p):
+                            try:
+                                with open(p, "r", errors="ignore") as f:
+                                    data = f.read(131072)
+                                with _PREFETCH_LOCK:
+                                    _PREFETCH_CACHE[p] = (time.time(), data)
+                                print(f"[PREFETCH] Speculatively prefetched {p} ({len(data)} chars)")
+                            except Exception:
+                                pass
+                        threading.Thread(target=_prefetch, args=(path,), daemon=True).start()
+    except Exception:
+        pass
 
 _GPU_URL_CACHE = {"url": "http://127.0.0.1:8002", "time": 0}
 _HEALTH_CACHE = {"data": None, "code": 503, "time": 0}
@@ -172,8 +199,32 @@ class ProxyHTTPHandler(BaseHTTPRequestHandler):
             self._forward_to_gpu("GET")
             return
 
+        if self.path.startswith("/v1/tool/prefetch") or self.path.startswith("/tool/prefetch"):
+            self._handle_tool_prefetch()
+            return
+
         # Reverse proxy any other GET request (e.g. Lemonade WebUI, static assets) to Lemonade core
         self._forward_to_lemonade("GET")
+
+    def _handle_tool_prefetch(self):
+        query = self.path.split("?", 1)[-1] if "?" in self.path else ""
+        target_path = ""
+        for param in query.split("&"):
+            if param.startswith("path="):
+                target_path = requests.utils.unquote(param.split("=", 1)[1])
+        with _PREFETCH_LOCK:
+            cached = _PREFETCH_CACHE.get(target_path)
+        if cached:
+            t_cached, data = cached
+            resp = json.dumps({"status": "hit", "path": target_path, "cached_at": t_cached, "content": data}).encode("utf-8")
+        else:
+            resp = json.dumps({"status": "miss", "path": target_path, "content": None}).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(resp)))
+        self._send_cors_headers()
+        self.end_headers()
+        self.wfile.write(resp)
 
     def do_POST(self):
         if self.path in ("/v1/chat/completions", "/chat/completions"):
@@ -262,6 +313,9 @@ class ProxyHTTPHandler(BaseHTTPRequestHandler):
                     "status": "ok" if healthy else "degraded",
                     "npu_coprocessor_online": npu_ok,
                     "npu_continuous_compactor": "online (AMD XDNA 2 FastFlowLM @ 52625)" if npu_ok else "offline",
+                    "think_evaporation": "enabled (selective CoT stripping)",
+                    "sticky_slot_affinity": "enabled (zero-prefill prefix caching across slots 0..3)",
+                    "speculative_tool_prefetch": "enabled (streaming tool argument pre-fetch)",
                     "gpu_cluster_online": gpu_ok,
                     "lemonade_core_online": lem_ok,
                     "node2_npu_embeddings_online": node2_npu_ok,
@@ -449,6 +503,36 @@ class ProxyHTTPHandler(BaseHTTPRequestHandler):
                 ctk["preserve_thinking"] = False
 
             payload["chat_template_kwargs"] = ctk
+
+        # Winner 1: <think> Evaporation (Selective Chain-of-Thought Stripping)
+        enable_evap = self.headers.get("X-Evaporate-Thinking", "true").lower() not in ("false", "0", "no")
+        if enable_evap and "messages" in payload:
+            cleaned_msgs = []
+            n_evaporated = 0
+            total_m = len(payload["messages"])
+            for idx, msg in enumerate(payload["messages"]):
+                m_copy = dict(msg)
+                # Strip thinking from prior completed assistant turns (keep current/last turn intact)
+                if m_copy.get("role") == "assistant" and idx < total_m - 1 and isinstance(m_copy.get("content"), str):
+                    raw_text = m_copy["content"]
+                    cleaned_text = re.sub(r'<think>[\s\S]*?</think>', '', raw_text).strip()
+                    if cleaned_text != raw_text:
+                        n_evaporated += (len(raw_text) - len(cleaned_text)) // 4
+                        m_copy["content"] = cleaned_text
+                cleaned_msgs.append(m_copy)
+            payload["messages"] = cleaned_msgs
+            if n_evaporated > 0:
+                print(f"[THINK-EVAPORATION] Evaporated ~{n_evaporated} dead reasoning tokens from history")
+
+        # Winner 2: Sticky Slot Affinity (Zero-Prefill Prefix Caching across Slots 0..3)
+        session_key = self.headers.get("X-Session-ID") or self.headers.get("Conversation-ID") or self.client_address[0]
+        if "id_slot" not in payload and "slot_id" not in payload:
+            target_slot = abs(hash(session_key)) % 4
+            payload["id_slot"] = target_slot
+            if "?" not in backend_url:
+                backend_url += f"?id_slot={target_slot}"
+            else:
+                backend_url += f"&id_slot={target_slot}"
 
         # Continuous Compaction Hook (Claude Code / Pi Harness Pattern)
         if decision != "npu" and ContinuousCompactor is not None:
@@ -655,11 +739,17 @@ class ProxyHTTPHandler(BaseHTTPRequestHandler):
                 return
 
             resp = resp_box[0]
+            stream_buf = []
             try:
                 for chunk in resp.iter_content(chunk_size=None):
                     if chunk:
                         self.wfile.write(chunk)
                         self.wfile.flush()
+                        # Winner 3: Speculative Tool Prefetching Hook
+                        if b"path" in chunk or b"tool_calls" in chunk or b"filename" in chunk or b"file" in chunk:
+                            stream_buf.append(chunk)
+                            if len(stream_buf) <= 25:
+                                check_and_prefetch_tools(stream_buf)
                         if b"data: [DONE]" in chunk or b"[DONE]" in chunk:
                             break
             except (BrokenPipeError, ConnectionResetError):
