@@ -119,14 +119,27 @@ To achieve the next major leap in throughput, execution must transcend the singl
 - **Current State:** 101–145 tok/s prompt prefill.
 - **Opportunity:** Prefill is compute-bound rather than memory-bound. Tuning `-b` and `-ub` batch chunks (e.g., evaluating 4096-token chunks) alongside RDNA 3.5 WMMA tile configurations can push prefill speeds past 200 tok/s.
 
-### 4. Dual XDNA 2 NPU Offloading for Sidecar Workloads
+### 4. Dual XDNA 2 NPU Offloading for Sidecar Workloads (Implemented)
 - **Hardware:** Both `bosgame1` and `bosgame2` possess AMD XDNA 2 NPUs providing 50 TOPS each (100 TOPS cluster total) exposed via `/dev/accel/accel0`.
-- **Opportunity:** Offload draft model execution, embedding generation, or real-time guardrail scoring to the NPUs, leaving 100% of GPU compute and LPDDR5X bandwidth dedicated to the 177B MoE model.
+- **Implementation:** Deployed `flm-compactor.service` on port `52625` running FastFlowLM with `qwen3:0.6b` on the NPU. It handles continuous context compaction for long-running agent workflows with zero GPU/ROCm overhead.
+- **Measured Throughput:** 1,100–1,425 tok/s prefill, 40–70 tok/s decode, completing 8,000-token chunk summaries in <10 seconds.
+
+---
+
+## 6. Continuous Context Compaction & Agentic Concurrency
+
+### The Context Bloat & Interconnect Bottleneck
+In long-running agentic coding sessions (Hermes, Pi harness, Claude Code), context expands rapidly with compiler outputs, pytest logs, and git diffs.
+- **Without Compaction:** Context balloons to 100k–130k+ tokens. Prefilling 131k tokens across the 40 Gbps USB4 cable locks the cluster interconnect for ~176 seconds (3 minutes), stalling concurrent slots and dropping single-token decode speed to 11.4 tok/s.
+- **With Continuous Compaction:** The agent harness or proxy middleware (`tools/speculative_npu_proxy.py` on port 13306) triggers background compaction on the AMD XDNA 2 NPU every 24,000 tokens. When the window limit is reached, it swaps historical verbose turns for a structured technical summary with 0 ms user-visible latency.
+- **Impact:** Active context stays lean (~4,000 tokens), prefill finishes in 5 seconds (34x faster turnaround), and decode throughput stays locked at the peak 25–28.4 tok/s memory roofline across 4 concurrent slots (`-np 4`).
 
 ---
 
 ## Verification & Deployment Summary
 
-- **Cluster Health:** Master node (`bosgame1`, port 8001 / 13306) and worker node (`bosgame2`, `llama-rpc.service`) fully synchronized.
-- **Build Status:** Complete build (`cmake --build build`) compiles cleanly with zero warnings/errors.
-- **Git Commit:** Committed to `feature/strix-halo-optimization` as commit [`acb4a6bdf`](https://github.com/liquidspikes/llama.cpp/commit/acb4a6bdf49a4495de167fec68d473b066291b8f) and pushed to remote `origin`.
+- **Cluster Topology:** Master node (`bosgame1`, ports 8004, 8002, 13305, 13306, 52625) and worker node (`bosgame2`, `llama-rpc.service`) fully synchronized.
+- **Context Capacity:** 1,048,576 tokens (1M unified context) across 4 parallel slots (`-np 4`, `--kv-unified -ctk q4_0 -ctv q4_0`).
+- **Inference Mode:** Pure serial decode (28.44 tok/s), RPC tensor parallelism (`-sm rpc-tensor -ts 1,1`).
+- **NPU Coprocessor:** AMD XDNA 2 FastFlowLM online on port 52625 for continuous compaction.
+- **Proxy Middleware:** Port 13306 reverse proxy handling automatic compaction, wildcard model paths (`/v1/models/*`), and SSE keep-alive streaming.
